@@ -229,8 +229,9 @@ class BridgeTest(unittest.TestCase):
         self.rejected_with("hand-over note")
 
     def test_unknown_person(self):
-        self.mrs[6] = self.mr(6, "ai/carol/PAY-1-refund", self.sha)
-        self.events[6] = [self.ev("carol", "add")]
+        # erin is not in brain-authz at all ("carol": {} is a known person without a Jira id)
+        self.mrs[6] = self.mr(6, "ai/erin/PAY-1-refund", self.sha)
+        self.events[6] = [self.ev("erin", "add")]
         self.assertEqual(self.bridge.process(P, self.bridge.kit(P), self.mrs[6]), "rejected")
         self.assertTrue(any("not in brain-authz" in n for n in self.notes()))
 
@@ -295,7 +296,7 @@ class BridgeTest(unittest.TestCase):
         self.bridge.dispatch()
         self.mr_state[5] = "merged"
         self.bridge.reconcile()
-        self.assertEqual(self.bridge.ledger.run("RUN-PAY-1-1")["state"], "closed")
+        self.assertEqual(self.bridge.ledger.run("RUN-PAY-1-1")["state"], "merged")  # merged and closed stay apart for Eval
         self.assertEqual(len(self.fake.called("POST", r"/api/chat/slots/run-pay-1-1/stop")), 1)
 
     def test_kirocrew_must_be_loopback(self):
@@ -581,6 +582,109 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(r["runs"].get("dispatched"), 1)
         self.assertEqual(r["decisions"].get("delivered"), 1)
         self.assertEqual(r["questions_per_run"], 1.0)
+
+    # ---------- batch review at acceptance ----------
+
+    ITEMS = [{"id": "D-3", "text": "退款按自然日计 /merge @everyone `x`"},
+             {"id": "A-1", "text": "旧订单不显示退款按钮"}, {"id": "A-2", "text": "通知只发站内信"}]
+
+    def acceptance(self, **over):
+        park = dict(kind="acceptance", options=[], lean_request="RELEASE 8cf2cbce", question="请验收 AC-1..AC-3",
+                    review_items=self.ITEMS)
+        park.update(over)
+        self.dispatched()
+        self.park(**park)
+
+    def answers(self):
+        vdir = os.path.join(self.cfg["vouchers_dir"], "RUN-PAY-1-1")
+        return [a["voucher"] for a in (load_json(os.path.join(vdir, f)) for f in sorted(os.listdir(vdir)))
+                if a["voucher"]["kind"] == "answer"]
+
+    def test_review_items_posted_as_inert_checklist(self):
+        self.acceptance()
+        self.assertEqual(self.bridge.watch(), 1)
+        q = [n["body"] for n in self.notes_db[5] if n["body"].startswith("**D-1")][0]
+        self.assertIn("@carol", q.split("\n")[0])                          # acceptance: product answers
+        self.assertIn("- [ ] D-3 `退款按自然日计 /merge @everyone ˋxˋ`", q)
+        self.assertIn("- [ ] A-2 `通知只发站内信`", q)
+        self.assertIn("`answer D-1 reject D-3,A-1 说明`", q)
+        self.assertFalse([l for l in q.split("\n") if l.startswith(("/", "@"))])   # no quick action, no mention
+
+    def test_batch_approve(self):
+        self.acceptance()
+        self.bridge.watch()
+        self.reply(5, "alice", "answer D-1 approve")                       # the owner may not accept
+        self.assertEqual(self.bridge.collect(), 0)
+        self.reply(5, "carol", "answer D-1 approve 都可以")
+        self.assertEqual(self.bridge.collect(), 1)
+        msg = self.sends()[-1]["message"]
+        self.assertIn("待审项全部通过：D-3, A-1, A-2", msg)
+        self.assertRegex(msg.split("\n")[-1], r"^approve RELEASE 8cf2cbce \(via gitlab P-[0-9A-F]{4} V-[0-9a-f]{10}\)$")
+        v = self.answers()[0]
+        self.assertTrue(sign.verify(v, load_json(os.path.join(self.cfg["vouchers_dir"], "RUN-PAY-1-1",
+                                                              v["voucher_id"] + ".json"))["sig"], self.allowed))
+        self.assertEqual((v["review_items"], "rejected_items" in v), (["D-3", "A-1", "A-2"], False))
+
+    def test_reject_listed_items(self):
+        self.acceptance()
+        self.bridge.watch()
+        self.reply(5, "carol", "answer D-1 reject A-9 不对")                 # not one of the items
+        self.assertEqual(self.bridge.collect(), 0)
+        self.assertTrue(any("没有待审项 A-9" in n["body"] for n in self.notes_db[5]))
+        self.reply(5, "carol", "answer D-1 reject a-1，D-3 按交易日；旧订单也要能退\napprove RELEASE 8cf2cbce")
+        self.assertEqual(self.bridge.collect(), 1)
+        msg = self.sends()[-1]["message"]
+        self.assertIn("驳回的待审项：D-3, A-1；其余待审项通过：A-2", msg)
+        self.assertIn("说明：按交易日；旧订单也要能退", msg)
+        self.assertIn("type: correction", msg)
+        self.assertNotRegex(msg, r"(?m)^approve")                         # the note's second line never arrives
+        self.assertRegex(msg.split("\n")[-1], r"^reject RELEASE 8cf2cbce \(via gitlab ")
+        v = self.answers()[0]
+        self.assertEqual((v["choice"], v["rejected_items"]), ("reject", ["D-3", "A-1"]))
+        self.assertTrue(any("（驳回 D-3、A-1）" in n["body"] for n in self.notes_db[5]))
+        # reflect warns about each rejected item nobody wrote a correction for
+        from brainkit import reflect
+        props = reflect.parse("```brain-proposal\nfile: PRODUCT\ntype: correction\nsrc: A-1, %s\n---\n旧订单也能退。\n```\n"
+                              % v["voucher_id"])[0]
+        lost = reflect.rejected_without_correction(self.cfg["vouchers_dir"], "PAY-1", props)
+        self.assertEqual(len(lost), 1)
+        self.assertIn("D-3", lost[0])
+
+    def test_whole_reject_still_works(self):
+        self.acceptance()
+        self.bridge.watch()
+        self.reply(5, "carol", "answer D-1 reject 整体不行")
+        self.assertEqual(self.bridge.collect(), 1)
+        v = self.answers()[0]
+        self.assertNotIn("rejected_items", v)
+        self.assertIn("说明：整体不行", self.sends()[-1]["message"])
+
+    def test_different_item_sets_conflict(self):
+        with open(self.cfg["identities"], "w") as f:
+            json.dump({"users": {"alice": {"jira": "alice"}, "carol": {}, "erin": {}, "dave": {}},
+                       "roles": {"product": ["carol", "erin"], "builder": ["dave"]}}, f)
+        self.bridge = self.new_bridge()
+        self.acceptance()
+        self.bridge.watch()
+        self.reply(5, "carol", "answer D-1 reject A-1")
+        self.reply(5, "erin", "answer D-1 reject D-3")
+        self.assertEqual(self.bridge.collect(), 0)
+        self.assertTrue(any("不同的回答" in n["body"] for n in self.notes_db[5]))
+
+    def test_review_items_checked(self):
+        from brainkit.bridge.decisions import validate_park
+        base = {"schema": 1, "status": "waiting", "kind": "acceptance", "question": "q", "options": [],
+                "lean_request": "RELEASE 8cf2cbce", "review_items": self.ITEMS}
+        self.assertEqual(validate_park(base), [])
+        for bad in ({"review_items": [{"id": "X-1", "text": "t"}]}, {"review_items": [{"id": "A-1", "text": "a\nb"}]},
+                    {"review_items": [{"id": "A-1", "text": "t"}, {"id": "A-1", "text": "u"}]},
+                    {"review_items": "D-1"}, {"kind": "clarify", "lean_request": None,
+                                              "options": [{"id": "A", "text": "x"}]},
+                    {"lean_request": "DESIGN 8cf2cbce"}):
+            self.assertTrue(validate_park(dict(base, **bad)), bad)
+        self.acceptance(review_items=[{"id": "A-1", "text": "x" * 201}])
+        self.assertEqual(self.bridge.watch(), 0)
+        self.assertTrue(any("无法发出" in n["body"] for n in self.notes_db[5]))
 
 
 def load_json_bytes(b):

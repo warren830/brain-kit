@@ -129,7 +129,7 @@ class Bridge(DecisionLoop):
             p.append("label '%s' was added by %s, not by the branch owner %s"
                      % (kit["handoff_label"], adder or "unknown", owner))
         ident = self.ids.get(owner)
-        if not ident:
+        if ident is None:  # {} is a valid entry: a person without a Jira id (tracker none)
             p.append("%s is not in brain-authz identities" % owner)
         elif kit["tracker"] == "jira":
             p += self.check_jira(kit, b["key"], owner, ident)
@@ -368,8 +368,9 @@ class Bridge(DecisionLoop):
                         self.kc.stop(row["slot"])
                     except BrainError as e:
                         self.out("%s: stop failed: %s" % (row["run_id"], e))
-                self.ledger.set_run(row["run_id"], row["state"], "closed")
-                self.out("closed %s (MR %s)" % (row["run_id"], mr.get("state")))
+                # "merged" and "closed" stay apart: Eval counts deliveries, not abandoned runs
+                self.ledger.set_run(row["run_id"], row["state"], mr.get("state"))
+                self.out("%s %s" % (mr.get("state"), row["run_id"]))
 
 
 def build(cfg_path, transport=None):
@@ -403,16 +404,16 @@ def main(argv=None):
             print(json.dumps(br.report(), ensure_ascii=False, indent=2))
             return 0
         while True:
-            if a.cmd in ("poll", "loop"):
-                br.poll()
-            if a.cmd in ("dispatch", "loop"):
-                br.dispatch()
-            if a.cmd in ("watch", "loop"):
-                br.watch()
-            if a.cmd in ("collect", "loop"):
-                br.collect()
-            if a.cmd in ("reconcile", "loop"):
-                br.reconcile()
+            for step in ("poll", "dispatch", "watch", "collect", "reconcile"):
+                if a.cmd not in (step, "loop"):
+                    continue
+                try:
+                    getattr(br, step)()
+                except BrainError as e:
+                    if a.cmd != "loop":
+                        raise
+                    # one bad round (network, GitLab, Midway) must not stop the bridge: log, go on, retry next round
+                    print("brain-bridge: %s failed this round: %s" % (step, e), file=sys.stderr)
             if a.cmd != "loop":
                 return 0
             time.sleep(br.cfg["interval"])

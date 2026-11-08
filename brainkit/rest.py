@@ -5,6 +5,7 @@ so tests can inject a fake instead of opening sockets.
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import urllib.error
@@ -23,6 +24,8 @@ def urllib_transport(method, url, headers, body, timeout=20):
         return e.code, e.read()
     except urllib.error.URLError as e:
         raise BrainError("cannot reach %s: %s" % (urllib.parse.urlsplit(url).netloc, e.reason))
+    except (OSError, http.client.HTTPException) as e:  # timeouts and dropped connections mid-response
+        raise BrainError("%s %s failed: %s" % (method, urllib.parse.urlsplit(url).netloc, e or type(e).__name__))
 
 
 try:  # optional machine-local transport (gitignored): transport_for(base) -> transport or None

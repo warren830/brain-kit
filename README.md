@@ -95,7 +95,7 @@ Brain 是仓库里的 `brain/PRODUCT.md`、`TECH.md`、`IMPROVEMENT.md`、`PROJE
 
 | 命令 | 谁跑、在哪 | 做什么 |
 |---|---|---|
-| `brain` | 每个人的电脑 | `install`、`doctor`、`claim`、`intake`、`start`、`handoff`、`status`；Brain：`lint`、`entry`、`reflect`、`usage` |
+| `brain` | 每个人的电脑 | `install`、`doctor`、`claim`、`intake`、`start`、`handoff`、`status`；Brain：`lint`、`entry`、`reflect`（含 `--draft`）、`usage`；入口：`intent add/list/show/close`（见 [docs/intents.md](docs/intents.md)）；评估：`trace`、`eval`、`eval gaps`、`golden`（见 [docs/eval.md](docs/eval.md)） |
 | `brain-bridge` | 团队运行机，`brainbridge` 用户 | `poll`（接手核对）、`dispatch`（送进 KiroCrew）、`watch`（贴问题）、`collect`（收回答并送回）、`reconcile`（MR 合并后收尾）、`report`（统计）、`loop`（循环跑以上全部） |
 | `brain-runnerd` | 团队运行机，`brainbot` 用户 | 验合同签名，按合同里的 commit 建 worktree，拷材料包 |
 | `brain-ci check-run` | GitLab MR 流水线（只在 MR 流水线里跑） | 检查五件事：run.json 和分支一致；材料包没被提交进仓库；run 分支没改 `brain/` 和 `AGENTS.md`；改了 risk-paths 必须有桥签名的设计批准；机器人提交的 commit 要有接手凭证。kit 配置、risk-paths 和 diff 基线都从**目标分支**读，MR 分支上改了也不算数 |
@@ -181,11 +181,12 @@ brain-kit/bin/brain install <项目目录> --lean <AI-DLC Lean 的 checkout 目�
 
 ## 还没验证（要在真环境里测）
 
-- KiroCrew 接口（V1）：按 0.11.2 源码写的，没在运行机上实际调过；`brain-run` agent 的工具名和 resources 能不能装上也没核实。
+- 运行机这一半（V1）：2026-11-08 在一个内部 GitLab 上实测了 GitLab 和 runnerd 这一侧：交接核对、签合同、建工作区、MR 上的问答、Lean 审批经桥送回后被 Lean 记下（审计里能追到凭证）。KiroCrew 换成了只记录的替身：真开会话、会话读接手消息、答完后接着跑，等 KiroCrew app 做好再测。实测找出的 3 个问题（身份表空条目、读超时让桥退出、hook 适配脚本没进 git）已修，见 `tests/test_live_fixes.py`。
+- KiroCrew 的 app token 只能调 manifest 里声明的接口；声明 `/api/chat` 后能看到本机所有聊天会话的列表（实测）。
 - Lean 的 hook 在 KiroCrew 里：本地 kas 引擎已实测生效（见下一节）；子代理有没有带上 hook 还没测。
 - Brain 闭环在真 run 里走一遍：run 写提案 → reflect → Brain MR → 下一个 run 引用。
 - run 中途合并了新的 Brain 时，run.json 的 `brain_commit` 不会跟着更新，`brain usage` 仍按旧的那版算"装载"。
-- 真实的 GitLab：标签事件、MR 评论、文件 API、服务器钩子环境、CI 镜像。
+- 真实的 GitLab：服务器钩子环境、CI 镜像（标签事件、MR 评论、文件 API 已实测）。
 - 用真人跑完整条接力流程（V14）。
 
 ## 在 KiroCrew 里本地开发

@@ -1,0 +1,25 @@
+{
+  "name": "brain-reflector",
+  "description": "After a run is accepted: read the whole run in a fresh session and write brain-proposal and brain-gap blocks to one file. Never edits the Brain, the code or the run branch.",
+  "model": "claude-opus-5.5",
+  "prompt": "file:///opt/brain-kit/remote/prompts/brain-reflector.md",
+  "tools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "allowedTools": [
+    "fs_read",
+    "grep",
+    "glob"
+  ],
+  "resources": [
+    "file://AGENTS.md",
+    "file://brain/PRODUCT.md",
+    "file://brain/TECH.md",
+    "file://brain/IMPROVEMENT.md",
+    "file://brain/PROJECT.md",
+    "file://.kiro/skills/brain-reflect/SKILL.md"
+  ],
+  "_notes": "Install at user level: ~/.kiro/agents/brain-reflector.json (KiroCrew on kas/v3 reads agent specs from the user level only). On a laptop, point prompt at your brain-kit checkout (file://<brain-kit>/remote/prompts/brain-reflector.md), or skip installing: `brain reflect --draft KEY` prints the full prompt as the first message. Run it in a fresh session with its own workspace (a detached worktree of the accepted run), never in the run's workspace. No Lean hooks on purpose: it does no Lean stage work and writes one file. Its output is only a proposal: a person runs `brain reflect --key KEY --from <file>`, and the Brain changes only through the Brain MR the file owners review. Still to confirm on the runner (V1): resources load from the workspace, the model is honoured, and who starts the session after acceptance (today: a person; the bridge does not start it yet)."
+}

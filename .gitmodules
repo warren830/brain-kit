@@ -1,0 +1,3 @@
+[submodule "vendor/aidlc-lean"]
+	path = vendor/aidlc-lean
+	url = git@github.com:warren830/aidlc-lean.git

@@ -47,6 +47,8 @@ def signed_vouchers(vouchers_dir, allowed_signers, key, repo):
             continue
         if not str(v.get("run_id", "")).startswith("RUN-%s-" % key):
             continue
+        if v.get("eval_oracle"):  # golden-task answers from the oracle never count for a real MR
+            continue
         if git(repo, "merge-base", "--is-ancestor", str(v.get("sha", "")), "HEAD", check=False).returncode != 0:
             continue
         good.append(v)

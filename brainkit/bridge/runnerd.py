@@ -63,6 +63,10 @@ def prepare(cfg, req) -> dict:
     head = git_out(path, "rev-parse", "HEAD")
     if head != v["sha"]:
         raise BrainError("worktree head %s != contract sha" % head[:12])
+    if os.path.exists(os.path.join(path, ".kiro", "aidlc-lean", "aidlc_lean.py")) and \
+            not os.path.exists(os.path.join(path, ".kiro", "brain", "lean-hook.py")):
+        raise BrainError("the branch has AI-DLC Lean but not .kiro/brain/lean-hook.py: the session's hooks would "
+                         "block every tool call; commit the adapter on main and hand over again")
     copy_materials(cfg, v.get("materials") or [], path)
     return {"run_id": run_id, "path": os.path.realpath(path), "head": head}
 

@@ -1,5 +1,7 @@
 """GitLab server-side pre-receive hook (a real gate: the bot cannot change it).
 
+Claim branches (claim/<KEY>): only the person claim.json names may create, change or delete one; an intent's
+text fields (intents.py: source, body, acs, refs, closed) must pass the Brain's content checks.
 Rules for run branches (<prefix>/<owner>/<JIRA>-<slug>):
   bot accounts   may push only branches under <prefix>/ (well-formed names), never delete or force-push,
                  never push tags, and never change bot_forbidden_paths (gates/, project-agent.yaml, CI, ...).
@@ -98,12 +100,12 @@ def is_ff(old, new, cwd=None) -> bool:
 
 
 def _claim_owner(sha, cwd):
-    p = _git("show", "%s:claim.json" % sha, cwd=cwd)
+    p = subprocess.run(["git", "show", "%s:claim.json" % sha], cwd=cwd, capture_output=True)
     if p.returncode != 0:
         return None, "has no claim.json"
     try:
-        doc = json.loads(p.stdout)
-    except ValueError:
+        doc = json.loads(p.stdout.decode("utf-8"))
+    except ValueError:            # also UnicodeDecodeError: claim.json is UTF-8 whatever the server's locale
         return None, "claim.json is not JSON"
     return doc, ""
 
@@ -125,8 +127,12 @@ def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
     doc, err = _claim_owner(new, cwd)
     if err:
         return ["%s: %s" % (branch, err)]
-    if doc.get("key") != key or doc.get("owner") != user:
+    if not isinstance(doc, dict) or doc.get("key") != key or doc.get("owner") != user:
         return ["%s: claim.json must name key %s and owner %s" % (branch, key, user)]
+    from . import intents  # an intent's text reaches the run's agent: same checks as `brain intent add`
+    bad = intents.doc_problems(doc)
+    if bad:
+        return ["%s: claim.json: %s" % (branch, "; ".join(bad[:5]))]
     return []
 
 

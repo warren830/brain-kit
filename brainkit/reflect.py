@@ -17,6 +17,19 @@ open brain/* branches), and applies them with the deterministic editor (entries.
 branch brain/<KEY>-reflect-<n> from main. brain lint (relation rules against main) must pass, or nothing is kept.
 Proposals already applied (same proposal hash in the Brain) are skipped; a reflect that only adds sources opens
 no MR. With --push it pushes the branch and opens the MR for the file owners (CODEOWNERS) to review.
+
+A second block kind records what is missing, for a later run (not the Brain):
+
+  ```brain-gap
+  title: 退款对账没有自动测试          one line: the next requirement's title
+  kind: test                         knowledge | test | other
+  refs: D-4, AC-2, src/pay/reconcile.py    optional
+  ---
+  What is missing and why it matters (the next requirement's text).
+  ```
+
+`--apply` files each new gap as an intent (intents.add, source gap: a claim/<KEY> the person running reflect owns),
+skipping gaps filed before (same title and text), and lists them in the Brain MR description; the preview shows them.
 """
 from __future__ import annotations
 
@@ -24,10 +37,12 @@ import glob
 import os
 import re
 
-from . import brainlint, config, entries as E
-from .common import BrainError, git, git_out, load_json
+from . import brainlint, config, entries as E, intents
+from .common import BrainError, git, git_out, load_json, parse_branch
 
 FENCE_OPEN_RE = re.compile(r"^\s*(`{3,})\s*brain-proposal\s*$")
+GAP_OPEN_RE = re.compile(r"^\s*(`{3,})\s*brain-gap\s*$")
+GAP_FIELDS = ("title", "kind", "refs")
 FENCE_CLOSE_RE = re.compile(r"^\s*(`{3,})\s*$")
 INNER_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*\S")
 ID_ARG_RE = re.compile(r"^[A-Z]-[A-Z0-9-]+$")
@@ -48,13 +63,13 @@ class Proposal:
         return "proposal at line %d" % self.line
 
 
-def parse(text) -> tuple:
-    """(proposals, problems) from a decisions.md (or any Markdown)."""
-    props, probs = [], []
+def _blocks(text, open_re, what, free=()) -> tuple:
+    """([(fields, body, start line)], problems) for the fenced blocks `open_re` opens. Fields in `free` keep '#'."""
+    blocks, probs = [], []
     lines = text.split("\n")
     i = 0
     while i < len(lines):
-        m = FENCE_OPEN_RE.match(lines[i])
+        m = open_re.match(lines[i])
         if not m:
             i += 1
             continue
@@ -75,7 +90,7 @@ def parse(text) -> tuple:
                     inner = o.group(1)
             j += 1
         if j >= len(lines):
-            probs.append("line %d: brain-proposal block is not closed" % (start))
+            probs.append("line %d: %s block is not closed" % (start, what))
             break
         block = lines[start:j]
         fields, body, in_body = {}, [], False
@@ -89,15 +104,105 @@ def parse(text) -> tuple:
             elif ":" in line:
                 k, v = line.split(":", 1)
                 k = k.strip().lower()
-                v = re.sub(r"\s+#.*$", "", v).strip()      # trailing "# comment" after a value
+                if k not in free:
+                    v = re.sub(r"\s+#.*$", "", v)          # trailing "# comment" after a value
+                v = v.strip()
                 if k in fields:
                     probs.append("line %d: %s given twice" % (start + n + 1, k))
                 fields[k] = v
             else:
                 probs.append("line %d: expected 'key: value' or '---'" % (start + n + 1))
-        props.append(Proposal(fields, "\n".join(body), start))
+        blocks.append((fields, "\n".join(body), start))
         i = j + 1
-    return props, probs
+    return blocks, probs
+
+
+def parse(text) -> tuple:
+    """(proposals, problems) from a decisions.md (or any Markdown)."""
+    blocks, probs = _blocks(text, FENCE_OPEN_RE, "brain-proposal")
+    return [Proposal(f, b, n) for f, b, n in blocks], probs
+
+
+class Gap:
+    """A brain-gap block: something missing (knowledge, a test) that becomes the next requirement."""
+
+    def __init__(self, fields, body, line):
+        self.fields, self.line = fields, line
+        self.body = intents.norm_body(body)
+        self.title = " ".join(fields.get("title", "").split())
+        self.kind = fields.get("kind", "")
+        self.refs = [r.strip() for r in re.split(r"[,，]", fields.get("refs", "")) if r.strip()]
+        self.hash = intents.digest("gap", self.title, self.body)
+
+    def label(self):
+        return "gap at line %d" % self.line
+
+
+def parse_gaps(text) -> tuple:
+    """(gaps, problems) from a decisions.md or a reflector's output."""
+    blocks, probs = _blocks(text, GAP_OPEN_RE, "brain-gap", free=("title",))
+    return [Gap(f, b, n) for f, b, n in blocks], probs
+
+
+def plan_gaps(repo, cfg, gaps, key) -> tuple:
+    """(rows, problems). Each row {"gap", "existing" (claim filed before, or None), "filed" (after file_gaps)}.
+    A gap that fails the checks refuses the whole reflect, like a bad proposal."""
+    rows, probs, seen = [], [], {}
+    for g in gaps:
+        where = g.label()
+        unknown = set(g.fields) - set(GAP_FIELDS)
+        if unknown:
+            probs.append("%s: unknown fields %s" % (where, ", ".join(sorted(unknown))))
+        if g.kind not in intents.GAP_KINDS:
+            probs.append("%s: kind must be one of %s" % (where, ", ".join(intents.GAP_KINDS)))
+        errs, _ = intents.problems("gap", g.title, g.body, (), g.refs, {"found_in": key})
+        probs += ["%s: %s" % (where, e) for e in errs]
+        if g.hash in seen:
+            continue                     # the same gap twice in one file: once
+        seen[g.hash] = g
+        rows.append({"gap": g, "existing": None, "filed": None})
+    if rows and not probs and cfg.get("tracker") == "none":
+        docs, _ = intents.scan(repo)
+        for r in rows:
+            r["existing"] = intents.first_with(docs, r["gap"].hash)
+    return rows, probs
+
+
+def new_gaps(rows) -> list:
+    return [r for r in rows if not r["existing"]]
+
+
+def file_gaps(repo, cfg, rows, key, owner) -> list:
+    """File the new gaps as intents (source gap). Rows filed before are left alone."""
+    if cfg.get("tracker") != "none":
+        return rows
+    for r in rows:
+        if r["existing"]:
+            continue
+        g = r["gap"]
+        doc = intents.add(repo, cfg, "gap", g.title, g.body, refs=g.refs, owner=owner,
+                          extra={"gap_kind": g.kind, "found_in": key})
+        if doc.get("duplicate"):
+            r["existing"] = doc
+        else:
+            r["filed"] = doc
+    return rows
+
+
+def gap_lines(rows, tracker="none") -> list:
+    out = []
+    for r in rows:
+        g = r["gap"]
+        if r["filed"]:
+            what = "登记为 %s" % r["filed"]["key"]
+        elif r["existing"]:
+            what = "已登记为 %s，跳过" % r["existing"]["key"]
+        elif tracker != "none":
+            what = "tracker 是 %s：请在那里登记" % tracker
+        else:
+            what = "新需求（--apply 时登记，source gap）"
+        out.append("  %-9s %-9s %s：%s" % ("gap", g.kind, g.title, what))
+    return out
 
 
 class Op:
@@ -252,7 +357,16 @@ def rejected_without_correction(vouchers_dir, key, proposals) -> list:
         v = data.get("voucher") if isinstance(data, dict) else None
         if not isinstance(v, dict):
             continue
+        if v.get("eval_oracle"):  # golden-task oracle answers are not real decisions
+            continue
         if v.get("kind") != "answer" or v.get("choice") not in REJECT_CHOICES:
+            continue
+        items = v.get("rejected_items")
+        if isinstance(items, list) and items:      # batch review: each rejected item needs its own correction
+            for it in items:
+                if it not in cited:
+                    out.append("%s in %s (%s) was rejected, but no correction or repeats proposal cites %s"
+                               % (it, v.get("decision"), v.get("voucher_id"), it))
             continue
         if v.get("voucher_id") not in cited and v.get("decision") not in cited:
             out.append("%s (%s) was rejected, but no correction or repeats proposal cites it"
@@ -290,7 +404,7 @@ def branch_name(repo, key) -> str:
     return "brain/%s-reflect-%d" % (key, n)
 
 
-def mr_description(key, ops, warnings, source) -> str:
+def mr_description(key, ops, warnings, source, gaps=None) -> str:
     rows = []
     for op in ops:
         p = op.p
@@ -311,6 +425,11 @@ def mr_description(key, ops, warnings, source) -> str:
            "| 条目 | 文件 | 类型 | 关系 | 出处 | 怎么审 |", "|---|---|---|---|---|---|"] + rows
     out += ["", "- 谁批：PRODUCT 归产品；TECH、IMPROVEMENT 归 Builder；PROJECT 两边各一人（CODEOWNERS）。",
             "- 由 `brain reflect` 生成，`brain lint` 已按 main 检查关系规则。正文请看 diff。"]
+    if gaps:
+        out += ["", "缺口 → 下一个需求（`brain intent list` 能看到，`brain start <slug> --key <KEY>` 开工）："]
+        out += ["- %s · %s · %s%s" % ((r["filed"] or r["existing"] or {}).get("key", "未登记"), r["gap"].kind,
+                                     r["gap"].title, "" if r["filed"] else "（之前已登记）" if r["existing"]
+                                     else "（tracker 不是 none：请在 tracker 里登记）") for r in gaps]
     if warnings:
         out += ["", "提醒："] + ["- " + w for w in warnings]
     return "\n".join(out) + "\n"
@@ -368,3 +487,79 @@ def main_cfg(repo, base):
     if p.returncode != 0:
         return config.load(repo)
     return config.merged(config.DEFAULTS, json.loads(p.stdout))
+
+
+# ---------- the reflector session ----------
+
+KIT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REFLECTOR_PROMPT = os.path.join(KIT_ROOT, "remote", "prompts", "brain-reflector.md")
+REFLECTOR_AGENT = os.path.join(KIT_ROOT, "remote", "agents", "brain-reflector.json")
+
+
+def run_ref(repo, cfg, key) -> str:
+    """Where the accepted run is: the default branch once merged, else its run branch (origin first)."""
+    rel = "%s/%s/run.json" % (cfg["runs_dir"], key)
+    main = cfg["default_branch"]
+    has_origin = git(repo, "remote", "get-url", "origin", check=False).returncode == 0
+    if has_origin:
+        git(repo, "fetch", "-q", "origin", main, check=False)
+    for ref in (("origin/" + main,) if has_origin else ()) + (main,):
+        if git(repo, "cat-file", "-e", "%s:%s" % (ref, rel), check=False).returncode == 0:
+            return ref
+    prefix = cfg["branch_prefix"]
+    if has_origin:
+        out = git(repo, "ls-remote", "origin", "refs/heads/%s/*" % prefix, check=False).stdout
+        for line in out.splitlines():
+            name = line.split("\t", 1)[-1][len("refs/heads/"):]
+            b = parse_branch(name, prefix)
+            if b and b["key"] == key:
+                git(repo, "fetch", "-q", "origin", "+refs/heads/%s:refs/remotes/origin/%s" % (name, name), check=False)
+                return "origin/" + name
+    for name in git_out(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/%s/" % prefix).split():
+        b = parse_branch(name, prefix)
+        if b and b["key"] == key:
+            return name
+    raise BrainError("no run for %s found (not on %s, no %s/*/%s-* branch): pass --ref" % (key, main, prefix, key))
+
+
+def draft(repo, cfg, key, ref=None, vouchers_dir=None) -> str:
+    """What a person does to run the reflector in a local KiroCrew session, and the exact message to send it."""
+    ref = ref or run_ref(repo, cfg, key)
+    rel = "%s/%s/run.json" % (cfg["runs_dir"], key)
+    p = git(repo, "show", "%s:%s" % (ref, rel), check=False)
+    if p.returncode != 0:
+        raise BrainError("%s has no %s" % (ref, rel))
+    intent = _intent(p.stdout, "%s:%s" % (ref, rel))
+    wt = os.path.join(worktree_root(repo), "reflector-%s" % key)
+    out = "%s/%s/reflect-proposals.md" % (cfg["runs_dir"], key)
+    with open(REFLECTOR_PROMPT, encoding="utf-8") as f:
+        prompt = f.read().rstrip()
+    message = "\n".join([
+        "You are brain-reflector for %s, in a fresh session. This run:" % key,
+        "- key: %s" % key,
+        "- ref: %s (this workspace is a detached checkout of it)" % ref,
+        "- intent: %s (aidlc-docs/%s/)" % (intent, intent),
+        "- workspace: %s" % wt,
+        "- vouchers: %s (answers the bridge signed; may be missing on this machine)"
+        % os.path.join(vouchers_dir or "<brain-intake>/vouchers", "RUN-%s-*" % key),
+        "- output: %s (in this workspace only)" % out,
+        "",
+        prompt])
+    steps = [
+        "brain reflect --draft %s：在本机 KiroCrew 里开一个新会话，让它读完这个 run，写出 Brain 提案和缺口。" % key,
+        "",
+        "1. 给它建一个单独的工作区（不动你现在的目录）：",
+        "     git -C %s worktree add --detach %s %s" % (repo, wt, ref),
+        "2. 装 agent（一次）：把 %s 拷到 ~/.kiro/agents/brain-reflector.json，" % REFLECTOR_AGENT,
+        "   prompt 改成 file://%s；不装也行，用默认 agent，下面的消息里已经带着全部说明。" % REFLECTOR_PROMPT,
+        "3. 在 KiroCrew 里新建会话：工作目录选 %s，agent 选 brain-reflector，模型 claude-opus-5.5；" % wt,
+        "   把下面两条 ==== 之间的内容整段发给它。",
+        "4. 它写完以后，在项目里先预览，再写入（写 Brain 分支、登记缺口）：",
+        "     brain reflect --key %s --from %s" % (key, os.path.join(wt, out)),
+        "     brain reflect --key %s --from %s --apply" % (key, os.path.join(wt, out)),
+        "5. 用完删掉工作区：git -C %s worktree remove --force %s" % (repo, wt),
+        "",
+        "==== 发给会话的内容 ====",
+        message,
+        "==== 结束 ===="]
+    return "\n".join(steps) + "\n"

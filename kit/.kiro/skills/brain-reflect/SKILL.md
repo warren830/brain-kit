@@ -1,6 +1,6 @@
 ---
 name: brain-reflect
-description: Use when a person corrected you or rejected something, when a decision or trap will matter beyond this run, when a Brain entry turned out wrong, and before hand-over or acceptance - to write Brain proposals the team reviews.
+description: Use when a person corrected you or rejected something, when a decision or trap will matter beyond this run, when a Brain entry turned out wrong, when knowledge or a test is missing, and before hand-over or acceptance - to write Brain proposals and gaps the team reviews.
 ---
 # Write Brain proposals
 
@@ -46,6 +46,36 @@ One to five lines the next run can act on. State the rule, not the story.
 - Entries from requirement documents (`src` with `D01#S...`) are reviewed one by one: keep each one small.
 - If a person rejected your work (`answer D-n reject ...`), write a `correction` (or `repeats <id>`) citing that
   decision or voucher id. Reflect warns about rejections nobody wrote down.
+- If they rejected review items at acceptance (`answer D-n reject A-3,D-7 ...`), write one `correction` per item,
+  with the item id and the voucher id in `src` (`src: A-3, V-1a2b3c4d5e`). Reflect warns about each item nobody
+  wrote down.
+
+## Gaps: what is missing becomes the next requirement
+
+Some things do not belong in the Brain yet: knowledge nobody could give you, a test that should exist, a check a
+person did by hand. Write one `brain-gap` block each (next to your proposals). `brain reflect --apply` files every
+new gap as a requirement (an intent with source `gap`, `brain intent list` shows it); the same title and text are
+filed once.
+
+````
+```brain-gap
+title: 退款对账没有自动测试
+kind: test
+refs: AC-2, D-4, src/pay/reconcile.py
+---
+What is missing, what in this run showed it, and what done looks like.
+```
+````
+
+| field | what |
+|---|---|
+| `title` | required, one line, at most 200 characters: the next requirement's title |
+| `kind` | `knowledge` (a question the repo and the Brain could not answer), `test` (an AC without a test, a defect found late, a manual check), `other` |
+| `refs` | optional, comma separated: AC ids, decision ids, entry ids, paths |
+| text after `---` | required: the next requirement's description |
+
+The same content rules apply (no secrets, personal data, amounts, placeholders, instruction lines). Only gaps
+outside this run's scope: what this run should do, it does.
 
 ## When you rely on the Brain
 Cite the entry id in `decisions.md` (for example "per T-PAY-1-2"). That is how the team learns which entries are

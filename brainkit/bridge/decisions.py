@@ -4,6 +4,10 @@ A run on the team runner that needs a person writes runs/<KEY>/park.json, pushes
   {"schema": 1, "status": "waiting", "kind": "clarify|design|plan|acceptance|action|other",
    "ask": "owner|product|builder|security|data", "question": "...", "options": [{"id": "A", "text": "..."}],
    "recommend": "A", "lean_request": "INCEPTION 8cf2cbce", "refs": ["D01#S003"]}
+An acceptance question may carry "review_items": [{"id": "D-7", "text": "..."}, {"id": "A-3", "text": "..."}]: every
+decision the agent took itself and every assumption, reviewed in one batch. They are posted as a checklist; the reply
+`answer D-<n> approve` approves them all, `answer D-<n> reject A-3,D-7 [note]` rejects the listed ones (delivered to
+the run as corrections; the voucher records rejected_items).
 The bridge posts it on the MR as D-<n>, waits for a reply line `answer D-<n> <A|approve|reject> [note]`, and checks:
   right person   the GitLab author is allowed for this kind of decision (decision_roles from main, not from the run)
   right question the reply names this decision id; the decision belongs to this run
@@ -21,7 +25,7 @@ import os
 import re
 
 from .. import sign
-from ..common import BrainError, iso, utcnow, write_json
+from ..common import BrainError, iso, plain, utcnow, write_json
 from ..intake import checks
 
 KINDS = ("clarify", "design", "plan", "acceptance", "action", "other")
@@ -32,6 +36,10 @@ DEFAULT_ROLES = {"clarify": ["owner", "product"], "requirements": ["product"], "
                  "plan": ["builder"], "acceptance": ["product"], "action": ["security"], "other": ["owner"]}
 ANSWER_RE = re.compile(r"^\s*(?:answer|答|回答)\s+(D-[1-9][0-9]*)\s+([A-H]|approve|reject)\b[ \t:：-]*(.*)$", re.I)
 LEAN_REQ_RE = re.compile(r"^(%s) ([0-9a-f]{6,64})$" % "|".join(LEAN_KINDS))
+ITEM_ID_RE = re.compile(r"^[AD]-[1-9][0-9]{0,3}$")     # review items: decisions D-n (Who = agent), assumptions A-n
+ITEMS_RE = re.compile(r"^([AD]-[1-9][0-9]{0,3}(?:(?:\s*[,，、]\s*|\s+)[AD]-[1-9][0-9]{0,3})*)(?![0-9A-Za-z_-])"
+                      r"[ \t:：,，、-]*(.*)$", re.I)
+MAX_REVIEW_ITEMS = 50
 KIND_LABEL = {"clarify": "澄清", "design": "设计", "plan": "计划", "acceptance": "验收", "action": "危险动作",
               "other": "其他"}
 
@@ -68,12 +76,31 @@ def validate_park(park) -> list:
                  "DESIGN separately)" % (LEAN_KINDS,))
     if lr and opts:
         p.append("a Lean approval request is answered approve/reject; leave options empty")
+    items = park.get("review_items")
+    if items is not None:
+        kind = LEAN_KIND_ROLE.get(str(lr).split(" ", 1)[0]) if lr and LEAN_REQ_RE.match(str(lr)) else park.get("kind")
+        if kind != "acceptance" or opts:
+            p.append("review_items go with an acceptance question answered approve/reject (no options)")
+        if not isinstance(items, list) or len(items) > MAX_REVIEW_ITEMS:
+            p.append("review_items must be a list of at most %d" % MAX_REVIEW_ITEMS)
+        else:
+            ids = [i.get("id") if isinstance(i, dict) else None for i in items]
+            if any(not ITEM_ID_RE.match(str(i)) for i in ids) or len(set(ids)) != len(ids):
+                p.append("review_items ids must be distinct D-<n> (decisions) or A-<n> (assumptions)")
+            if any(not isinstance(i, dict) or not plain(i.get("text")) or not str(i.get("text")).strip()
+                   or len(i["text"]) > 200 for i in items):
+                p.append("review_items text: one line, 1-200 characters")
     return p
 
 
 def _block(text) -> str:
     """Run-written text, shown verbatim and inert (no quick actions, mentions or markdown)."""
     return "```text\n%s\n```" % str(text).replace("```", "ˋˋˋ")
+
+
+def _inline(text) -> str:
+    """One line of run-written text as inline code: no mentions, links or markdown; quick actions need a line start."""
+    return "`%s`" % " ".join(str(text).split()).replace("`", "ˋ")
 
 
 def _neutral_note(note) -> str:
@@ -183,7 +210,14 @@ class DecisionLoop:
         if park.get("refs"):
             body.append("依据：%s" % ", ".join(str(x) for x in park["refs"][:10]))
         lines.append(_block("\n".join(body)))
+        items = park.get("review_items") or []
+        if items:
+            lines.append("待审项（agent 在权限内自己定的默认做法和假设，一次审完）：\n" + "\n".join(
+                "- [ ] %s %s" % (i["id"], _inline(i["text"])) for i in items))
         how = "`answer %s A`" % did if park.get("options") else "`answer %s approve` 或 `answer %s reject`" % (did, did)
+        if items:
+            how = ("`answer %s approve`（全部通过），或 `answer %s reject %s 说明`（只驳回列出的项，驳回的项作为纠正送回 run；"
+                   "不列项就是整个驳回）" % (did, did, ",".join(i["id"] for i in items[:2])))
         lines.append("回复一行 %s，后面可以加一句说明。只认第一条有效回复；代码有新推送时，这个问题作废。" % how)
         return "\n\n".join(lines)
 
@@ -225,19 +259,32 @@ class DecisionLoop:
                 if not self._choice_ok(d, choice):
                     self.gl.comment(d["project"], d["iid"], "%s 没有选项 %s，这条回复不算。" % (d["id"], choice))
                     continue
-                valid.setdefault(author, (choice, m.group(3), nid))
+                note, items = m.group(3), ()
+                review = self._review_ids(d) if choice == "reject" else []
+                im = ITEMS_RE.match(note or "") if review else None
+                if im:
+                    listed = [x.upper() for x in re.split(r"[\s,，、]+", im.group(1)) if x]
+                    unknown = [i for i in listed if i not in review]
+                    if unknown:
+                        self.gl.comment(d["project"], d["iid"], "%s 没有待审项 %s，这条回复不算。"
+                                        % (d["id"], "、".join(unknown)))
+                        continue
+                    items = tuple(i for i in review if i in listed)     # the park's order, each once
+                    note = im.group(2)
+                valid.setdefault(author, (choice, note, nid, items))
             if not valid:
                 # replies already looked at are not looked at (or answered) again
                 db.execute("UPDATE decisions SET note_id=? WHERE id=? AND state='open'", (last_id, d["id"]))
                 continue
-            choices = {c for c, _, _ in valid.values()}
+            choices = {(c, items) for c, _, _, items in valid.values()}
             if len(choices) > 1:
                 db.execute("UPDATE decisions SET note_id=?, updated=? WHERE id=?", (last_id, iso(utcnow()), d["id"]))
                 self.gl.comment(d["project"], d["iid"], "%s 收到不同的回答（%s），都不送。请商量后由一个人重新回答。"
-                                % (d["id"], "、".join("@%s=%s" % (a, c) for a, (c, _, _) in sorted(valid.items()))))
+                                % (d["id"], "、".join("@%s=%s%s" % (a, c, " " + ",".join(items) if items else "")
+                                                     for a, (c, _, _, items) in sorted(valid.items()))))
                 continue
-            author, (choice, note, nid) = sorted(valid.items(), key=lambda kv: kv[1][2])[0]
-            if self.deliver(d, row, author, choice, note):
+            author, (choice, note, nid, items) = sorted(valid.items(), key=lambda kv: kv[1][2])[0]
+            if self.deliver(d, row, author, choice, note, items=items, review=self._review_ids(d)):
                 delivered += 1
         return delivered
 
@@ -247,14 +294,22 @@ class DecisionLoop:
         req = self._park_options(d)
         return choice in req
 
-    def _park_options(self, d):
+    def _park(self, d) -> dict:
         kit = self.kit(d["project"])
         row = self.ledger.run(d["run_id"])
         raw = self.gl.file_raw(d["project"], "%s/%s/park.json" % (kit["runs_dir"], row["req"]), d["sha"])
-        park = json.loads(raw.decode("utf-8")) if raw else {}
-        return {o.get("id") for o in park.get("options", [])}
+        return json.loads(raw.decode("utf-8")) if raw else {}
 
-    def deliver(self, d, row, author, choice, note) -> bool:
+    def _park_options(self, d):
+        return {o.get("id") for o in self._park(d).get("options", [])}
+
+    def _review_ids(self, d) -> list:
+        """The review items' ids of an acceptance question (park.json at the question's commit), in order."""
+        if d["kind"] != "acceptance":
+            return []
+        return [i["id"] for i in self._park(d).get("review_items") or [] if isinstance(i, dict) and "id" in i]
+
+    def deliver(self, d, row, author, choice, note, items=(), review=()) -> bool:
         db = self.ledger.db
         if not db.execute("UPDATE decisions SET state='answered', answer=?, answerer=?, updated=? "
                           "WHERE id=? AND state='open'", (choice, author, iso(utcnow()), d["id"])).rowcount:
@@ -265,6 +320,10 @@ class DecisionLoop:
              "choice": choice, "answerer": pseud, "issued_at": iso(utcnow()), "issuer": sign.PRINCIPAL}
         if d["lean_request"]:
             v["lean_request"] = d["lean_request"]
+        if review:
+            v["review_items"] = list(review)          # what this answer reviewed in one batch
+        if items:
+            v["rejected_items"] = list(items)         # rejected one by one; the rest stand
         v["voucher_id"] = "V-" + sign.digest(v)[:10]
         sig = sign.sign(v, self.cfg["signing_key"])
         write_json(os.path.join(self.cfg["vouchers_dir"], d["run_id"], v["voucher_id"] + ".json"),
@@ -272,7 +331,7 @@ class DecisionLoop:
         if self.cfg.get("publish_vouchers"):
             self.publish(d["run_id"], v["voucher_id"])
         db.execute("UPDATE decisions SET voucher_id=? WHERE id=?", (v["voucher_id"], d["id"]))
-        msg = self.answer_message(d, choice, note, pseud, v["voucher_id"])
+        msg = self.answer_message(d, choice, note, pseud, v["voucher_id"], items=items, review=review)
         try:
             self.kc.send(row["slot"], msg, v["voucher_id"])
         except BrainError as e:
@@ -281,18 +340,29 @@ class DecisionLoop:
             return False
         db.execute("UPDATE decisions SET state='delivered', updated=? WHERE id=? AND state='answered'",
                    (iso(utcnow()), d["id"]))
-        self.gl.comment(d["project"], d["iid"], "%s 已收到 @%s 的回答：%s，已送回 %s（凭证 %s）。"
-                        % (d["id"], author, choice, d["run_id"], v["voucher_id"]))
+        self.gl.comment(d["project"], d["iid"], "%s 已收到 @%s 的回答：%s%s，已送回 %s（凭证 %s）。"
+                        % (d["id"], author, choice, "（驳回 %s）" % "、".join(items) if items else "",
+                           d["run_id"], v["voucher_id"]))
         self.out("delivered %s=%s to %s" % (d["id"], choice, d["run_id"]))
         return True
 
     @staticmethod
-    def answer_message(d, choice, note, pseud, voucher_id) -> str:
+    def answer_message(d, choice, note, pseud, voucher_id, items=(), review=()) -> str:
         """Ids, the choice and a neutralized one-line note. For a Lean request, the one approval line Lean reads."""
         lines = ["决策 %s 已答（凭证 %s，答复人 %s）：%s。" % (d["id"], voucher_id, pseud, choice)]
+        if items:
+            rest = [i for i in review if i not in items]
+            lines.append("驳回的待审项：%s；%s。" % (", ".join(items), "其余待审项通过：%s" % ", ".join(rest)
+                                                 if rest else "没有其余待审项"))
+        elif review and choice == "approve":
+            lines.append("待审项全部通过：%s。" % ", ".join(review))
         n = _neutral_note(note)
         if n:
             lines.append("说明：%s" % n)
+        if items:
+            lines.append("把驳回的每一项当作纠正：改掉它，在 decisions.md 记一行（写明 %s、%s 和项号），并为每一项写一个"
+                         " type: correction 的 brain-proposal（src 写项号和 %s）；改完重新请求验收。"
+                         % (d["id"], voucher_id, voucher_id))
         lines.append("把 park.json 的 status 改成 answered，按这个回答继续。")
         if d["lean_request"]:
             kind, h = d["lean_request"].split(" ", 1)

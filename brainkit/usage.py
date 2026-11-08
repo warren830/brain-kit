@@ -23,7 +23,7 @@ from .common import git
 
 CITE_RE = re.compile(r"(?<![A-Za-z0-9-])([PTIJ]-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3})(?![0-9-])")
 LEGACY_CITE_RE = re.compile(r"(?<![A-Za-z0-9-])([PTIJ]-[0-9]{1,5})(?![0-9-])")
-PROPOSAL_BLOCK_RE = re.compile(r"^\s*```+\s*brain-proposal\s*$.*?^\s*```+\s*$", re.M | re.S)
+PROPOSAL_BLOCK_RE = re.compile(r"^\s*```+\s*brain-(?:proposal|gap)\s*$.*?^\s*```+\s*$", re.M | re.S)
 
 
 def strip_proposals(text) -> str:

@@ -17,6 +17,9 @@
   brain reflect [--key KEY] [--ref REF | --from FILE] [--apply [--no-commit] [--push]]
                                                   a run's brain-proposal blocks -> a Brain MR (brain/<KEY>-reflect-<n>)
   brain usage [--ref REF] [--json] [--min-runs N] which entries runs cite, useful rate, repeat rate
+  brain intent add|list|show|close ...            requirements from alerts, tech debt, schedules, Eval gaps (commands/)
+  brain reflect --draft KEY                       instructions for a fresh session to draft the proposals
+  brain trace KEY / brain eval / brain golden ... run trace, Eval v1, golden tasks and ablation (commands/)
 """
 from __future__ import annotations
 
@@ -38,6 +41,7 @@ KIT_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 TEMPLATES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "templates")
 CREW_AGENT_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "crew", "brain-dev.json")
 CREW_HOOK = ".kiro/brain/lean-hook.py"
+VENDORED_LEAN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor", "aidlc-lean")
 
 
 def crew_agent_path():
@@ -163,10 +167,13 @@ def cmd_install(a):
     repo = os.path.abspath(a.repo)
     if not os.path.isdir(repo):
         raise BrainError("not a directory: %s" % repo)
-    if a.lean:
-        lean.install(repo, os.path.abspath(a.lean))
+    lean_src = os.path.abspath(a.lean) if a.lean else (VENDORED_LEAN if os.path.exists(
+        os.path.join(VENDORED_LEAN, "install.sh")) else None)
+    if lean_src:
+        lean.install(repo, lean_src)
     elif not lean.installed(repo):
-        print("WARN: AI-DLC Lean is not installed; pass --lean <path-to-aidlc-lean> (the middle step uses it)")
+        print("WARN: AI-DLC Lean is not installed: run `git submodule update --init` in brain-kit "
+              "(vendor/aidlc-lean), or pass --lean <path-to-aidlc-lean>")
     for dirpath, _, files in os.walk(KIT_SRC):
         for name in files:
             src = os.path.join(dirpath, name)
@@ -382,6 +389,8 @@ def cmd_start(a):
         raise BrainError("use --doc (take documents in now) or --package (an existing package), not both")
     if a.doc and (not a.consent or not a.classification):
         raise BrainError("--doc needs --consent and --classification (see `brain intake --help`)")
+    from . import intents
+    doc = None
     if cfg["tracker"] == "jira":
         if not a.key or not JIRA_RE.match(a.key):
             raise BrainError("tracker is jira: pass --key <JIRA key>")
@@ -395,8 +404,14 @@ def cmd_start(a):
             doc = claims.read(repo, key)
             if doc and doc.get("owner") != me:
                 raise BrainError("%s is claimed by %s" % (key, doc.get("owner")))
-        key = _claim(repo, cfg, me, key, a.title or slug.replace("-", " "))
+            if doc and doc.get("closed"):
+                raise BrainError("%s is closed (%s)" % (key, (doc["closed"] or {}).get("reason", "")))
+            bad = intents.doc_problems(doc) if intents.is_intent(doc) else []
+            if bad:
+                raise BrainError("claim/%s: %s" % (key, "; ".join(bad)))
+        key = _claim(repo, cfg, me, key, a.title or (doc or {}).get("title") or slug.replace("-", " "))
         checked = True
+    title = a.title or (doc or {}).get("title") or slug.replace("-", " ")
     rec_path = runrec.path(cfg["runs_dir"], key)
     base, brain_commit = _brain_base(repo, cfg)
     if git(repo, "cat-file", "-e", "%s:%s" % (base, rec_path), check=False).returncode == 0:
@@ -415,12 +430,17 @@ def cmd_start(a):
     git(repo, "switch", "-q", "-c", br, base)
     if a.package:
         materials.append(attach_package(repo, store, a.package))
-    intent = lean.new_intent(repo, "%s-%s" % (key.lower(), slug), "%s %s" % (key, (a.title or slug.replace("-", " "))))
+    intent = lean.new_intent(repo, "%s-%s" % (key.lower(), slug), "%s %s" % (key, title))
     paths = [p.strip() for p in (a.paths or "").split(",") if p.strip()]
     rec = runrec.new(key, me, br, intent, brain_commit, __version__, paths, iso(utcnow()), checked,
                      tracker=cfg["tracker"], materials=materials)
     write_json(os.path.join(repo, rec_path), rec)
-    git(repo, "add", "--", rec_path, os.path.join(lean.DOCS, intent))
+    intent_md = []    # the claim's text (an intent from debt, alert, schedule, eval or gap) for the run's agent
+    if intents.is_intent(doc):
+        intent_md.append(os.path.join(cfg["runs_dir"], key, intents.INTENT_MD))
+        with open(os.path.join(repo, intent_md[0]), "w", encoding="utf-8") as f:
+            f.write(intents.render_md(doc))
+    git(repo, "add", "--", rec_path, os.path.join(lean.DOCS, intent), *intent_md)
     if os.path.isdir(os.path.join(repo, lean.DOCS, "audit")):
         git(repo, "add", "--", os.path.join(lean.DOCS, "audit"))
     git(repo, "commit", "-q", "-m", "%s: start run (brain %s)" % (key, brain_commit[:10]))
@@ -432,6 +452,8 @@ def cmd_start(a):
                                                                 ", pushed" if pushed else ""))
     if materials:
         print("Materials: %s/%s/ (read-only; start from toc.md)" % (MATERIALS_DIR, materials[0]["package"]))
+    if intent_md:
+        print("Intent: %s (source %s; the agent reads it first)" % (intent_md[0], doc.get("source", "product")))
     print("Next: open Kiro here with the brain-dev agent; keep %s/%s/aidlc-state.md current;"
           " `brain handoff` when the runner should take over." % (lean.DOCS, intent))
     return 0
@@ -476,6 +498,17 @@ def publish_materials(store, rec) -> list:
     return warn
 
 
+def runner_kit_problems(repo) -> list:
+    """What the team runner's session needs in git (not just on this disk): Lean, and the hook adapter that
+    carries Lean's hooks in KiroCrew. Without the adapter every tool call of the runner's session is blocked."""
+    probs = []
+    for path, why in ((".kiro/aidlc-lean/aidlc_lean.py", "AI-DLC Lean"),
+                      (CREW_HOOK, "the KiroCrew hook adapter (brain install wrote it)")):
+        if git(repo, "ls-files", "--error-unmatch", "--", path, check=False).returncode != 0:
+            probs.append("%s is not committed: %s; commit it on main through an MR" % (path, why))
+    return probs
+
+
 def cmd_handoff(a):
     repo = repo_root()
     cfg = config.load(repo)
@@ -491,6 +524,9 @@ def cmd_handoff(a):
     dirty = _dirty(repo, ignore=(rel,))
     if dirty:
         raise BrainError("commit your work first:\n  " + "\n  ".join(dirty))
+    missing = runner_kit_problems(repo)
+    if missing:
+        raise BrainError("the team runner could not run this branch: " + "; ".join(missing))
     if not a.no_push:
         for w in publish_materials(_store(repo, a.store), rec):
             print("WARN: " + w)
@@ -677,25 +713,37 @@ def _reflect_key(repo, cfg, given):
 def cmd_reflect(a):
     repo = repo_root()
     cfg = config.load(repo)
+    store = a.vouchers or os.path.join(os.path.abspath(os.path.expanduser(
+        os.environ.get("BRAIN_INTAKE_DIR") or git(repo, "config", "brain.intake", check=False).stdout.strip()
+        or "~/.brain/intake")), "vouchers")
+    if getattr(a, "draft", None):          # print the reflector session's instructions; changes nothing
+        if a.apply or a.from_file:
+            raise BrainError("--draft only prints the reflector's instructions (no --apply, no --from)")
+        print(reflect.draft(repo, cfg, a.draft, ref=a.ref, vouchers_dir=store), end="")
+        return 0
     key = _reflect_key(repo, cfg, a.key)
     base = _fetch_brain_refs(repo, cfg)
     mcfg = reflect.main_cfg(repo, base)
     text, label = reflect.source_text(repo, cfg, key, ref=a.ref, from_file=a.from_file)
     proposals, probs = reflect.parse(text)
-    if not proposals and not probs:
+    gaps, more = reflect.parse_gaps(text)
+    probs += more
+    if not proposals and not gaps and not probs:
         print("%s 里没有 brain-proposal 块：这个 run 没有提出 Brain 条目。" % label)
         return 0
     brain = entries.Brain.from_git(repo, base, mcfg["brain_dir"])
     used, pending = reflect.open_branches(repo, mcfg["brain_dir"])
     ops, more, notes = reflect.plan(brain, proposals, key, pending=pending, used_extra=used)
     probs += more
-    store = a.vouchers or os.path.join(os.path.abspath(os.path.expanduser(
-        os.environ.get("BRAIN_INTAKE_DIR") or git(repo, "config", "brain.intake", check=False).stdout.strip()
-        or "~/.brain/intake")), "vouchers")
+    rows, more = reflect.plan_gaps(repo, cfg, gaps, key)
+    probs += more
     lost = reflect.rejected_without_correction(store, key, proposals)
-    print("brain reflect %s：%s 里有 %d 个提案，对照 %s" % (key, label, len(proposals), base))
+    print("brain reflect %s：%s 里有 %d 个提案%s，对照 %s" % (key, label, len(proposals),
+                                                      "、%d 个缺口" % len(gaps) if gaps else "", base))
     for op in ops:
         print("  %-9s %s %s" % (op.kind, op.kw.get("file") or op.kw.get("eid"), op.kw.get("type", "")))
+    for line in reflect.gap_lines(rows, cfg["tracker"]):
+        print(line)
     for n in notes:
         print("  NOTE", n)
     for w in lost:
@@ -704,15 +752,27 @@ def cmd_reflect(a):
         print("  FAIL", p)
     if probs:
         return 1
-    if not ops:
-        print("这些提案都已写进 Brain，没有新东西：不开 MR。")
-        return 0
-    if not reflect.substantive(ops):
-        print("只有补出处（same），没有新知识：不开 MR。")
+    fresh = reflect.new_gaps(rows) if cfg["tracker"] == "none" else []
+
+    def file_gaps():
+        reflect.file_gaps(repo, cfg, rows, key, _me(repo, cfg))
+        for line in reflect.gap_lines(fresh, cfg["tracker"]):
+            print(line)
+
+    if not ops or not reflect.substantive(ops):
+        if proposals:
+            print("这些提案都已写进 Brain，没有新东西：不开 MR。" if not ops else "只有补出处（same），没有新知识：不开 MR。")
+        if fresh and a.apply:
+            file_gaps()
+        elif fresh:
+            print("这是预览。加 --apply 登记这 %d 个缺口（每个成为一个新需求）。" % len(fresh))
         return 0
     if not a.apply:
-        print("这是预览。加 --apply 在 main 上开新分支写入（不动你当前的工作区）。")
+        print("这是预览。加 --apply 在 main 上开新分支写入（不动你当前的工作区）%s。"
+              % ("，并登记 %d 个缺口" % len(fresh) if fresh else ""))
         return 0
+    if fresh:
+        file_gaps()
     br = reflect.branch_name(repo, key)
     wt = os.path.abspath(a.worktree) if a.worktree else os.path.join(reflect.worktree_root(repo),
                                                                      br.replace("/", "-"))
@@ -729,7 +789,7 @@ def cmd_reflect(a):
                                            purge_approvers=mcfg.get("purge_approvers") or [])
         if errors:
             raise BrainError("brain lint refused the result:\n  " + "\n  ".join(errors))
-        desc = reflect.mr_description(key, ops, warnings + lost, label)
+        desc = reflect.mr_description(key, ops, warnings + lost, label, gaps=rows)
         title = "Brain: %s reflect（%d 条）" % (key, sum(1 for op in ops if op.kind != "same"))
         with open(wt + ".mr.md", "w", encoding="utf-8") as f:
             f.write("%s\n\n%s" % (title, desc))
@@ -787,7 +847,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("install")
     s.add_argument("repo")
-    s.add_argument("--lean", help="path to an AI-DLC Lean checkout")
+    s.add_argument("--lean", help="path to an AI-DLC Lean checkout (default: brain-kit's vendor/aidlc-lean)")
     s.add_argument("--team")
     s.add_argument("--prefix", help="requirement key prefix, e.g. OMS")
     s.set_defaults(fn=cmd_install)
@@ -884,6 +944,11 @@ def main(argv=None):
     s.add_argument("--json", action="store_true")
     s.add_argument("--min-runs", type=int, default=3, help="loaded by this many runs and never cited = candidate")
     s.set_defaults(fn=cmd_usage)
+    import importlib
+    import pkgutil
+    from . import commands
+    for m in sorted(pkgutil.iter_modules(commands.__path__), key=lambda m: m.name):
+        importlib.import_module("%s.%s" % (commands.__name__, m.name)).register(sub)
     a = ap.parse_args(argv)
     try:
         return a.fn(a)

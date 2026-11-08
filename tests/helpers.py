@@ -10,7 +10,9 @@ import tempfile
 import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LEAN_SRC = os.environ.get("BRAIN_TEST_LEAN") or os.path.join(os.path.dirname(ROOT), "aidlc", "aidlc-lean")  # an AI-DLC Lean checkout
+LEAN_SRC = os.environ.get("BRAIN_TEST_LEAN") or (os.path.join(ROOT, "vendor", "aidlc-lean")  # the pinned submodule
+                                                 if os.path.exists(os.path.join(ROOT, "vendor", "aidlc-lean", "install.sh"))
+                                                 else os.path.join(os.path.dirname(ROOT), "aidlc", "aidlc-lean"))
 
 
 def sh(*cmd, cwd=None, check=True, env=None):
