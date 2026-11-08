@@ -10,7 +10,7 @@ import tempfile
 import urllib.parse
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LEAN_SRC = os.environ.get("BRAIN_TEST_LEAN", os.path.expanduser("~/warren_ws/aidlc/aidlc-lean"))
+LEAN_SRC = os.environ.get("BRAIN_TEST_LEAN") or os.path.join(os.path.dirname(ROOT), "aidlc", "aidlc-lean")  # an AI-DLC Lean checkout
 
 
 def sh(*cmd, cwd=None, check=True, env=None):

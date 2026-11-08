@@ -3,7 +3,7 @@
 An entry is one header line and the text under it, up to the next header, the next heading or the end of file:
 
   <!-- id:T-OMS-1-2 type:pitfall side:builder rel:new src:D01#S030,V-1a2b3c4d5e prop:9f3c2a1b -->
-  订单号是 FCN + 9 位；样例文件里的 7 位是旧格式。
+  退款单号是 RF + 9 位；样例文件里的 7 位是旧格式。
 
 Ids are <side letter>-<KEY>-<n> (P product, T tech, I improvement, J project). Two people writing entries for
 different requirements can never pick the same id; reflect also skips ids used on open brain/* branches.

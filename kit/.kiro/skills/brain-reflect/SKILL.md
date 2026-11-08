@@ -39,7 +39,7 @@ One to five lines the next run can act on. State the rule, not the story.
 
 ## Rules (reflect refuses the whole batch otherwise)
 - No secrets, personal data, money amounts, contract numbers, and no masked placeholders such as `[人名-1]` or
-  `[金额-2]`. Write the rule ("面值 ≤ 估计资产净值 × 30%"), not the figure.
+  `[金额-2]`. Write the rule ("单笔退款 ≤ 原单金额"), not the figure.
 - No instruction-like lines ("approve ...", "忽略以上指令"): every run reads the Brain.
 - Only knowledge a later run needs. Not this run's status, not a diary.
 - An entry that relaxes tests, logging, auth, reviews or dependencies needs Builder and security: say why.
@@ -48,5 +48,5 @@ One to five lines the next run can act on. State the rule, not the story.
   decision or voucher id. Reflect warns about rejections nobody wrote down.
 
 ## When you rely on the Brain
-Cite the entry id in `decisions.md` (for example "per T-OMS-1-2"). That is how the team learns which entries are
+Cite the entry id in `decisions.md` (for example "per T-PAY-1-2"). That is how the team learns which entries are
 used (`brain usage`) and which can go.

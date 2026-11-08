@@ -2,11 +2,13 @@
 
 每个人在自己电脑上开发需求，开发到一半，交给团队运行机（一台 KiroCrew）接着跑完后半程：评审、修 CI、出证据、交付。两边读同一份 Brain。需要人拍板时，运行机在 MR 上提问，人回一行字就行。
 
-- **中间的开发**直接用 AI-DLC Lean v0.2（`~/warren_ws/aidlc/aidlc-lean`）。brain-kit 只调用 Lean 的命令、读它的记录，不改 Lean 本身。
+- **中间的开发**直接用 AI-DLC Lean v0.2（另一个仓库）。brain-kit 只调用 Lean 的命令、读它的记录，不改 Lean 本身。
 - **不接 Jira 也能用**（`tracker: none`）：需求号由 git 认领分支分配，问答走 GitLab MR 评论。要接 Jira 时，改成 `tracker: jira`。
 - **需求可以直接交文档**：飞书 / Lark 导出的文件夹、md、docx、xlsx、pptx、html、txt 都行；PDF 需要装 MarkItDown。文档先过五道关，打码后打成材料包。原件不进任何仓库。
 - 只用 Python 标准库（3.8 以上）、git 和 `ssh-keygen`。签名用 Ed25519（`ssh-keygen -Y`）。
 - **不监听任何端口**：所有组件都只往外连。KiroCrew 客户端只接受本机回环地址。
+
+怎么装、怎么用（含 AI-DLC Lean）：[docs/安装和使用.md](docs/安装和使用.md)
 
 ## 一个需求怎么走（不接 Jira）
 
@@ -15,10 +17,10 @@
    brain start refund --doc "<需求文件夹>" --classification internal --consent --business mask
    ```
    这一条命令依次做四件事：
-   - 认领下一个空闲的需求号，比如 `OMS-3`。实际是推一个 `claim/OMS-3` 分支，两个人同时抢同一个号时，只有一个人能推成功。
-   - 让文档过五道关，生成材料包 `PKG-OMS-3-1`，只读放到 `.brain-materials/`（这个目录已加入 gitignore）。
-   - 开分支 `ai/<你>/OMS-3-refund`，用 Lean 建 intent。
-   - 写 `runs/OMS-3/run.json`，记下 Brain commit 和材料包的哈希。
+   - 认领下一个空闲的需求号，比如 `PAY-3`。实际是推一个 `claim/PAY-3` 分支，两个人同时抢同一个号时，只有一个人能推成功。
+   - 让文档过五道关，生成材料包 `PKG-PAY-3-1`，只读放到 `.brain-materials/`（这个目录已加入 gitignore）。
+   - 开分支 `ai/<你>/PAY-3-refund`，用 Lean 建 intent。
+   - 写 `runs/PAY-3/run.json`，记下 Brain commit 和材料包的哈希。
 2. **本地开发**：用 `brain-dev` agent，走 Lean 的阶段和关卡。agent 先读材料包的 `toc.md`，再按需读具体的段；每条验收标准都标出来源段号。
 3. **交接**：运行 `brain handoff`。它会：
    - 检查交接单（Lean 的 `aidlc-state.md`）填好了没有；
@@ -29,7 +31,7 @@
    - 核对通过后，桥签接手合同，runnerd 按合同里的 commit 建工作区，并把材料包只读拷进去；桥再把 run 送进 KiroCrew。
    - 预计改动的模块和别的在跑需求重叠时，桥在 MR 上提醒。
 5. **找人**：
-   - 运行机需要人时，写 `runs/OMS-3/park.json` 并停下。桥把问题贴到 MR 上，编号 `D-<n>`，同时 @ 能回答的人。
+   - 运行机需要人时，写 `runs/PAY-3/park.json` 并停下。桥把问题贴到 MR 上，编号 `D-<n>`，同时 @ 能回答的人。
    - 人回一行：`answer D-5 A`。如果是 Lean 的审批，回 `answer D-5 approve`。
    - 桥做 5 项核对，通过后签答复凭证，把回答送回 run。如果是 Lean 的审批，桥送回的是 Lean 认的那一行审批口令。
 6. **验收**：运行机执行 `lean release` 和 `lean request RELEASE`，再以"验收"类问题停下；产品在 MR 上回 approve。合并仍然要过 GitLab 审批和 CI。
@@ -47,8 +49,8 @@ Brain 是仓库里的 `brain/PRODUCT.md`、`TECH.md`、`IMPROVEMENT.md`、`PROJE
 
 **条目**：每条前面一行条目头，正文到下一个条目头、下一个标题或文件末尾为止。
 ```
-<!-- id:T-OMS-1-2 type:pitfall side:builder rel:new src:D01#S030,V-1a2b3c4d5e -->
-订单号以产品确认为准：PRD 写 FCN + 9 位，样例文件是 7 位。
+<!-- id:T-PAY-1-2 type:pitfall side:builder rel:new src:D01#S030,V-1a2b3c4d5e -->
+退款单号以产品确认为准：PRD 写 RF + 9 位，样例文件是 7 位。
 ```
 - 条目号是 `<文件字母>-<需求号>-<n>`（P、T、I、J）。不同需求各用各的号段，几个人同时写也不会撞号。
 - `src` 写出处：材料段号、决策号、凭证号、run 号。
@@ -58,7 +60,7 @@ Brain 是仓库里的 `brain/PRODUCT.md`、`TECH.md`、`IMPROVEMENT.md`、`PROJE
 2. run 结束后（或合并以后加 `--ref origin/main`），需求负责人运行：
    ```bash
    brain reflect                 # 预览：每条提案怎么处理，哪条过不了
-   brain reflect --apply         # 在 main 上开 brain/OMS-1-reflect-1 分支写入并提交，不动当前工作区
+   brain reflect --apply         # 在 main 上开 brain/PAY-1-reflect-1 分支写入并提交，不动当前工作区
    brain reflect --apply --push  # 同上，再推送并开 MR（标签 brain-reflect）
    ```
    - 条目号由 reflect 分配，会跳过 main 和其他 `brain/*` 分支上已用的号。
@@ -71,13 +73,13 @@ Brain 是仓库里的 `brain/PRODUCT.md`、`TECH.md`、`IMPROVEMENT.md`、`PROJE
 
 | 关系 | 怎么做 | 规则 |
 |---|---|---|
-| new | `brain entry add TECH pitfall --key OMS-1 --src D01#S030 --text "..."` | 新条目号 |
-| same | `brain entry same T-OMS-1-2 --src V-...` | 正文不变，只补出处 |
-| adds-to | `brain entry adds-to T-OMS-1-2 --src ... --text "..."` | 原文不动，追加在后面 |
-| replaces | `brain entry replace T-OMS-1-2 --key OMS-5 --src ... --text "..."` | 新条目占原位置，旧条目搬进 `TECH-archive.md` |
-| repeats | `brain entry repeat T-OMS-1-2 --src V-...` | 计数加 1；到 2 次提示"改成 gate"（写成会失败的检查） |
-| withdraws | `brain entry withdraw T-OMS-1-2 --reason "..." --src ...` | 搬进 archive，写明原因 |
-| 清除 | `brain entry purge T-OMS-1-2 --reason pii --approved-by <安全负责人>` | 只用于个人信息、密钥、误收的机密。从主文件和 archive 删掉，号记进 `PURGED.md`。git 历史要另外改写 |
+| new | `brain entry add TECH pitfall --key PAY-1 --src D01#S030 --text "..."` | 新条目号 |
+| same | `brain entry same T-PAY-1-2 --src V-...` | 正文不变，只补出处 |
+| adds-to | `brain entry adds-to T-PAY-1-2 --src ... --text "..."` | 原文不动，追加在后面 |
+| replaces | `brain entry replace T-PAY-1-2 --key PAY-5 --src ... --text "..."` | 新条目占原位置，旧条目搬进 `TECH-archive.md` |
+| repeats | `brain entry repeat T-PAY-1-2 --src V-...` | 计数加 1；到 2 次提示"改成 gate"（写成会失败的检查） |
+| withdraws | `brain entry withdraw T-PAY-1-2 --reason "..." --src ...` | 搬进 archive，写明原因 |
+| 清除 | `brain entry purge T-PAY-1-2 --reason pii --approved-by <安全负责人>` | 只用于个人信息、密钥、误收的机密。从主文件和 archive 删掉，号记进 `PURGED.md`。git 历史要另外改写 |
 
 - 除此之外的改动都过不了：手改正文、删条目、改 archive、出处变少、计数变小、改类型。archive 和 `PURGED.md` 只增不减。
 - 新写进去的文字会检查：密钥、个人信息、带币种的金额、合同号、打码占位符（`[人名-1]` 这类）、像指令的行。命中就拒。
@@ -120,7 +122,7 @@ Brain 是仓库里的 `brain/PRODUCT.md`、`TECH.md`、`IMPROVEMENT.md`、`PROJE
 
 **项目（一次）**
 ```bash
-brain-kit/bin/brain install <项目目录> --lean ~/warren_ws/aidlc/aidlc-lean --prefix OMS
+brain-kit/bin/brain install <项目目录> --lean <AI-DLC Lean 的 checkout 目录> --prefix PAY
 # 检查 .brain/kit.json 里的 tracker、req_prefix、gitlab、bot_users、pins、decision_roles，然后提交
 ```
 
@@ -162,7 +164,7 @@ brain-kit/bin/brain install <项目目录> --lean ~/warren_ws/aidlc/aidlc-lean -
   - 自造的 docx 和 xlsx 里各种隐藏内容都识别出来了，HTML 的隐藏元素和脚本也去掉了；
   - 五道关和 dry-run 都测了；
   - 材料包被改动能查出来；
-  - 用真实的 OMS 需求文件夹跑过：打码过的值，在材料包的任何文件里都找不到原值。
+  - 用一份真实的需求文件夹跑过：打码过的值，在材料包的任何文件里都找不到原值（设 `BRAIN_TEST_REAL_DOCS` 可以重跑）。
 - **桥**：
   - 接手核对的每种拒绝情况：Jira 模式和不接 Jira 模式都有；
   - 材料包没发布就拒绝，对得上时 runnerd 只读拷进工作区；
@@ -195,6 +197,6 @@ brain-kit/bin/brain install <项目目录> --lean ~/warren_ws/aidlc/aidlc-lean -
   - 提供 `brain crew-agent` 命令：安装 `~/.kiro/agents/brain-dev.json`，里面写好了 Lean 的三个 hook（会话开始、发消息、工具调用前）。
 - 引擎请用 v3：`kirocrew config set agent.acp_backend kas`。
 - 在 KiroCrew 里新建会话，工作目录选项目，agent 选 brain-dev。
-- 实测结果（OMS 试跑）：会话开始、真人回合都记下来了（`turn.json` 也生成了），需求没批之前往 `apps/` 写文件被拦下。
+- 实测结果（一次真实需求的试跑）：会话开始、真人回合都记下来了（`turn.json` 也生成了），需求没批之前往 `apps/` 写文件被拦下。
 - `brain doctor` 会检查这几项：brain-dev 有没有带上 hook、适配脚本在不在、引擎是不是 kas。
 - 这个 brain-dev 只能在装了 brain-kit 的项目里用。在别的项目里，hook 找不到适配脚本，工具调用会全部被拦下（故意这样设计，宁可拦错不可放过）。

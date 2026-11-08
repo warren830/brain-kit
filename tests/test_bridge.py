@@ -13,7 +13,7 @@ from brainkit.bridge.handoff import Bridge  # noqa: E402
 from brainkit.bridge.kirocrew import KiroCrew  # noqa: E402
 from brainkit.common import load_json, write_json  # noqa: E402
 from brainkit.rest import GitLab, Jira  # noqa: E402
-from tests.helpers import Fake, commit_file, git_repo, keypair, sh, tmpdir  # noqa: E402
+from tests.helpers import LEAN_SRC, Fake, commit_file, git_repo, keypair, sh, tmpdir  # noqa: E402
 
 P = "grp/repo"
 GL = "/api/v4/projects/grp/repo"
@@ -478,7 +478,7 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.bridge.collect(), 1)
         last = self.sends()[-1]["message"].split("\n")[-1]
         self.assertRegex(last, r"^approve DESIGN 8cf2cbce \(via gitlab P-[0-9A-F]{4} V-[0-9a-f]{10}\)$")
-        lean_py = os.path.join(os.path.expanduser("~/warren_ws/aidlc/aidlc-lean"), "kit", ".kiro", "aidlc-lean",
+        lean_py = os.path.join(LEAN_SRC, "kit", ".kiro", "aidlc-lean",
                                "aidlc_lean.py")
         if os.path.exists(lean_py):
             import importlib.util

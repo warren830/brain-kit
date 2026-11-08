@@ -41,17 +41,17 @@ def run_cli(repo, *args):
 class Entries(unittest.TestCase):
     def test_round_trip_keeps_the_file(self):
         text = (HEAD_T + "\n## 外部系统\n\n<!-- id:T-OMS-1-1 type:pitfall side:builder rel:new src:D01#S012 -->\n"
-                "524 冻结失败时不建单。\n\n## 约定\n\n- free text\n\n```\n<!-- id:T-OMS-1-9 type:pitfall -->\n```\n")
+                "支付网关超时时不建单。\n\n## 约定\n\n- free text\n\n```\n<!-- id:T-OMS-1-9 type:pitfall -->\n```\n")
         b = brain_of(TECH=text)
         self.assertEqual(b.files["TECH.md"].render(), text)
         self.assertEqual(list(b.main()), ["T-OMS-1-1"])        # quoted and fenced headers are not entries
-        self.assertEqual(b.main()["T-OMS-1-1"][1].text(), "524 冻结失败时不建单。")
+        self.assertEqual(b.main()["T-OMS-1-1"][1].text(), "支付网关超时时不建单。")
 
     def test_add_under_section_and_ids(self):
         b = brain_of(TECH=HEAD_T, PRODUCT="# PRODUCT\n")
         self.assertEqual(b.new("TECH", "pitfall", "a", "OMS-1", "D01#S001", section="外部系统"), "T-OMS-1-1")
         self.assertEqual(b.new("tech.md", "guideline", "b", "OMS-1", ["RUN-OMS-1-1"], section="外部系统"), "T-OMS-1-2")
-        self.assertEqual(b.new("PRODUCT", "model", "**FCN**：x", "OMS-1", "D01#S022"), "P-OMS-1-1")
+        self.assertEqual(b.new("PRODUCT", "model", "**退款单**：x", "OMS-1", "D01#S022"), "P-OMS-1-1")
         text = b.files["TECH.md"].render()
         self.assertEqual(text.count("## 外部系统"), 1)
         self.assertLess(text.index("T-OMS-1-1"), text.index("T-OMS-1-2"))
@@ -183,8 +183,8 @@ class LintRules(unittest.TestCase):
         self.assertIn("needs status", e)
 
     def test_duplicate_term_warning(self):
-        b = brain_of(PRODUCT="<!-- id:P-OMS-1-1 type:model rel:new src:a -->\n**FCN**：一\n\n"
-                             "<!-- id:P-OMS-2-1 type:model rel:new src:b -->\n**fcn**：二\n")
+        b = brain_of(PRODUCT="<!-- id:P-OMS-1-1 type:model rel:new src:a -->\n**退款单**：一\n\n"
+                             "<!-- id:P-OMS-2-1 type:model rel:new src:b -->\n**退款单**：二\n")
         self.assertTrue(any("also defined" in w for w in lint(b)[1]))
 
 
@@ -205,7 +205,7 @@ src: D-1, RUN-OMS-3-1
 rel: replaces T-OMS-1-1
 src: V-1a2b3c4d5e
 ---
-订单号是 FCN + 9 位（产品已确认）。
+退款单号是 RF + 9 位（产品已确认）。
 ```
 ```brain-proposal
 file: PRODUCT
@@ -222,7 +222,7 @@ class Reflect(unittest.TestCase):
         self.repo = git_repo(os.path.join(tmpdir(self), "r"))
         commit_file(self.repo, ".brain/kit.json", json.dumps({"version": 1, "req_prefix": "OMS"}))
         commit_file(self.repo, "brain/TECH.md", "# TECH\n\n<!-- id:T-OMS-1-1 type:pitfall side:builder rel:new "
-                                                "src:D01#S021 -->\n订单号是 FCN + 9 位。\n")
+                                                "src:D01#S021 -->\n退款单号是 RF + 9 位。\n")
         commit_file(self.repo, "brain/PRODUCT.md", "# PRODUCT\n")
         self.base = sh("git", "-C", self.repo, "rev-parse", "HEAD").stdout.strip()
         sh("git", "-C", self.repo, "switch", "-q", "-c", "ai/alice/OMS-3-x")
@@ -269,7 +269,7 @@ y
         text = " | ".join(probs)
         for want in ("not in the Brain", "PRODUCT takes", "src is required", "is in TECH, not PRODUCT"):
             self.assertIn(want, text)
-        same = reflect.parse("```brain-proposal\nfile: TECH\ntype: pitfall\nsrc: D-5\n---\n订单号是 FCN + 9 位。\n```\n")[0]
+        same = reflect.parse("```brain-proposal\nfile: TECH\ntype: pitfall\nsrc: D-5\n---\n退款单号是 RF + 9 位。\n```\n")[0]
         ops, probs, notes = reflect.plan(b, same, "OMS-3")
         self.assertEqual(([o.kind for o in ops], probs), (["same"], []))
         self.assertFalse(reflect.substantive(ops))
