@@ -27,13 +27,14 @@
    - 把材料包推到 brain-intake；
    - 推送分支，给 MR 打上 `ai-handoff` 标签。
 4. **桥核对后接手**：
-   - 核对 7 项：分支名格式、打标签的人就是分支主人、认领是他本人的、run.json 有效、交接单已填、Brain commit 存在、材料包的哈希对得上。另外，同一个需求不能有两个 run 同时在跑。
+   - 核对 8 项：分支名格式、打标签的人就是分支主人、标签比最后一次推送晚（按 GitLab 自己记的推送时间，不看 commit 上写的日期；`brain handoff` 会等 GitLab 记下推送再打标签）、认领是他本人的、run.json 有效、交接单已填、Brain commit 存在、材料包的哈希对得上。另外，同一个需求不能有两个 run 同时在跑。
    - 核对通过后，桥签接手合同，runnerd 按合同里的 commit 建工作区，并把材料包只读拷进去；桥再把 run 送进 KiroCrew。
    - 预计改动的模块和别的在跑需求重叠时，桥在 MR 上提醒。
 5. **找人**：
    - 运行机需要人时，写 `runs/PAY-3/park.json` 并停下。桥把问题贴到 MR 上，编号 `D-<n>`，同时 @ 能回答的人。
    - 人回一行：`answer D-5 A`。如果是 Lean 的审批，回 `answer D-5 approve`。
    - 桥做 5 项核对，通过后签答复凭证，把回答送回 run。如果是 Lean 的审批，桥送回的是 Lean 认的那一行审批口令。
+   - 问题的第一行写着提交号和 park 指纹；回答只认：问题评论没被改过、问题是在那次推送之后贴的、一个 D-n 只对应一个问题。否则这个问题作废，重问。
 6. **验收**：运行机执行 `lean release` 和 `lean request RELEASE`，再以"验收"类问题停下；产品在 MR 上回 approve。合并仍然要过 GitLab 审批和 CI。
 
 ## Brain：团队共用的知识
@@ -135,7 +136,8 @@ brain-kit/bin/brain install <项目目录> --lean <AI-DLC Lean 的 checkout 目�
 - 系统用户：`brainbot`（跑 KiroCrew 和 runnerd）、`brainbridge`（跑桥）、共用组 `brainspool`。
 - 配置样例：`examples/bridge.json`、`runnerd.json`、`identities.json`。`identities.json` 里的 `roles` 规定谁能回答哪类决策。
 - 服务：`deploy/*.service`。
-- 签名私钥只放在 `brainbridge` 那边，公钥写进 `deploy/allowed_signers`。
+- 签名私钥只放在 `brainbridge` 那边，公钥写进 `deploy/allowed_signers`。签名可以换成单独的签名进程（`bridge.json` 里 `"signer": {"type": "spool", ...}`），桥自己不拿私钥；KiroCrew app 用的就是这种方式。
+- `.brain/kit.json` 里写上 `bridge_user`（桥在 GitLab 上的账号，不能是 bot 账号），用来分清哪些评论是桥贴的。
 - KiroCrew 里：建一个最小 app `brain-bridge`，把它的 `.app_secret` 给 `brainbridge`，权限 0600；再装上 `remote/agents/brain-run.json`。
 
 **GitLab**
@@ -169,7 +171,7 @@ brain-kit/bin/brain install <项目目录> --lean <AI-DLC Lean 的 checkout 目�
   - 接手核对的每种拒绝情况：Jira 模式和不接 Jira 模式都有；
   - 材料包没发布就拒绝，对得上时 runnerd 只读拷进工作区；
   - 重叠提醒；
-  - 决策循环：问题文字不会触发 GitLab 快捷命令；答错人、答错题号、选项不存在都不算；同一个问题只送一次；回答冲突时都不送；分支有新推送后问题作废；答复人只认 main 上配置的角色；送回的审批口令能被 Lean 自己的 `APPROVE_RE` 识别。
+  - 决策循环：交接绑定打标签时的那次推送；回答绑定问题和推送（问题被改、问题早于推送、D-n 被重复使用都不认）；CI 认的设计批准必须对得上现在的设计文件；读 MR 评论超过页数上限时报错而不是悄悄停下；问题文字不会触发 GitLab 快捷命令；答错人、答错题号、选项不存在都不算；同一个问题只送一次；回答冲突时都不送；分支有新推送后问题作废；答复人只认 main 上配置的角色；送回的审批口令能被 Lean 自己的 `APPROVE_RE` 识别。
 - **Brain**：
   - 条目工具的每种改法，以及改完之后 lint 是否放行；
   - 手改正文、删条目、改 archive、出处变少、计数变小、改类型、已归档的号复活，都会被拦；

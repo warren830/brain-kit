@@ -8,7 +8,12 @@ An acceptance question may carry "review_items": [{"id": "D-7", "text": "..."}, 
 decision the agent took itself and every assumption, reviewed in one batch. They are posted as a checklist; the reply
 `answer D-<n> approve` approves them all, `answer D-<n> reject A-3,D-7 [note]` rejects the listed ones (delivered to
 the run as corrections; the voucher records rejected_items).
-The bridge posts it on the MR as D-<n>, waits for a reply line `answer D-<n> <A|approve|reject> [note]`, and checks:
+The bridge posts it on the MR as D-<n> (once GitLab has recorded the push as an MR version); the question's first
+line names the commit and park.json's hash. It waits for a reply line `answer D-<n> <A|approve|reject> [note]`.
+What counts is one pure function, check_answer(), which an outside signer can import too:
+  bound          the question note is on the MR, is the text the bridge posts for park.json at that commit (not
+                 edited), was posted after GitLab recorded that push, and no other note binds this D-n to another
+                 run, commit or park.json (a D-n is never bound twice)
   right person   the GitLab author is allowed for this kind of decision (decision_roles from main, not from the run)
   right question the reply names this decision id; the decision belongs to this run
   still current  the MR head has not moved since the question (otherwise the question is void)
@@ -23,10 +28,12 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 
 from .. import sign
-from ..common import BrainError, iso, plain, utcnow, write_json
+from ..common import SHA_RE, BrainError, iso, plain, utcnow, write_json
 from ..intake import checks
+from ..rest import gl_time, head_pushed_at
 
 KINDS = ("clarify", "design", "plan", "acceptance", "action", "other")
 LEAN_KINDS = ("REQUIREMENTS", "DESIGN", "PLAN", "RELEASE")   # INCEPTION: ask REQUIREMENTS and DESIGN separately
@@ -42,14 +49,28 @@ ITEMS_RE = re.compile(r"^([AD]-[1-9][0-9]{0,3}(?:(?:\s*[,，、]\s*|\s+)[AD]-[1-
 MAX_REVIEW_ITEMS = 50
 KIND_LABEL = {"clarify": "澄清", "design": "设计", "plan": "计划", "acceptance": "验收", "action": "危险动作",
               "other": "其他"}
+DECISION_ID_RE = re.compile(r"^D-[1-9][0-9]*$")
+RUN_ID = r"RUN-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,5}"
+USER = r"[a-z0-9][a-z0-9._-]{0,63}"
+# the first line of a question note (question_text): decision, kind, run, commit and park.json hash, who answers
+Q_HEAD_RE = re.compile(r"^\*\*(D-[1-9][0-9]*) · ([^·*\n]+) · (%s)\*\* · 提交 ([0-9a-f]{12}) · park ([0-9a-f]{12}) · "
+                       r"需要 (@%s(?:、@%s)*) 回答$" % (RUN_ID, USER, USER))
+# the bridge's note that ends a round with different answers: replies before it no longer count
+CONFLICT_RE = re.compile(r"^(D-[1-9][0-9]*) 收到不同的回答（")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY, run_id TEXT NOT NULL, project TEXT NOT NULL, iid INTEGER NOT NULL, sha TEXT NOT NULL,
   park_hash TEXT NOT NULL, kind TEXT NOT NULL, lean_request TEXT, state TEXT NOT NULL, note_id INTEGER,
   answer TEXT, answerer TEXT, voucher_id TEXT, created TEXT NOT NULL, updated TEXT NOT NULL,
+  qnote_id INTEGER, told_id INTEGER,
   UNIQUE (run_id, sha, park_hash));
 """
+# note_id: replies after this note count (the question, or the end of a round); qnote_id: the question note;
+# told_id: replies up to here have been told why they do not count. States: posting (row written, question not on
+# the MR yet), open, answered, delivered, delivery_unknown, refused (the signer would not sign), stale, void, invalid,
+# closed.
+ADDED_COLUMNS = ("qnote_id", "told_id")
 
 
 def validate_park(park) -> list:
@@ -111,33 +132,290 @@ def _neutral_note(note) -> str:
     return one
 
 
+# ---------- the rules, as pure functions (the bridge and an outside signer use the same ones) ----------
+
+def effective_kind(kind, lean_request) -> str:
+    """A Lean approval is answered by the people for that approval, whatever kind park.json names."""
+    if lean_request:
+        return LEAN_KIND_ROLE[str(lean_request).split(" ", 1)[0]]
+    return kind
+
+
+def allowed_people(kit, kind, owner, roles) -> set:
+    """Who may answer a decision of `kind`: decision_roles from the kit (main), people from brain-authz roles.
+    Never a bot, never the bridge's own account."""
+    table = dict(DEFAULT_ROLES, **(kit.get("decision_roles") or {}))
+    people = set()
+    for r in table.get(kind, []):
+        if r == "owner":
+            people.add(owner)
+        else:
+            people.update(str(u).lower() for u in (roles or {}).get(r, []))
+    people -= {str(u).lower() for u in kit.get("bot_users") or []}
+    people.discard(str(kit.get("bridge_user") or "").lower())
+    return people
+
+
+def question_text(did, run_id, park, who, kind, sha, park_hash) -> str:
+    """The question note for park.json. The first line binds it: decision id, run, the commit the question was asked
+    at and park.json's sha256 (12 hex each), and who may answer."""
+    label = {"requirements": "需求批准"}.get(kind, KIND_LABEL.get(kind, kind))
+    lines = ["**%s · %s · %s** · 提交 %s · park %s · 需要 %s 回答" % (
+        did, label, run_id, sha[:12], park_hash[:12], "、".join("@" + u for u in who))]
+    body = [park["question"]]
+    for o in park.get("options", []):
+        body.append("%s. %s" % (o["id"], o.get("text", "")))
+    if park.get("recommend"):
+        body.append("推荐：%s" % park["recommend"])
+    if park.get("lean_request"):
+        body.append("审批：%s" % park["lean_request"])
+    if park.get("refs"):
+        body.append("依据：%s" % ", ".join(str(x) for x in park["refs"][:10]))
+    lines.append(_block("\n".join(body)))
+    items = park.get("review_items") or []
+    if items:
+        lines.append("待审项（agent 在权限内自己定的默认做法和假设，一次审完）：\n" + "\n".join(
+            "- [ ] %s %s" % (i["id"], _inline(i["text"])) for i in items))
+    how = "`answer %s A`" % did if park.get("options") else "`answer %s approve` 或 `answer %s reject`" % (did, did)
+    if items:
+        how = ("`answer %s approve`（全部通过），或 `answer %s reject %s 说明`（只驳回列出的项，驳回的项作为纠正送回 run；"
+               "不列项就是整个驳回）" % (did, did, ",".join(i["id"] for i in items[:2])))
+    lines.append("回复一行 %s，后面可以加一句说明。只认第一条有效回复；代码有新推送时，这个问题作废。" % how)
+    return "\n\n".join(lines)
+
+
+def conflict_text(did, valid) -> str:
+    return "%s 收到不同的回答（%s），都不送。请商量后由一个人重新回答。" % (
+        did, "、".join("@%s=%s%s" % (a, c, " " + ",".join(items) if items else "")
+                      for a, (c, _, _, items) in sorted(valid.items())))
+
+
+class Verdict:
+    """What check_answer found.
+
+    status  answer    deliver it: author, choice, note (the reply's free text), items (rejected review items, in
+                      park.json's order), review (every review item id), note_id (the reply)
+            none      no reply counts yet
+            conflict  allowed people answered differently: conflict = {author: (choice, note, note_id, items)}
+            stale     the MR head moved since the question
+            void      the question is not bound to its push and park.json (reason says why): no reply to it counts
+    reason   why it is not an answer (English, ids and hashes only)
+    feedback [(note id, text)]: replies that do not count and why (to tell the people who wrote them)
+    last_id  the newest note looked at
+    """
+
+    def __init__(self, status, reason="", **kw):
+        self.status, self.reason = status, reason
+        self.author, self.choice, self.note = kw.get("author", ""), kw.get("choice", ""), kw.get("note", "")
+        self.items, self.review = tuple(kw.get("items", ())), list(kw.get("review", ()))
+        self.note_id, self.last_id = kw.get("note_id", 0), kw.get("last_id", 0)
+        self.feedback, self.conflict = list(kw.get("feedback", ())), dict(kw.get("conflict", {}))
+        self.kind, self.who, self.question = kw.get("kind", ""), set(kw.get("who", ())), kw.get("question")
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "answer"
+
+    def __repr__(self):
+        return "Verdict(%s%s)" % (self.status, ", " + self.reason if self.reason else "")
+
+
+def _nid(note) -> int:
+    try:
+        return int(note.get("id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _author(note) -> str:
+    return str(((note.get("author") or {}).get("username")) or "").lower()
+
+
+def _first(note) -> str:
+    return str(note.get("body") or "").split("\n", 1)[0].rstrip("\r")
+
+
+def _norm(text) -> str:
+    return "\n".join(l.rstrip() for l in str(text or "").replace("\r\n", "\n").split("\n")).strip()
+
+
+def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, question_id=None, after=None):
+    """Does an answer on the MR count for this decision, and which one? Pure: no GitLab, no ledger, no clock.
+
+    decision     {"id": "D-5", "run_id": "RUN-PAY-3-1", "sha": <40 hex>, "park_hash": <sha256 hex of park.json>}
+                 (a ledger row, or an answer voucher's decision/run_id/sha/park_hash); "kind" and "lean_request",
+                 when given, must agree with park.json
+    park_raw     the bytes of runs/<KEY>/park.json at that sha, or None
+    notes        every note on the MR, as GitLab returns them (id, body, author.username, created_at, system)
+    kit          the kit config from the default branch (decision_roles, bot_users, bridge_user)
+    roles        brain-authz roles: {"product": ["carol"], ...}
+    owner        the run's owner
+    head         the MR head now
+    pushed_at    when GitLab recorded `sha` as the MR head (rest.head_pushed_at of the MR versions); None: unknown
+    question_id  the note id the bridge recorded when it posted the question (None: it is found on the MR; then
+                 kit bridge_user tells the bridge's notes from people's)
+    after        only replies after this note count (the bridge's round: a conflict starts a new one); default the
+                 question. With bridge_user known, the bridge's own conflict notes end a round as well.
+    -> Verdict
+    """
+    did, run_id = str(decision.get("id") or ""), str(decision.get("run_id") or "")
+    sha, ph = str(decision.get("sha") or ""), str(decision.get("park_hash") or "")
+
+    def void(why, **kw):
+        return Verdict("void", why, **kw)
+
+    if not DECISION_ID_RE.match(did) or not re.match(r"^%s$" % RUN_ID, run_id) or not SHA_RE.match(sha) \
+            or not re.match(r"^[0-9a-f]{64}$", ph):
+        return void("the decision record is not well-formed")
+    if head != sha:
+        return Verdict("stale", "the MR head moved from %s to %s after the question" % (sha[:12], str(head)[:12]))
+    if park_raw is None or hashlib.sha256(park_raw).hexdigest() != ph:
+        return void("park.json at %s is not the one the question was asked from" % sha[:12])
+    try:
+        park = json.loads(park_raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return void("park.json at %s is not JSON" % sha[:12])
+    probs = validate_park(park)
+    if probs or park.get("status") != "waiting":
+        return void("park.json at %s is not a valid waiting question" % sha[:12])
+    kind = effective_kind(park.get("kind"), park.get("lean_request"))
+    if decision.get("kind") and decision["kind"] != kind:
+        return void("the decision is of kind %s, park.json asks %s" % (decision["kind"], kind))
+    if "lean_request" in decision.keys() and (decision["lean_request"] or None) != (park.get("lean_request") or None):
+        return void("the decision's Lean request is not park.json's")
+    who = allowed_people(kit, kind, owner, roles)
+    if not who:
+        return void("nobody may answer a %s decision" % kind)
+
+    notes = sorted((n for n in notes or [] if isinstance(n, dict)), key=_nid)
+    bridge = str(kit.get("bridge_user") or "").lower()
+    if question_id:
+        posted = [n for n in notes if _nid(n) == int(question_id)]
+        if not posted:
+            return void("the question note %s is not on the MR (deleted?)" % question_id)
+        if bridge and _author(posted[0]) != bridge:
+            return void("the question note was posted by %s, not by the bridge account %s"
+                        % (_author(posted[0]), bridge))
+        bridge = bridge or _author(posted[0])      # the bridge's account, as GitLab shows its own note
+    asked = []
+    for n in notes:
+        m = Q_HEAD_RE.match(_first(n))
+        if n.get("system") or not m or m.group(1) != did or (bridge and _author(n) != bridge):
+            continue
+        if (m.group(3), m.group(4), m.group(5)) != (run_id, sha[:12], ph[:12]):
+            return void("%s on the MR is bound to %s @ %s (park %s): a decision id is never bound twice"
+                        % (did, m.group(3), m.group(4), m.group(5)))
+        want = question_text(did, run_id, park, [u[1:] for u in m.group(6).split("、")], kind, sha, ph)
+        if _norm(n.get("body")) != _norm(want):
+            return void("note %d is not the question the bridge posts for park.json at %s (edited?)"
+                        % (_nid(n), sha[:12]))
+        asked.append(n)
+    if not asked:
+        return void("no question %s for %s @ %s on the MR%s" % (did, run_id, sha[:12],
+                                                               " by %s" % bridge if bridge else ""))
+    if question_id and int(question_id) not in [_nid(n) for n in asked]:
+        return void("note %s is not the question %s" % (question_id, did))
+    q = asked[0]   # the first copy (a retried post may leave two equal ones)
+    when, pushed = gl_time(q.get("created_at")), gl_time(pushed_at)
+    if pushed is None:
+        return void("GitLab shows no MR version with head %s" % sha[:12])
+    if when is None or when < pushed:
+        return void("%s was asked before %s was last pushed: replies to an older push do not count" % (did, sha[:12]))
+
+    start = max(_nid(q), int(after or 0))
+    if bridge:
+        for n in notes:
+            m = CONFLICT_RE.match(_first(n))
+            if m and m.group(1) == did and _author(n) == bridge and _nid(n) > start:
+                start = _nid(n)
+    review = [i["id"] for i in park.get("review_items") or [] if isinstance(i, dict) and "id" in i] \
+        if kind == "acceptance" else []
+    options = {o.get("id") for o in park.get("options", []) if isinstance(o, dict)}
+    valid, feedback, last = {}, [], start
+    for n in notes:
+        nid = _nid(n)
+        if nid <= start or n.get("system"):
+            continue
+        last = max(last, nid)
+        m = ANSWER_RE.match(str(n.get("body") or "").split("\n", 1)[0])
+        if not m or m.group(1).upper() != did:
+            continue
+        author, choice = _author(n), m.group(2)
+        choice = choice.lower() if choice.lower() in ("approve", "reject") else choice.upper()
+        if author not in who:
+            feedback.append((nid, "@%s 不在 %s 的可回答名单里，这条回复不算。" % (author, did)))
+            continue
+        if not (choice in ("approve", "reject") if park.get("lean_request") else choice in options):
+            feedback.append((nid, "%s 没有选项 %s，这条回复不算。" % (did, choice)))
+            continue
+        note, items = m.group(3), ()
+        im = ITEMS_RE.match(note or "") if review and choice == "reject" else None
+        if im:
+            listed = [x.upper() for x in re.split(r"[\s,，、]+", im.group(1)) if x]
+            unknown = [i for i in listed if i not in review]
+            if unknown:
+                feedback.append((nid, "%s 没有待审项 %s，这条回复不算。" % (did, "、".join(unknown))))
+                continue
+            items = tuple(i for i in review if i in listed)     # the park's order, each once
+            note = im.group(2)
+        valid.setdefault(author, (choice, note, nid, items))
+    common = dict(feedback=feedback, last_id=last, kind=kind, who=who, question=q, review=review)
+    if not valid:
+        return Verdict("none", "no reply counts yet", **common)
+    if len({(c, items) for c, _, _, items in valid.values()}) > 1:
+        return Verdict("conflict", "allowed people answered differently", conflict=valid, **common)
+    author, (choice, note, nid, items) = min(valid.items(), key=lambda kv: kv[1][2])
+    return Verdict("answer", author=author, choice=choice, note=note, items=items, note_id=nid, **common)
+
+
 class DecisionLoop:
-    """Mixed into Bridge: needs self.gl, self.ledger (db), self.kc, self.cfg, self.kit(), self.ids, self.roles."""
+    """Mixed into Bridge: needs self.gl, self.ledger (db), self.kc, self.cfg, self.kit(), self.ids, self.roles,
+    self.signer."""
 
     def _ddb(self):
-        self.ledger.db.executescript(SCHEMA)
-        return self.ledger.db
+        db = self.ledger.db
+        if getattr(self, "_ddb_ready", False):
+            return db
+        with self.ledger.lock:
+            db.executescript(SCHEMA)
+            have = {r[1] for r in db.execute("PRAGMA table_info(decisions)")}
+            for col in ADDED_COLUMNS:
+                if col in have:
+                    continue
+                try:
+                    db.execute("ALTER TABLE decisions ADD COLUMN %s INTEGER" % col)
+                except sqlite3.OperationalError:      # another process added it meanwhile
+                    continue
+                if col == "qnote_id":
+                    # Questions an older bridge asked name neither their commit nor park.json: ask them once more.
+                    db.execute("UPDATE runs SET last_sha=NULL WHERE run_id IN "
+                               "(SELECT run_id FROM decisions WHERE state='open')")
+                    db.execute("UPDATE decisions SET state='posting' WHERE state='open'")
+        self._ddb_ready = True
+        return db
 
-    @staticmethod
-    def effective_kind(kind, lean_request) -> str:
-        if lean_request:
-            return LEAN_KIND_ROLE[str(lean_request).split(" ", 1)[0]]
-        return kind
+    effective_kind = staticmethod(effective_kind)
 
     def pseudonym(self, username) -> str:
         salt = self.cfg.get("pseudonym_salt", "")
         return "P-" + hashlib.sha256((salt + username).encode()).hexdigest()[:4].upper()
 
     def allowed(self, kit, kind, owner) -> set:
-        table = dict(DEFAULT_ROLES, **(kit.get("decision_roles") or {}))
-        roles = table.get(kind, [])
-        people = set()
-        for r in roles:
-            if r == "owner":
-                people.add(owner)
-            else:
-                people.update(u.lower() for u in self.roles.get(r, []))
-        return people - {u.lower() for u in kit["bot_users"]}
+        return allowed_people(kit, kind, owner, self.roles)
+
+    def question_text(self, did, row, park, who, kind, sha, park_hash) -> str:
+        return question_text(did, row["run_id"], park, who, kind, sha, park_hash)
+
+    def check_bridge_user(self, kit):
+        """kit.json bridge_user must be the account this bridge's token posts as, or no answer would count."""
+        want = str(kit.get("bridge_user") or "").lower()
+        if not want:
+            return
+        if getattr(self, "_gitlab_me", None) is None:
+            self._gitlab_me = str((self.gl.current_user() or {}).get("username") or "").lower()
+        if self._gitlab_me != want:
+            raise BrainError("kit.json bridge_user is %s but the bridge's GitLab token is %s: its questions would "
+                             "not count" % (want, self._gitlab_me or "unknown"))
 
     # ---------- questions ----------
 
@@ -166,8 +444,9 @@ class DecisionLoop:
                 seen()
                 continue
             ph = hashlib.sha256(raw).hexdigest()
-            if db.execute("SELECT 1 FROM decisions WHERE run_id=? AND sha=? AND park_hash=?",
-                          (row["run_id"], head, ph)).fetchone():
+            old = db.execute("SELECT * FROM decisions WHERE run_id=? AND sha=? AND park_hash=?",
+                             (row["run_id"], head, ph)).fetchone()
+            if old is not None and old["state"] != "posting":
                 seen()
                 continue
             probs = validate_park(park)
@@ -176,138 +455,102 @@ class DecisionLoop:
             who = sorted(self.allowed(kit, kind, owner)) if not probs else []
             if not probs and not who:
                 probs.append("没有人被配置为可以回答「%s」类决策（decision_roles / brain-authz roles）" % park.get("kind"))
-            n = db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] + 1
-            did = "D-%d" % n
+            if not probs:
+                self.check_bridge_user(kit)
+                if head_pushed_at(self.gl.mr_versions(row["project"], row["iid"]), head) is None:
+                    # asked before GitLab records the push, the question would read as older than its commit
+                    self.out("%s: GitLab has no MR version for %s yet; asking next round" % (row["run_id"], head[:12]))
+                    continue
             now = iso(utcnow())
-            state = "invalid" if probs else "open"
-            db.execute("INSERT INTO decisions(id,run_id,project,iid,sha,park_hash,kind,lean_request,state,created,updated)"
-                       " VALUES (?,?,?,?,?,?,?,?,?,?,?)", (did, row["run_id"], row["project"], row["iid"], head, ph,
-                                                           kind, park.get("lean_request"), state,
-                                                           now, now))
+            if old is not None:
+                did = old["id"]
+                if probs:
+                    db.execute("UPDATE decisions SET state='invalid', updated=? WHERE id=?", (now, did))
+            else:
+                with self.ledger.lock:
+                    did = "D-%d" % (db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] + 1)
+                    db.execute("INSERT INTO decisions(id,run_id,project,iid,sha,park_hash,kind,lean_request,state,"
+                               "created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                               (did, row["run_id"], row["project"], row["iid"], head, ph, kind,
+                                park.get("lean_request"), "invalid" if probs else "posting", now, now))
             if probs:
                 self.gl.comment(row["project"], row["iid"], "%s 无法发出（%s）：\n%s" % (
                     did, row["run_id"], "\n".join("- " + x for x in probs)))
                 seen()
                 continue
-            note = self.gl.comment(row["project"], row["iid"], self.question_text(did, row, park, who, kind))
-            db.execute("UPDATE decisions SET note_id=? WHERE id=?", ((note or {}).get("id", 0), did))
+            # a failed post leaves the row 'posting' and the head unseen: the next round posts it again
+            note = self.gl.comment(row["project"], row["iid"], question_text(did, row["run_id"], park, who, kind,
+                                                                             head, ph))
+            nid = int((note or {}).get("id") or 0)
+            db.execute("UPDATE decisions SET state='open', qnote_id=?, note_id=?, told_id=?, updated=? "
+                       "WHERE id=? AND state='posting'", (nid, nid, nid, iso(utcnow()), did))
             seen()
             posted += 1
             self.out("asked %s for %s (%s)" % (did, row["run_id"], ", ".join(who)))
         return posted
 
-    def question_text(self, did, row, park, who, kind) -> str:
-        label = {"requirements": "需求批准"}.get(kind, KIND_LABEL.get(kind, kind))
-        lines = ["**%s · %s · %s** 需要 %s 回答" % (did, label, row["run_id"],
-                                                  "、".join("@" + u for u in who))]
-        body = [park["question"]]
-        for o in park.get("options", []):
-            body.append("%s. %s" % (o["id"], o.get("text", "")))
-        if park.get("recommend"):
-            body.append("推荐：%s" % park["recommend"])
-        if park.get("lean_request"):
-            body.append("审批：%s" % park["lean_request"])
-        if park.get("refs"):
-            body.append("依据：%s" % ", ".join(str(x) for x in park["refs"][:10]))
-        lines.append(_block("\n".join(body)))
-        items = park.get("review_items") or []
-        if items:
-            lines.append("待审项（agent 在权限内自己定的默认做法和假设，一次审完）：\n" + "\n".join(
-                "- [ ] %s %s" % (i["id"], _inline(i["text"])) for i in items))
-        how = "`answer %s A`" % did if park.get("options") else "`answer %s approve` 或 `answer %s reject`" % (did, did)
-        if items:
-            how = ("`answer %s approve`（全部通过），或 `answer %s reject %s 说明`（只驳回列出的项，驳回的项作为纠正送回 run；"
-                   "不列项就是整个驳回）" % (did, did, ",".join(i["id"] for i in items[:2])))
-        lines.append("回复一行 %s，后面可以加一句说明。只认第一条有效回复；代码有新推送时，这个问题作废。" % how)
-        return "\n\n".join(lines)
-
     # ---------- answers ----------
 
     def collect(self):
-        """Check replies to open decisions and deliver valid ones to the run."""
+        """Check replies to open decisions (check_answer decides what counts) and deliver valid ones to the run."""
         db = self._ddb()
-        delivered = 0
-        for d in db.execute("SELECT * FROM decisions WHERE state='open' ORDER BY created").fetchall():
-            row = self.ledger.run(d["run_id"])
-            kit = self.kit(d["project"])
-            mr = self.gl.mr(d["project"], d["iid"])
-            if mr.get("state") != "opened" or row is None or row["state"] != "dispatched":
-                db.execute("UPDATE decisions SET state='closed', updated=? WHERE id=? AND state='open'",
-                           (iso(utcnow()), d["id"]))
-                continue
-            if mr.get("sha") != d["sha"]:
-                if db.execute("UPDATE decisions SET state='stale', updated=? WHERE id=? AND state='open'",
-                              (iso(utcnow()), d["id"])).rowcount:
-                    self.gl.comment(d["project"], d["iid"], "%s 作废：问题发出后分支又有了新推送。run 需要时会重新提问。" % d["id"])
-                continue
-            who = self.allowed(kit, d["kind"], row["owner"])
-            valid, last_id = {}, d["note_id"] or 0
-            for note in self.gl.mr_notes(d["project"], d["iid"]):
-                nid = int(note.get("id", 0))
-                if nid <= (d["note_id"] or 0) or note.get("system"):
-                    continue
-                last_id = max(last_id, nid)
-                m = ANSWER_RE.match((note.get("body") or "").split("\n", 1)[0])
-                if not m or m.group(1).upper() != d["id"]:
-                    continue
-                author = ((note.get("author") or {}).get("username") or "").lower()
-                choice = m.group(2)
-                choice = choice.lower() if choice.lower() in ("approve", "reject") else choice.upper()
-                if author not in who:
-                    self.gl.comment(d["project"], d["iid"], "@%s 不在 %s 的可回答名单里，这条回复不算。" % (author, d["id"]))
-                    continue
-                if not self._choice_ok(d, choice):
-                    self.gl.comment(d["project"], d["iid"], "%s 没有选项 %s，这条回复不算。" % (d["id"], choice))
-                    continue
-                note, items = m.group(3), ()
-                review = self._review_ids(d) if choice == "reject" else []
-                im = ITEMS_RE.match(note or "") if review else None
-                if im:
-                    listed = [x.upper() for x in re.split(r"[\s,，、]+", im.group(1)) if x]
-                    unknown = [i for i in listed if i not in review]
-                    if unknown:
-                        self.gl.comment(d["project"], d["iid"], "%s 没有待审项 %s，这条回复不算。"
-                                        % (d["id"], "、".join(unknown)))
-                        continue
-                    items = tuple(i for i in review if i in listed)     # the park's order, each once
-                    note = im.group(2)
-                valid.setdefault(author, (choice, note, nid, items))
-            if not valid:
-                # replies already looked at are not looked at (or answered) again
-                db.execute("UPDATE decisions SET note_id=? WHERE id=? AND state='open'", (last_id, d["id"]))
-                continue
-            choices = {(c, items) for c, _, _, items in valid.values()}
-            if len(choices) > 1:
-                db.execute("UPDATE decisions SET note_id=?, updated=? WHERE id=?", (last_id, iso(utcnow()), d["id"]))
-                self.gl.comment(d["project"], d["iid"], "%s 收到不同的回答（%s），都不送。请商量后由一个人重新回答。"
-                                % (d["id"], "、".join("@%s=%s%s" % (a, c, " " + ",".join(items) if items else "")
-                                                     for a, (c, _, _, items) in sorted(valid.items()))))
-                continue
-            author, (choice, note, nid, items) = sorted(valid.items(), key=lambda kv: kv[1][2])[0]
-            if self.deliver(d, row, author, choice, note, items=items, review=self._review_ids(d)):
-                delivered += 1
+        delivered, errors = 0, []
+        for d in db.execute("SELECT * FROM decisions WHERE state IN ('open', 'posting') ORDER BY created").fetchall():
+            try:
+                delivered += 1 if self._collect_one(db, d) else 0
+            except BrainError as e:   # one MR GitLab will not show (or shows too much of) must not hold up the rest
+                errors.append("%s: %s" % (d["id"], e))
+        if errors:
+            raise BrainError("collect: not checked this round: " + "; ".join(errors))
         return delivered
 
-    def _choice_ok(self, d, choice) -> bool:
-        if d["lean_request"]:
-            return choice in ("approve", "reject")
-        req = self._park_options(d)
-        return choice in req
-
-    def _park(self, d) -> dict:
-        kit = self.kit(d["project"])
+    def _collect_one(self, db, d) -> bool:
         row = self.ledger.run(d["run_id"])
+        mr = self.gl.mr(d["project"], d["iid"])
+        now = iso(utcnow())
+        if mr.get("state") != "opened" or row is None or row["state"] != "dispatched":
+            db.execute("UPDATE decisions SET state='closed', updated=? WHERE id=? AND state=?",
+                       (now, d["id"], d["state"]))
+            return False
+        if mr.get("sha") != d["sha"]:
+            if db.execute("UPDATE decisions SET state='stale', updated=? WHERE id=? AND state=?",
+                          (now, d["id"], d["state"])).rowcount:
+                self.gl.comment(d["project"], d["iid"], "%s 作废：问题发出后分支又有了新推送。run 需要时会重新提问。" % d["id"])
+            return False
+        if d["state"] == "posting":
+            return False                                      # watch posts it
+        kit = self.kit(d["project"])
+        pushed = head_pushed_at(self.gl.mr_versions(d["project"], d["iid"]), d["sha"])
+        if pushed is None:
+            self.out("%s: GitLab shows no MR version for %s; looked at next round" % (d["id"], d["sha"][:12]))
+            return False
         raw = self.gl.file_raw(d["project"], "%s/%s/park.json" % (kit["runs_dir"], row["req"]), d["sha"])
-        return json.loads(raw.decode("utf-8")) if raw else {}
-
-    def _park_options(self, d):
-        return {o.get("id") for o in self._park(d).get("options", [])}
-
-    def _review_ids(self, d) -> list:
-        """The review items' ids of an acceptance question (park.json at the question's commit), in order."""
-        if d["kind"] != "acceptance":
-            return []
-        return [i["id"] for i in self._park(d).get("review_items") or [] if isinstance(i, dict) and "id" in i]
+        notes = self.gl.mr_notes(d["project"], d["iid"])
+        v = check_answer(dict(d), raw, notes, kit, self.roles, row["owner"], mr.get("sha", ""), pushed,
+                         question_id=d["qnote_id"], after=d["note_id"])
+        told = d["told_id"] or 0
+        for nid, text in v.feedback:                          # each reply that does not count is told so once
+            if nid > told:
+                self.gl.comment(d["project"], d["iid"], text)
+        if v.status in ("void", "stale"):
+            if db.execute("UPDATE decisions SET state=?, told_id=?, updated=? WHERE id=? AND state='open'",
+                          (v.status, max(told, v.last_id), now, d["id"])).rowcount:
+                self.gl.comment(d["project"], d["iid"], "%s 作废（%s），对它的回答都不算。run 重新推送后会重新提问。"
+                                % (d["id"], v.reason))
+                self.out("%s void: %s" % (d["id"], v.reason))
+            return False
+        db.execute("UPDATE decisions SET told_id=? WHERE id=? AND state='open'", (max(told, v.last_id), d["id"]))
+        if v.status == "none":
+            # replies already looked at are not looked at (or answered) again
+            db.execute("UPDATE decisions SET note_id=? WHERE id=? AND state='open'", (v.last_id, d["id"]))
+            return False
+        if v.status == "conflict":
+            note = self.gl.comment(d["project"], d["iid"], conflict_text(d["id"], v.conflict))
+            start = max(v.last_id, int((note or {}).get("id") or 0))   # a new round starts after the bridge's note
+            db.execute("UPDATE decisions SET note_id=?, told_id=?, updated=? WHERE id=? AND state='open'",
+                       (start, start, now, d["id"]))
+            return False
+        return self.deliver(d, row, v.author, v.choice, v.note, items=v.items, review=v.review)
 
     def deliver(self, d, row, author, choice, note, items=(), review=()) -> bool:
         db = self.ledger.db
@@ -325,7 +568,21 @@ class DecisionLoop:
         if items:
             v["rejected_items"] = list(items)         # rejected one by one; the rest stand
         v["voucher_id"] = "V-" + sign.digest(v)[:10]
-        sig = sign.sign(v, self.cfg["signing_key"])
+        try:
+            sig = self.signer.sign(v)
+        except sign.SignerRefused as e:
+            db.execute("UPDATE decisions SET state='refused', updated=? WHERE id=? AND state='answered'",
+                       (iso(utcnow()), d["id"]))
+            self.gl.comment(d["project"], d["iid"], "%s 的回答没有送回 run：签名服务不签（%s）。请负责人看一下签名服务的记录。"
+                            % (d["id"], "；".join(e.reasons)[:500]))
+            self.out("%s: the signer refused the answer: %s" % (d["id"], e))
+            return False
+        except sign.SignerUnavailable as e:
+            # nothing was signed or sent: the question is open again and looked at next round
+            db.execute("UPDATE decisions SET state='open', answer=NULL, answerer=NULL, updated=? "
+                       "WHERE id=? AND state='answered'", (iso(utcnow()), d["id"]))
+            self.out("%s: signer unavailable, the answer stays open: %s" % (d["id"], e))
+            return False
         write_json(os.path.join(self.cfg["vouchers_dir"], d["run_id"], v["voucher_id"] + ".json"),
                    {"voucher": v, "sig": sig})
         if self.cfg.get("publish_vouchers"):

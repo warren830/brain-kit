@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,6 +20,18 @@ P = "grp/repo"
 GL = "/api/v4/projects/grp/repo"
 BRANCH = "ai/alice/PAY-1-refund"
 INTENT = "261108-pay-1-refund"
+# GitLab's server times in the fake: every label event and note is one second after the one before; MR versions
+# (pushes) are older than all of them unless a test sets self.versions.
+PUSHED = "2026-11-01T00:00:00.000Z"
+_clock = [0]
+
+
+def tick():
+    _clock[0] += 1
+    t = datetime(2026, 11, 9, tzinfo=timezone.utc) + timedelta(seconds=_clock[0])
+    return t.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
 STATE_OK = ("# AI-DLC State\n## Session notes\nStatus: Construction app step 2 of 4\n### Next\n"
             "1. finish step 3 (AC-2)\n2. run review\n### Open questions and blockers\n- none\n"
             "### Notes for the next session\n- SECRET-REQUIREMENT-TEXT must never reach the message\n")
@@ -65,6 +78,7 @@ class BridgeTest(unittest.TestCase):
         self.fail_send = False
         self.notes_db = {}
         self.issues = {}
+        self.versions = {}
         self.fake = self.build_fake()
         self.bridge = self.new_bridge()
 
@@ -84,7 +98,8 @@ class BridgeTest(unittest.TestCase):
     @classmethod
     def ev(cls, user, action, label="ai-handoff"):
         cls._ev_id[0] += 1
-        return {"id": cls._ev_id[0], "action": action, "label": {"name": label}, "user": {"username": user}}
+        return {"id": cls._ev_id[0], "action": action, "label": {"name": label}, "user": {"username": user},
+                "created_at": tick()}
 
     def build_fake(self):
         f = Fake()
@@ -123,6 +138,9 @@ class BridgeTest(unittest.TestCase):
             return 200, rows[(page - 1) * n: page * n]
 
         f.on("GET", GL + r"/merge_requests/(\d+)/resource_label_events", events)
+        f.on("GET", GL + r"/merge_requests/(\d+)/versions", lambda m, qy, b: (200, self.versions.get(
+            int(m.group(1)), [{"id": 1, "head_commit_sha": self.mrs[int(m.group(1))]["sha"], "created_at": PUSHED}])
+            if qy.get("page", "1") == "1" else []))
         f.on("PUT", GL + r"/merge_requests/(\d+)", lambda m, qy, b: (200, {"iid": int(m.group(1))}))
         f.on("POST", GL + r"/merge_requests/(\d+)/notes", self.add_note)
         f.on("GET", GL + r"/merge_requests/(\d+)/notes", lambda m, qy, b: (
@@ -143,7 +161,7 @@ class BridgeTest(unittest.TestCase):
         iid = int(m.group(1)) if m else qy
         rows = self.notes_db.setdefault(iid, [])
         n = {"id": 1000 + sum(len(v) for v in self.notes_db.values()), "body": b["body"], "author": {"username": author},
-             "system": False}
+             "system": False, "created_at": tick()}
         rows.append(n)
         return 201, n
 

@@ -2,15 +2,26 @@
 
 CI and the runner verify offline with an allowed_signers file; no Python crypto package is needed.
 In production the private key sits on the bridge host only (or behind Vault/KMS via ssh-agent).
+
+The bridge signs through a signer object, `signer.sign(voucher) -> armored signature`:
+  KeySigner    the default: the private key file in bridge.json `signing_key`
+  SpoolSigner  bridge.json "signer": {"type": "spool", "spool_dir": ..., "allowed_signers": ...}: a separate signing
+               service (another OS user holds the key) answers through spool files and may refuse
+A signer that will not sign raises SignerRefused (with reasons); one that does not answer raises SignerUnavailable
+(nothing was signed: try again later). The voucher format is the same whoever signs it.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
 import shutil
+import stat
 import tempfile
+import time
 
-from .common import BrainError, canonical, run
+from .common import BrainError, canonical, iso, run, utcnow, write_json
 
 NAMESPACE = "brain-voucher"
 PRINCIPAL = "brain-bridge"
@@ -52,3 +63,141 @@ def write_allowed_signers(path, pubkey_path, principal=PRINCIPAL):
         pub = f.read().strip()
     with open(path, "w", encoding="ascii") as f:
         f.write('%s namespaces="%s" %s\n' % (principal, NAMESPACE, pub))
+
+
+# ---------- signers ----------
+
+class SignerRefused(BrainError):
+    """The signer checked the voucher and will not sign it. Each reason is one line (they are posted on the MR)."""
+
+    def __init__(self, reasons):
+        self.reasons = [" ".join(str(r).split())[:300] for r in (reasons or [])] or ["no reason given"]
+        super().__init__("the signer refused: " + "; ".join(self.reasons))
+
+
+class SignerUnavailable(BrainError):
+    """The signer did not answer in time: nothing was signed."""
+
+
+class KeySigner:
+    """Signs with the bridge's private key file (ssh-keygen -Y sign)."""
+
+    def __init__(self, key_path):
+        self.key_path = key_path
+
+    def sign(self, voucher) -> str:
+        return sign(voucher, self.key_path)
+
+
+MAX_SPOOL_FILE = 64 * 1024
+
+
+def _read_small(path):
+    """JSON from a small regular file, opened without following a symlink or blocking on a FIFO (another OS user
+    writes the spool's answers). None when there is no such file yet, or it is not one."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_SPOOL_FILE:
+            return None
+        data = os.read(fd, MAX_SPOOL_FILE + 1)
+    finally:
+        os.close(fd)
+    try:
+        return json.loads(data.decode("utf-8")) if len(data) <= MAX_SPOOL_FILE else None
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+class SpoolSigner:
+    """A signing service in another process, reached through spool files only (no socket):
+
+      <spool>/requests/<req>.json  written here:      {"schema": 1, "req_id", "kind", "created", "voucher"}
+      <spool>/signed/<req>.json    written by it:     {"req_id", "voucher", "sig"}
+      <spool>/refused/<req>.json   written by it:     {"req_id", "reasons": ["..."]}
+
+    <req> is <kind>-<run_id>-<first 12 hex of the voucher's digest>. A signature counts only when the signed voucher
+    is exactly the one asked for and verifies against allowed_signers (the bridge's public key). The request is taken
+    back when an answer arrives or the wait ends. Keep this spool apart from runnerd's (bridge.json spool_dir)."""
+
+    def __init__(self, spool_dir, allowed_signers, timeout=30.0, poll=0.25, clock=time.monotonic, sleep=time.sleep):
+        self.spool, self.allowed = spool_dir, allowed_signers
+        self.timeout, self.poll, self.clock, self.sleep = float(timeout), float(poll), clock, sleep
+
+    @staticmethod
+    def req_id(voucher) -> str:
+        kind = re.sub(r"[^a-z]", "", str(voucher.get("kind") or "x")) or "x"
+        run_id = re.sub(r"[^A-Za-z0-9-]", "", str(voucher.get("run_id") or "x"))[:60] or "x"
+        return "%s-%s-%s" % (kind, run_id, digest(voucher)[:12])
+
+    def sign(self, voucher) -> str:
+        if not isinstance(voucher, dict):
+            raise SignerRefused(["only a JSON object is signed"])
+        rid = self.req_id(voucher)
+        req = os.path.join(self.spool, "requests", rid + ".json")
+        write_json(req, {"schema": 1, "req_id": rid, "kind": voucher.get("kind"), "created": iso(utcnow()),
+                         "voucher": voucher}, mode=0o640)
+        end = self.clock() + self.timeout
+        try:
+            while True:
+                got = _read_small(os.path.join(self.spool, "signed", rid + ".json"))
+                if isinstance(got, dict):
+                    sig = got.get("sig")
+                    if got.get("voucher") != voucher:
+                        raise SignerRefused(["the signer signed another voucher than the one asked for (%s)" % rid])
+                    if not isinstance(sig, str) or not verify(voucher, sig, self.allowed):
+                        raise SignerRefused(["the signature does not verify against %s (%s)" % (self.allowed, rid)])
+                    return sig
+                no = _read_small(os.path.join(self.spool, "refused", rid + ".json"))
+                if isinstance(no, dict):
+                    reasons = no.get("reasons") if isinstance(no.get("reasons"), list) else []
+                    raise SignerRefused(reasons[:10])
+                if self.clock() >= end:
+                    raise SignerUnavailable("the signer did not answer %s within %ds" % (rid, self.timeout))
+                self.sleep(self.poll)
+        finally:
+            try:
+                os.unlink(req)
+            except OSError:
+                pass
+
+
+SIGNER_TYPES = ("key", "spool")
+
+
+def _signer_cfg(cfg) -> dict:
+    s = cfg.get("signer") or {}
+    return {"type": s} if isinstance(s, str) else dict(s) if isinstance(s, dict) else {"type": repr(s)}
+
+
+def signer_problems(cfg) -> list:
+    """What is wrong with the signing part of a bridge config (`signing_key`, `signer`)."""
+    s = _signer_cfg(cfg)
+    kind = s.get("type") or "key"
+    if kind not in SIGNER_TYPES:
+        return ["signer.type must be one of %s, not %s" % (SIGNER_TYPES, kind)]
+    if kind == "key":
+        return [] if (s.get("key") or cfg.get("signing_key")) else ["signing_key is required (or a signer of type "
+                                                                    "spool)"]
+    p = ["signer.%s is required for a spool signer" % k for k in ("spool_dir", "allowed_signers") if not s.get(k)]
+    if s.get("spool_dir") and cfg.get("spool_dir") and \
+            os.path.realpath(s["spool_dir"]) == os.path.realpath(cfg["spool_dir"]):
+        p.append("signer.spool_dir must not be the runner's spool_dir (runnerd reads its requests/)")
+    return p
+
+
+def signer_from_config(cfg):
+    """The signer a bridge config names: the key file signer unless "signer" says otherwise."""
+    p = signer_problems(cfg)
+    s = _signer_cfg(cfg)
+    if (s.get("type") or "key") == "key":
+        # a missing key fails when something is signed, as it always did
+        return KeySigner(s.get("key") or cfg.get("signing_key", ""))
+    if p:
+        raise BrainError("bridge config: " + "; ".join(p))
+    return SpoolSigner(s["spool_dir"], s["allowed_signers"], timeout=float(s.get("timeout", 30)),
+                       poll=float(s.get("poll", 0.25)))

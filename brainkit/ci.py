@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 
 from . import config, lean, runrec, sign
@@ -132,11 +134,44 @@ def lean_events(repo, intent):
     return sorted(out, key=lambda e: str(e.get("ts", "")))
 
 
+def _blob(repo, rev, path):
+    """The bytes of `path` at `rev`, or None (raw: no text decoding, no end-of-line conversion)."""
+    p = subprocess.run(["git", "-C", repo, "cat-file", "blob", "%s:%s" % (rev, path)], capture_output=True)
+    return p.stdout if p.returncode == 0 else None
+
+
+def design_approval_covers(repo, voucher, design_path, risky) -> str:
+    """'' when this DESIGN approval still covers the MR, else why not (see check_route)."""
+    h = str(voucher.get("lean_request", "")).split(" ", 1)[-1].strip().lower()
+    at = str(voucher.get("sha", ""))
+    if not re.match(r"^[0-9a-f]{6,64}$", h) or not re.match(r"^[0-9a-f]{40}$", at):
+        return "%s: not a DESIGN <hash> approval at a commit" % voucher.get("voucher_id", "?")
+    now, then = _blob(repo, "HEAD", design_path), _blob(repo, at, design_path)
+    if now is not None and now == then and hashlib.sha256(now).hexdigest().startswith(h):
+        return ""                                                  # a. the design is the file that was approved
+    after = git_out(repo, "-c", "core.quotepath=false", "diff", "--no-renames", "--name-only", at, "HEAD").splitlines()
+    moved = sorted(set(after) & set(risky))
+    if not moved:
+        return ""                                                  # b. the risky code was all there when approved
+    return ("%s approved DESIGN %s at %s; since then application-design.md is not that file and risk paths changed "
+            "(%s)" % (voucher.get("voucher_id", "?"), h[:8], at[:12], ", ".join(moved[:5])))
+
+
 def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
     """The skip floor: changes to risk paths need the design stage and a design approval signed by the bridge.
 
     Risk paths come from the target branch. A design approval is a bridge answer voucher (approve, lean_request
-    DESIGN ...) for this requirement: a ledger line on the branch is not evidence, anyone can write one."""
+    DESIGN ...) for this requirement: a ledger line on the branch is not evidence, anyone can write one.
+
+    An approval covers the design as it was approved, not what came after. The voucher names it twice: `sha`, the
+    MR head the question was asked at (the file the approver could read), and the hash in lean_request, Lean's hash
+    of application-design.md (`lean request DESIGN` prints the first 8 hex digits of the file's sha256; an approval
+    line matches when the file's sha256 starts with them). One approval is enough when either holds:
+      a. application-design.md at HEAD is the approved file: its sha256 starts with the voucher's hash, and its bytes
+         equal the file at the voucher's commit (8 hex digits alone can be matched by a crafted file in minutes);
+      b. no risk path that this MR changes was changed after the voucher's commit: the risky code was all there when
+         the approver looked, whatever the design says now.
+    Otherwise the design and the risky code both moved on after the approval: the run asks for a fresh one."""
     text = tgt.file(cfg["risk_paths_file"])
     if text is None and not tgt.trusted:
         p = git(repo, "show", "%s:%s" % (rec["brain_commit"], cfg["risk_paths_file"]), check=False)
@@ -153,8 +188,8 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
     ev = lean_events(repo, rec["intent"])
     skipped = any(e.get("event") == "STAGE_SKIPPED" and (e.get("data") or {}).get("stage") == "application-design"
                   for e in ev)
-    designed = os.path.exists(os.path.join(repo, lean.DOCS, rec["intent"], "inception", "application-design",
-                                           "application-design.md"))
+    design_path = "%s/%s/inception/application-design/application-design.md" % (lean.DOCS, rec["intent"])
+    designed = os.path.exists(os.path.join(repo, design_path))
     if skipped or not designed:
         return ["risk paths changed (%s) but application design was %s: this change needs the design stage"
                 % (shown, "skipped" if skipped else "not written")]
@@ -163,6 +198,10 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
     if not approvals:
         return ["risk paths changed (%s): no design approval signed by the bridge for %s (ask through the MR: "
                 "park.json with lean_request DESIGN ...)" % (shown, rec["key"])]
+    why = [design_approval_covers(repo, v, design_path, risky) for v in approvals]
+    if all(why):
+        return ["risk paths changed (%s): no design approval covers them any more (%s): ask for a fresh DESIGN "
+                "approval through the MR" % (shown, "; ".join(why[:3]))]
     return []
 
 

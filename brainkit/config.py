@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import re
 
-from .common import BrainError, load_json
+from .common import USER_RE, BrainError, load_json
 
 KIT_CONFIG = ".brain/kit.json"
 
@@ -21,6 +21,9 @@ DEFAULTS = {
     "rejected_label": "ai-handoff-rejected",
     "bot_users": ["brain-bot"],
     "bot_emails": ["brain-bot@noreply.invalid"],
+    # the GitLab account the bridge posts as (its questions, replies): lets anyone tell its notes from people's.
+    # Empty: the bridge goes by the note ids it recorded; an outside checker (a separate signer) cannot.
+    "bridge_user": "",
     "bot_forbidden_paths": ["gates/", "project-agent.yaml", ".brain/", "CODEOWNERS", ".gitlab/CODEOWNERS",
                             ".gitlab-ci.yml", "ci/"],
     "claim_statuses": ["In Progress", "进行中"],
@@ -86,6 +89,12 @@ def validate(cfg: dict) -> list:
         p.append("allowed_models may not contain auto")
     if not cfg.get("bot_users"):
         p.append("bot_users is empty")
+    bu = cfg.get("bridge_user")
+    if bu and not (isinstance(bu, str) and USER_RE.match(bu.lower())):
+        p.append("bridge_user must be a GitLab username")
+    elif bu and bu.lower() in [str(u).lower() for u in cfg.get("bot_users") or []]:
+        p.append("bridge_user must not be one of bot_users (the runner must not be able to post the bridge's "
+                 "questions)")
     if not str(cfg.get("branch_prefix", "")).isalpha():
         p.append("branch_prefix must be letters only")
     if cfg.get("tracker") not in TRACKERS:

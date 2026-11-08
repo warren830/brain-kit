@@ -10,7 +10,8 @@
 
 What a hand-over must prove (otherwise the MR gets a comment and the 'rejected' label):
   1. branch is <prefix>/<owner>/<JIRA>-<slug>, same project (no forks), targets the default branch;
-  2. the person who added the hand-over label is the branch owner (from GitLab's label events);
+  2. the person who added the hand-over label is the branch owner (from GitLab's label events), and added it after
+     GitLab recorded the MR head as pushed (its MR versions; commit dates are the pusher's and are not used);
   3. the owner is in brain-authz and is not a bot;
   4. the requirement is theirs: Jira assignee + claim status (tracker jira), or claim/<KEY> names them (none);
   5. run.json at the MR head is valid for this branch and was handed off by the owner;
@@ -30,7 +31,7 @@ import time
 from .. import claims, config as kitconfig, lean, runrec, sign
 from ..intake import package as intake
 from ..common import BrainError, git, iso, later, load_json, parse_branch, plain, utcnow, write_json
-from ..rest import DEFAULT_TOKEN_FILE, GitLab, HttpError, Jira, jira_user_id, read_token
+from ..rest import DEFAULT_TOKEN_FILE, GitLab, HttpError, Jira, gl_time, head_pushed_at, jira_user_id, read_token
 from .decisions import DecisionLoop
 from .kirocrew import KiroCrew
 from .ledger import OPEN_RUN_STATES, Ledger
@@ -39,6 +40,7 @@ BRIDGE_DEFAULTS = {
     "projects": [],
     "identities": "",
     "signing_key": "",
+    "signer": {},   # {}: sign with signing_key; {"type": "spool", "spool_dir", "allowed_signers"}: a signing service
     "vouchers_dir": "",
     "spool_dir": "",
     "ledger": "",
@@ -55,22 +57,29 @@ BRIDGE_DEFAULTS = {
 
 
 def load_bridge_config(path) -> dict:
+    """bridge.json. signing_key is needed only when the bridge signs with its own key (no other "signer")."""
     cfg = kitconfig.merged(BRIDGE_DEFAULTS, load_json(path))
-    for k in ("identities", "signing_key", "vouchers_dir", "spool_dir", "ledger"):
+    for k in ("identities", "vouchers_dir", "spool_dir", "ledger"):
         if not cfg.get(k):
             raise BrainError("bridge config: %s is required" % k)
+    probs = sign.signer_problems(cfg)
+    if probs:
+        raise BrainError("bridge config: " + "; ".join(probs))
     if not cfg["projects"]:
         raise BrainError("bridge config: projects is empty")
     return cfg
 
 
 class Bridge(DecisionLoop):
-    def __init__(self, cfg, gitlab, jira, kirocrew=None, out=print):
+    def __init__(self, cfg, gitlab, jira, kirocrew=None, out=print, signer=None):
+        """`signer`: any object with sign(voucher) -> signature; default the one bridge.json names (sign.py)."""
         self.cfg = cfg
         self.gl = gitlab
         self.jira = jira
         self.kc = kirocrew
         self.out = out
+        # a subclass may also bring its signer as a class attribute
+        self.signer = signer or getattr(self, "signer", None) or sign.signer_from_config(cfg)
         self.ledger = Ledger(cfg["ledger"])
         authz = load_json(cfg["identities"])
         self.ids = authz.get("users", {})
@@ -98,18 +107,44 @@ class Bridge(DecisionLoop):
 
     # ---------- checks ----------
 
-    def label_adder(self, project, iid, label):
-        """(username, event id) of the latest event on `label` when that event is an 'add'; ("", "") otherwise."""
+    def last_label_event(self, project, iid, label):
+        """The latest add/remove event on `label` (all pages), or None."""
         last = None
-        for ev in self.gl.label_events(project, iid):  # all pages
+        for ev in self.gl.label_events(project, iid):
             if (ev.get("label") or {}).get("name") == label and ev.get("action") in ("add", "remove"):
                 last = ev
-        if not last or last.get("action") != "add":
-            return "", ""
-        return ((last.get("user") or {}).get("username") or "").lower(), str(last.get("id", ""))
+        return last
 
-    def verify(self, project, kit, mr, adder=None):
-        """(problems, facts). facts carries what the contract needs."""
+    @staticmethod
+    def _adder(ev):
+        if not ev or ev.get("action") != "add":
+            return "", ""
+        return ((ev.get("user") or {}).get("username") or "").lower(), str(ev.get("id", ""))
+
+    def label_adder(self, project, iid, label):
+        """(username, event id) of the latest event on `label` when that event is an 'add'; ("", "") otherwise."""
+        return self._adder(self.last_label_event(project, iid, label))
+
+    def label_after_push(self, project, kit, mr, ev) -> list:
+        """The owner hands over the commit the MR showed when they added the label. A commit pushed after the label
+        (by the runner's key, or anyone who may push to ai/*) was not handed over: the label must come later than
+        the newest MR version whose head is the MR head. Both times are GitLab's own; commit dates are not used."""
+        label, sha = kit["handoff_label"], mr.get("sha", "")
+        added = gl_time((ev or {}).get("created_at"))
+        if added is None:
+            return ["the '%s' label event has no time GitLab recorded" % label]
+        pushed = head_pushed_at(self.gl.mr_versions(project, mr["iid"]), sha)
+        if pushed is None:
+            return ["GitLab shows no MR version with head %s: add the label '%s' again once the push shows on the MR"
+                    % (sha[:12], label)]
+        if pushed > added:
+            return ["%s was pushed (%s) after the label '%s' was added (%s): that commit was not handed over; add the "
+                    "label again to hand it over" % (sha[:12], iso(pushed), label, iso(added))]
+        return []
+
+    def verify(self, project, kit, mr, adder=None, label_event=None):
+        """(problems, facts). facts carries what the contract needs. `label_event`: the last hand-over label event,
+        when the caller has read it already (with `adder`, its user)."""
         p, f = [], {}
         branch = mr.get("source_branch", "")
         b = parse_branch(branch, kit["branch_prefix"])
@@ -123,11 +158,15 @@ class Bridge(DecisionLoop):
         owner = b["owner"]
         if owner in [u.lower() for u in kit["bot_users"]]:
             p.append("bot branches are not handed over")
+        if label_event is None:
+            label_event = self.last_label_event(project, mr["iid"], kit["handoff_label"])
         if adder is None:
-            adder = self.label_adder(project, mr["iid"], kit["handoff_label"])[0]
+            adder = self._adder(label_event)[0]
         if adder != owner:
             p.append("label '%s' was added by %s, not by the branch owner %s"
                      % (kit["handoff_label"], adder or "unknown", owner))
+        else:
+            p += self.label_after_push(project, kit, mr, label_event)
         ident = self.ids.get(owner)
         if ident is None:  # {} is a valid entry: a person without a Jira id (tracker none)
             p.append("%s is not in brain-authz identities" % owner)
@@ -234,20 +273,21 @@ class Bridge(DecisionLoop):
 
     def process(self, project, kit, mr):
         iid, sha = int(mr["iid"]), mr.get("sha", "")
-        adder, event = self.label_adder(project, iid, kit["handoff_label"])
+        ev = self.last_label_event(project, iid, kit["handoff_label"])
+        adder, event = self._adder(ev)
         # One check per (head commit, label event): re-adding the label after fixing Jira re-checks the same commit.
         key = "%s#%s" % (sha, event)
         if not self.ledger.claim_handoff(project, iid, key):
             return "seen"
         try:
-            return self._process(project, kit, mr, iid, sha, key, adder)
+            return self._process(project, kit, mr, iid, sha, key, adder, label_event=ev)
         except Exception:
             # Leave nothing half-done: an MR still 'checking' is retried on the next poll.
             self.ledger.release_handoff(project, iid, key)
             raise
 
-    def _process(self, project, kit, mr, iid, sha, key, adder):
-        probs, f = self.verify(project, kit, mr, adder)
+    def _process(self, project, kit, mr, iid, sha, key, adder, label_event=None):
+        probs, f = self.verify(project, kit, mr, adder, label_event=label_event)
         if probs:
             self.ledger.set_handoff(project, iid, key, "checking", "rejected", reason="; ".join(probs)[:2000])
             self.gl.comment(project, iid, "AI 接手被拒（%s）：\n" % sha[:12] + "\n".join("- " + x for x in probs) +
@@ -267,7 +307,17 @@ class Bridge(DecisionLoop):
             "expires_at": later(self.cfg["contract_ttl_hours"]), "issuer": sign.PRINCIPAL,
         }
         voucher["voucher_id"] = "V-" + sign.digest(voucher)[:10]
-        sig = sign.sign(voucher, self.cfg["signing_key"])
+        try:
+            sig = self.signer.sign(voucher)     # SignerUnavailable: nothing signed, checked again next round
+        except sign.SignerRefused as e:
+            why = "; ".join(e.reasons)
+            self.ledger.set_handoff(project, iid, key, "checking", "rejected", reason=("signer: " + why)[:2000])
+            self.gl.comment(project, iid, "AI 接手被拒（%s）：交接的检查都过了，但签名服务没有签这份合同：\n%s\n\n"
+                            "请负责人看一下签名服务的记录；改好后重新推送，再打一次标签 `%s`。"
+                            % (sha[:12], "\n".join("- " + x for x in e.reasons), kit["handoff_label"]))
+            self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
+            self.out("signer refused %s!%d @%s: %s" % (project, iid, sha[:12], why))
+            return "rejected"
         write_json(os.path.join(self.cfg["vouchers_dir"], run_id, voucher["voucher_id"] + ".json"),
                    {"voucher": voucher, "sig": sig})
         if self.cfg.get("publish_vouchers"):

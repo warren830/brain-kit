@@ -8,9 +8,11 @@ from __future__ import annotations
 import http.client
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 
 from .common import BrainError
 
@@ -93,6 +95,40 @@ def q(s) -> str:
     return urllib.parse.quote(str(s), safe="")
 
 
+GL_TIME_RE = re.compile(r"^(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d):(\d\d)(?:\.(\d{1,9}))?(Z|[+-]\d\d:?\d\d)$")
+
+
+def gl_time(s):
+    """A GitLab time (2026-11-08T12:00:00.123Z, 2026-11-08T20:00:00.123+08:00) as an aware UTC datetime.
+    None when it cannot be read, or has no zone: such a time cannot be compared with another one."""
+    if isinstance(s, datetime):
+        return s if s.tzinfo else None
+    m = GL_TIME_RE.match(str(s or "").strip())
+    if not m:
+        return None
+    y, mo, d, h, mi, se, frac, zone = m.groups()
+    try:
+        dt = datetime(int(y), int(mo), int(d), int(h), int(mi), int(se), int((frac or "0")[:6].ljust(6, "0")),
+                      tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    if zone != "Z":
+        off = timedelta(hours=int(zone[1:3]), minutes=int(zone[-2:]))
+        dt = dt - off if zone[0] == "+" else dt + off
+    return dt
+
+
+def head_pushed_at(versions, sha):
+    """When GitLab recorded `sha` as the MR's head: the newest MR version (diff) whose head_commit_sha is `sha`.
+
+    GitLab's server writes these times; a commit's own dates are whatever the pusher typed, so they are never used.
+    The newest one: a branch pushed away from `sha` and back to it was pushed again. None when there is none."""
+    times = [gl_time(v.get("created_at")) for v in versions or [] if isinstance(v, dict)
+             and v.get("head_commit_sha") == sha]
+    times = [t for t in times if t is not None]
+    return max(times) if times else None
+
+
 class GitLab(Rest):
     """GitLab REST v4. `project` is a numeric id or 'group/repo'."""
 
@@ -148,15 +184,27 @@ class GitLab(Rest):
         return self.call("POST", "/projects/%s/merge_requests/%d/notes" % (q(project), int(iid)), body={"body": text})
 
     def mr_notes(self, project, iid, per_page=100, max_pages=20):
-        """All notes on an MR, oldest first."""
+        """All notes on an MR, oldest first. More than max_pages pages is an error, not a short list: a flood of
+        notes must not hide a later answer (a conflicting one, say) from whoever reads them."""
         out = []
         for page in range(1, max_pages + 1):
             rows = self.call("GET", "/projects/%s/merge_requests/%d/notes" % (q(project), int(iid)),
                              {"sort": "asc", "order_by": "created_at", "per_page": per_page, "page": page}) or []
             out += rows
             if len(rows) < per_page:
-                break
-        return out
+                return out
+        raise BrainError("too many notes on !%s (more than %d): not read" % (iid, per_page * max_pages))
+
+    def mr_versions(self, project, iid, per_page=100, max_pages=20):
+        """The MR's versions (one per push GitLab recorded: head_commit_sha, created_at), all pages."""
+        out = []
+        for page in range(1, max_pages + 1):
+            rows = self.call("GET", "/projects/%s/merge_requests/%d/versions" % (q(project), int(iid)),
+                             {"per_page": per_page, "page": page}) or []
+            out += rows
+            if len(rows) < per_page:
+                return out
+        raise BrainError("too many versions on !%s (more than %d): not read" % (iid, per_page * max_pages))
 
     def file_raw(self, project, path, ref):
         """File bytes at ref, or None when it does not exist."""

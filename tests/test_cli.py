@@ -31,6 +31,9 @@ class LocalFlow(unittest.TestCase):
         os.environ.pop("GITLAB_TOKEN", None)
         os.environ["BRAIN_USER"] = "alice"
         self.addCleanup(os.environ.pop, "BRAIN_USER", None)
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = tmpdir(self)          # never read the developer's ~/.kiro, ~/.brain
+        self.addCleanup(os.environ.__setitem__, "HOME", old_home)
         self.repo = git_repo(os.path.join(tmpdir(self), "proj"))
         commit_file(self.repo, "src/app.py", "print('hi')\n", "init")
         rc, out = brain(self.repo, "install", self.repo, "--lean", LEAN_SRC, "--team", "pay", "--prefix", "PAY")
@@ -315,9 +318,17 @@ class LocalFlow(unittest.TestCase):
             spec = load_json(os.path.join(home, ".kiro", "agents", "brain-dev.json"))
             self.assertIn("PreToolUse", json.dumps(spec["hooks"]))
             self.assertEqual(brain(self.repo, "crew-agent")[0], 0)       # idempotent
-            write_json(os.path.join(home, ".kiro", "agents", "brain-dev.json"), {"name": "brain-dev"})
-            self.assertEqual(brain(self.repo, "crew-agent")[0], 2)       # refuses to overwrite a different one
+            p = os.path.join(home, ".kiro", "agents", "brain-dev.json")
+            # Kiro's upgraded list format with another tool's hook and no Lean hooks
+            other = {"name": "other-0", "trigger": "stop", "action": {"type": "command", "command": "other.sh"}}
+            write_json(p, {"name": "brain-dev", "kiroUpgrade": {"revision": 2}, "hooks": [other]})
+            self.assertEqual(brain(self.repo, "crew-agent")[0], 2)       # missing hooks: needs --force
             self.assertEqual(brain(self.repo, "crew-agent", "--force")[0], 0)
+            spec = load_json(p)
+            self.assertIn(other, spec["hooks"])                           # other tools' hooks kept
+            self.assertEqual(spec["kiroUpgrade"], {"revision": 2})
+            self.assertEqual(cli.missing_lean_hooks(spec), [])
+            self.assertEqual(brain(self.repo, "crew-agent")[0], 0)       # now nothing to do
         finally:
             os.environ["HOME"] = old
 

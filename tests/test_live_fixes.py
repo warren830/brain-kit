@@ -100,5 +100,30 @@ class RunnerNeedsTheHookAdapterInGit(unittest.TestCase):
         self.assertTrue(cli.runner_kit_problems(repo))
 
 
+class KiroUpgradedAgentSpec(unittest.TestCase):
+    """Kiro rewrote ~/.kiro/agents/*.json into a list format on upgrade (2026-11-08), next to other tools' hooks."""
+
+    def test_both_formats(self):
+        cmd = lambda ev: "python3 %s %s" % (cli.CREW_HOOK, ev)
+        old = {"hooks": {"agentSpawn": [{"command": cmd("SessionStart")}],
+                         "userPromptSubmit": [{"command": cmd("UserPromptSubmit")}],
+                         "preToolUse": [{"matcher": "*", "command": cmd("PreToolUse")}]}}
+        new = {"kiroUpgrade": {"revision": 2}, "hooks": [
+            {"name": "agentSpawn-0", "trigger": "agentSpawn", "action": {"type": "command", "command": cmd("SessionStart")}},
+            {"name": "agentSpawn-1", "trigger": "agentSpawn", "action": {"type": "command", "command": "other.sh"}},
+            {"name": "preToolUse-0", "trigger": "preToolUse", "matcher": "*",
+             "action": {"type": "command", "command": cmd("PreToolUse")}},
+            {"name": "userPromptSubmit-0", "trigger": "userPromptSubmit",
+             "action": {"type": "command", "command": cmd("UserPromptSubmit")}}]}
+        self.assertEqual(cli.missing_lean_hooks(old), [])
+        self.assertEqual(cli.missing_lean_hooks(new), [])
+        # a Lean hook under the wrong trigger does not count
+        wrong = {"hooks": [{"trigger": "stop", "action": {"command": cmd("PreToolUse")}}]}
+        self.assertEqual(len(cli.missing_lean_hooks(wrong)), 3)
+        fixed = cli.add_lean_hooks(wrong, cli.missing_lean_hooks(wrong))
+        self.assertEqual(cli.missing_lean_hooks(fixed), [])
+        self.assertIn(wrong["hooks"][0], fixed["hooks"])
+
+
 if __name__ == "__main__":
     unittest.main()
