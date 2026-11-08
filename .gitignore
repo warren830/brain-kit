@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# machine-local, never shared: internal SSO transport and its test
+brainkit/local_transport.py
+tests/test_local_transport.py

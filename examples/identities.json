@@ -1,0 +1,24 @@
+{
+  "_help": "brain-authz: GitLab username -> Jira user id (DC: name; Cloud: accountId; leave empty without Jira); roles: who may answer which decisions (see decision_roles in .brain/kit.json). Restricted repo; the bot cannot read it.",
+  "users": {
+    "alice": {
+      "jira": "alice"
+    },
+    "bob": {
+      "jira": "bob"
+    },
+    "carol": {},
+    "dave": {}
+  },
+  "roles": {
+    "product": [
+      "carol"
+    ],
+    "builder": [
+      "dave"
+    ],
+    "security": [
+      "erin"
+    ]
+  }
+}

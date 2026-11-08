@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "team": "",
+  "tracker": "none",
+  "req_prefix": "REQ",
+  "default_branch": "main",
+  "brain_dir": "brain",
+  "runs_dir": "runs",
+  "branch_prefix": "ai",
+  "bot_users": [
+    "brain-bot"
+  ],
+  "bot_emails": [
+    "brain-bot@noreply.invalid"
+  ],
+  "model": "claude-opus-5.5",
+  "review_model": "kimi-k3",
+  "allowed_models": [
+    "claude-opus-5.5",
+    "kimi-k3"
+  ],
+  "claim_statuses": [
+    "In Progress",
+    "进行中"
+  ],
+  "pins": {
+    "kiro-cli": "",
+    "kirocrew": "",
+    "lean": "0.2"
+  },
+  "jira": {
+    "base": "",
+    "api": "2"
+  },
+  "gitlab": {
+    "base": "",
+    "project": ""
+  },
+  "_help": "People edit this file; the bot may not (pre-receive). tracker: none (keys <req_prefix>-<n>, claimed as git branches claim/<KEY>) or jira (keys are Jira issues; set jira.base). gitlab.base / gitlab.project (group/repo): for MR labels. bot_users / bot_emails: the team runner's GitLab account. pins: exact versions every machine must run. intake.allow_confidential: decision 02 (may confidential material reach the model).",
+  "intake": {
+    "allow_confidential": false,
+    "bulk_pii_limit": 30
+  }
+}

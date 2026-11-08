@@ -1,0 +1,34 @@
+{
+  "projects": [
+    "grp/pilot-repo"
+  ],
+  "gitlab": {
+    "base": "https://gitlab.example.internal",
+    "token_env": "BRIDGE_GITLAB_TOKEN"
+  },
+  "jira": {
+    "base": "https://jira.example.internal",
+    "api": "2",
+    "token_env": "BRIDGE_JIRA_TOKEN"
+  },
+  "identities": "/srv/brain-authz/identities.json",
+  "signing_key": "/etc/brain-kit/bridge_ed25519",
+  "vouchers_dir": "/srv/brain-intake/vouchers",
+  "spool_dir": "/srv/brain-spool",
+  "ledger": "/var/lib/brain-bridge/ledger.sqlite",
+  "max_inflight": 12,
+  "max_per_repo": 3,
+  "contract_ttl_hours": 72,
+  "interval": 60,
+  "intake_dir": "/srv/brain-intake",
+  "publish_vouchers": true,
+  "kirocrew": {
+    "base": "http://127.0.0.1:5476",
+    "app": "brain-bridge",
+    "secret_file": "/home/brainbridge/.brain/app_secret",
+    "agent": "brain-run",
+    "memory_mode": "incognito"
+  },
+  "runner_runs_root": "/home/brainbot/runs",
+  "pseudonym_salt": "change-me-per-team"
+}

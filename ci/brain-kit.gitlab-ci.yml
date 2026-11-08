@@ -1,0 +1,43 @@
+# Include from the project's .gitlab-ci.yml (owned by the platform team; the bot cannot edit CI files).
+# Make `brain-run-check` a required check for MRs from ai/* branches, reported by a job the bot cannot fake
+# (see the main plan §6: only checks the bot cannot write count as gates).
+brain-run-check:
+  stage: test
+  image: ${BRAIN_CI_IMAGE}          # internal image with python3 (3.8+), git and openssh-client
+  variables:
+    GIT_DEPTH: "0"                  # brain_commit must be in history
+  rules:
+    - if: '$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^ai\//'
+  script:
+    - git clone -q --depth 1 --branch "${BRAIN_KIT_REF}" "${BRAIN_KIT_REPO}" /tmp/brain-kit
+    # vouchers: read-only clone of brain-intake/vouchers (deploy token scoped to that repo, read_repository)
+    - git clone -q --depth 1 "${BRAIN_INTAKE_VOUCHERS_REPO}" /tmp/brain-intake
+    - export BRAIN_VOUCHERS_DIR=/tmp/brain-intake/vouchers
+    - export BRAIN_ALLOWED_SIGNERS=/tmp/brain-kit/deploy/allowed_signers   # bridge public key, pinned with the kit
+    - python3 /tmp/brain-kit/bin/brain-ci check-run
+
+# GitLab Free has no server hooks: run the same rules here and make this job required too.
+brain-push-rules:
+  stage: test
+  image: ${BRAIN_CI_IMAGE}
+  variables:
+    GIT_DEPTH: "0"
+  rules:
+    - if: '$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^ai\//'
+  script:
+    - git clone -q --depth 1 --branch "${BRAIN_KIT_REF}" "${BRAIN_KIT_REPO}" /tmp/brain-kit
+    - python3 /tmp/brain-kit/bin/brain-ci push-rules
+
+# The Brain's rules on every MR (Brain MRs from `brain reflect`, and anything else touching brain/):
+# entries change only by same / adds-to / replaces / withdraws / purge, archives only grow, new text has no
+# secrets, personal data, amounts or masked placeholders. Make it required; the warnings tell reviewers what to check.
+brain-lint:
+  stage: test
+  image: ${BRAIN_CI_IMAGE}
+  variables:
+    GIT_DEPTH: "0"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  script:
+    - git clone -q --depth 1 --branch "${BRAIN_KIT_REF}" "${BRAIN_KIT_REPO}" /tmp/brain-kit
+    - python3 /tmp/brain-kit/bin/brain-ci brain-lint

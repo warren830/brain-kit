@@ -1,0 +1,43 @@
+{
+  "name": "brain-run",
+  "description": "Team runner: continue a handed-over run (review, CI fixes, evidence, delivery). Bridge-driven.",
+  "model": "claude-opus-5.5",
+  "prompt": "file:///opt/brain-kit/remote/prompts/brain-run.md",
+  "tools": [
+    "read",
+    "write",
+    "shell"
+  ],
+  "allowedTools": [
+    "fs_read",
+    "grep",
+    "glob"
+  ],
+  "resources": [
+    "file://AGENTS.md",
+    "file://brain/PRODUCT.md",
+    "file://brain/TECH.md",
+    "file://brain/IMPROVEMENT.md",
+    "file://brain/PROJECT.md",
+    "file://.kiro/steering/*.md"
+  ],
+  "_notes": "Install at user level on the team runner: ~/.kiro/agents/brain-run.json (KiroCrew on kas/v3 reads agent specs and their hooks from the user level only, and never reads a project's .kiro/hooks/). Lean's hooks run through the hooks field above via the workspace's .kiro/brain/lean-hook.py. Messages the bridge sends count as human turns for Lean; that is by design (the bridge verified them). Still to confirm on the runner (V1): resources load from the workspace, the model is honoured, subagents also carry the hooks.",
+  "hooks": {
+    "agentSpawn": [
+      {
+        "command": "python3 .kiro/brain/lean-hook.py SessionStart"
+      }
+    ],
+    "userPromptSubmit": [
+      {
+        "command": "python3 .kiro/brain/lean-hook.py UserPromptSubmit"
+      }
+    ],
+    "preToolUse": [
+      {
+        "matcher": "*",
+        "command": "python3 .kiro/brain/lean-hook.py PreToolUse"
+      }
+    ]
+  }
+}

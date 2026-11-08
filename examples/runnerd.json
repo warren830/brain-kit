@@ -1,0 +1,9 @@
+{
+  "spool_dir": "/srv/brain-spool",
+  "cache_dir": "/home/brainbot/brain-cache",
+  "runs_root": "/home/brainbot/runs",
+  "allowed_signers": "/opt/brain-kit/deploy/allowed_signers",
+  "clone_url": "ssh://git@gitlab.example.internal/{project}.git",
+  "intake_dir": "/home/brainbot/brain-intake",
+  "interval": 30
+}

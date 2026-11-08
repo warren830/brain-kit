@@ -1,0 +1,18 @@
+# Runs as brainbot (the KiroCrew user). Outbound only: GitLab over SSH. Listens on nothing.
+[Unit]
+Description=brain-kit runner workspace preparer
+After=network-online.target
+
+[Service]
+User=brainbot
+Group=brainspool
+UMask=0007
+ExecStart=/usr/bin/python3 -I /opt/brain-kit/bin/brain-runnerd --config /etc/brain-kit/runnerd.json loop
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/srv/brain-spool /home/brainbot/brain-cache /home/brainbot/runs
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

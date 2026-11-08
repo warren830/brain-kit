@@ -1,0 +1,26 @@
+# Runs as brainbridge. Outbound only: GitLab, Jira, and the KiroCrew dashboard on 127.0.0.1. Listens on nothing.
+# Spool layout (each side writes only its own directory; the other side can only read it):
+#   /srv/brain-spool/requests  brainbridge:brainspool 2750   signed hand-over requests (bridge writes)
+#   /srv/brain-spool/ready     brainbot:brainspool    2750   prepared workspaces (runnerd writes)
+#   /srv/brain-spool/failed    brainbot:brainspool    2750
+# The bridge never trusts ready/ blindly: it checks the path is runner_runs_root/<RUN-ID> and the head is the
+# contract sha, and it sends from its own ledger copy of the voucher.
+[Unit]
+Description=brain-kit bridge (hand-over)
+After=network-online.target
+
+[Service]
+User=brainbridge
+Group=brainspool
+UMask=0007
+EnvironmentFile=/etc/brain-kit/bridge.env
+ExecStart=/usr/bin/python3 -I /opt/brain-kit/bin/brain-bridge --config /etc/brain-kit/bridge.json loop
+Restart=on-failure
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/srv/brain-spool /srv/brain-intake /var/lib/brain-bridge
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
