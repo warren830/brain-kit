@@ -166,5 +166,47 @@ class PackageTamper(unittest.TestCase):
         self.assertFalse(os.path.exists(dst))
 
 
+def bridge_fixture(test):
+    from tests import test_qa_security as qs
+    qs.env(test, HOME=tmpdir(test))
+    return qs.fixture(test)
+
+
+class PollOneBrokenProject(unittest.TestCase):
+    """R1-05: a project whose kit.json cannot be read stopped the hand-overs of every project listed after it."""
+    BROKEN = "grp/broken"
+
+    def setUp(self):
+        from tests import test_bridge as tb
+        self.t = bridge_fixture(self)
+        self.P = tb.P
+
+    def broken(self, raw):
+        t = self.t
+        t.fake.on("GET", "/api/v4/projects/grp/broken", lambda m, qy, b: (200, {"default_branch": "main"}))
+        t.fake.on("GET", "/api/v4/projects/grp/broken/repository/files/(.+)/raw", lambda m, qy, b: (200, raw))
+
+    def check(self):
+        from brainkit.common import BrainError
+        t = self.t
+        for order in ([self.BROKEN, self.P], [self.P, self.BROKEN]):
+            t.cfg["projects"] = order
+            t.bridge = t.new_bridge()
+            with self.assertRaises(BrainError) as cm:
+                t.bridge.poll()
+            self.assertIn("grp/broken", str(cm.exception))
+            rows = [tuple(r) for r in t.bridge.ledger.db.execute("SELECT project, state FROM handoffs")]
+            self.assertEqual(rows, [(self.P, "accepted")], order)
+
+    def test_kit_json_not_json(self):
+        self.broken(b"{not json")
+        self.check()
+
+    def test_kit_json_invalid(self):
+        import json
+        self.broken(json.dumps({"version": 1, "model": "gpt-x"}).encode())
+        self.check()
+
+
 if __name__ == "__main__":
     unittest.main()

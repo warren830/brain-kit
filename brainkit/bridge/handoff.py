@@ -413,14 +413,24 @@ class Bridge(DecisionLoop):
     # ---------- poll ----------
 
     def poll(self):
+        """Check the labelled MRs of every project. A project whose kit.json or MR list cannot be read does not hold
+        up the others (as in dispatch, watch and collect): its error is raised at the end, after the rest."""
+        errors = []
         for proj in self.cfg["projects"]:
             project = proj["project"] if isinstance(proj, dict) else proj
-            kit = self.kit(project)
-            for mr in self.gl.mrs_with_label(project, kit["handoff_label"]):
+            try:
+                kit = self.kit(project)
+                mrs = self.gl.mrs_with_label(project, kit["handoff_label"])
+            except Exception as e:  # noqa: BLE001 - logged by the caller; this project is looked at again next round
+                errors.append("%s: %s" % (project, e))
+                continue
+            for mr in mrs:
                 try:
                     self.process(project, kit, mr)
                 except BrainError as e:  # one bad MR must not stop the others; it is retried next round
                     self.out("error on %s!%s: %s" % (project, mr.get("iid"), e))
+        if errors:
+            raise BrainError("poll: not done this round: " + "; ".join(errors))
 
     def process(self, project, kit, mr):
         """-> "accepted", "rejected", "seen" (this head and label event were checked before), "unlabelled" (the
