@@ -1253,13 +1253,20 @@ def cmd_handoff(a):
             br, cfg["handoff_label"], " (its description is %s)" % md if desc is not None else ""))
         return 0
     git(repo, "push", "-q", "-u", "origin", br)
+    # exit 1 from here on whenever the MR is not labelled: pushed, but nothing handed over (docs 4.3)
     if a.no_label:
-        print("Pushed %s. Add label '%s' to its MR when ready." % (br, cfg["handoff_label"]))
-        return 0
+        print("Pushed %s, but NOT labelled (--no-label): nothing was handed over yet. Add the label '%s' to its MR "
+              "when it is ready." % (br, cfg["handoff_label"]))
+        return 1
     gl = _gitlab(cfg)
     if not gl or not cfg["gitlab"]["project"]:
-        print("Pushed %s. GitLab not configured here: add label '%s' to its MR by hand." % (br, cfg["handoff_label"]))
-        return 0
+        missing = ["gitlab.%s in %s" % (k, config.KIT_CONFIG) for k in ("base", "project") if not cfg["gitlab"][k]]
+        if cfg["gitlab"]["base"] and not read_token():
+            missing.append("a GitLab token on this machine (GITLAB_TOKEN, or %s)" % os.environ.get(
+                "BRAIN_GITLAB_TOKEN_FILE", "~/.brain/gitlab-token"))
+        print("Pushed %s, but NOT labelled: missing %s. Nothing was handed over: add the label '%s' to its MR by "
+              "hand, or set that up and run `brain handoff` again." % (br, "; ".join(missing), cfg["handoff_label"]))
+        return 1
     proj = cfg["gitlab"]["project"]
     head = git_out(repo, "rev-parse", "HEAD")
     mr = gl.mr_for_branch(proj, br)

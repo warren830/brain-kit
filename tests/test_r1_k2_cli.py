@@ -329,5 +329,47 @@ class R1_102_LeanPin(Project):
         self.assertIn("OK   AI-DLC Lean 0.30.0 (not pinned)", brain(self.repo, "doctor", "--offline")[1])
 
 
+class R1_26_PushedNotLabelledExits1(Project):
+    def setUp(self):
+        super().setUp()
+        self.add_origin()
+
+    def ready(self, gitlab=None):
+        if gitlab is not None:
+            kp = os.path.join(self.repo, ".brain", "kit.json")
+            kit = load_json(kp)
+            kit["gitlab"] = gitlab
+            write_json(kp, kit)
+            sh("git", "-C", self.repo, "commit", "-q", "-am", "gitlab")
+            sh("git", "-C", self.repo, "push", "-q", "origin", "main")
+        rc, out = brain(self.repo, "start", "refund", "--key", "PAY-1")
+        self.assertEqual(rc, 0, out)
+        edit_status(self.repo, load_json(os.path.join(self.repo, "runs", "PAY-1", "run.json"))["intent"])
+
+    def pushed(self):
+        return sh("git", "-C", self.origin, "log", "-1", "--format=%s", "ai/alice/PAY-1-refund").stdout.strip()
+
+    def test_r1_26_no_token_exits_1_and_says_what_is_missing(self):
+        self.ready({"base": "https://gitlab.example.invalid", "project": "grp/repo"})
+        rc, out = brain(self.repo, "handoff")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NOT labelled: missing a GitLab token on this machine", out)
+        self.assertIn("Nothing was handed over", out)
+        self.assertEqual(self.pushed(), "PAY-1: hand off to team runner")
+
+    def test_r1_26_gitlab_not_in_kit_json_exits_1(self):
+        self.ready()
+        rc, out = brain(self.repo, "handoff")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NOT labelled: missing gitlab.base in .brain/kit.json; gitlab.project in .brain/kit.json", out)
+
+    def test_r1_26_no_label_exits_1(self):
+        self.ready()
+        rc, out = brain(self.repo, "handoff", "--no-label")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("NOT labelled (--no-label): nothing was handed over yet", out)
+        self.assertEqual(self.pushed(), "PAY-1: hand off to team runner")
+
+
 if __name__ == "__main__":
     unittest.main()
