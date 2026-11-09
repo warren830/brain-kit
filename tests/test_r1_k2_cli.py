@@ -222,5 +222,26 @@ class R1_23_UnfinishedStartPutsBack(Project):
         self.assertEqual(branch(self.repo), "main")
 
 
+@unittest.skipUnless(HAVE_LEAN, "AI-DLC Lean checkout not found")
+class R1_24_GitignoreLastLine(unittest.TestCase):
+    def test_r1_24_install_appends_after_a_last_line_without_newline(self):
+        d = tmpdir(self)
+        env(self, HOME=d, BRAIN_USER="alice")
+        fake_tools(self)
+        repo = git_repo(os.path.join(d, "p"))
+        commit_file(repo, ".gitignore", "node_modules/\n.aidlc-lean/\ndist", "init")      # no final newline
+        rc, out = brain(repo, "install", repo, "--lean", LEAN_SRC, "--prefix", "PAY")
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(repo, ".gitignore"), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        self.assertIn("dist", lines)
+        self.assertIn(".brain-materials/", lines)
+        for p in ("dist/bundle.js", ".brain-materials/x", ".aidlc-lean/x"):
+            self.assertEqual(sh("git", "-C", repo, "check-ignore", "-q", p, check=False).returncode, 0, p)
+        rc, out = brain(repo, "install", repo, "--lean", LEAN_SRC)               # again: nothing added twice
+        with open(os.path.join(repo, ".gitignore"), encoding="utf-8") as f:
+            self.assertEqual(f.read().splitlines().count(".brain-materials/"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

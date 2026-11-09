@@ -341,14 +341,15 @@ def cmd_install(a):
     if not os.path.exists(os.path.join(repo, "AGENTS.md")):
         shutil.copyfile(os.path.join(TEMPLATES, "AGENTS.md"), os.path.join(repo, "AGENTS.md"))
     gi = os.path.join(repo, ".gitignore")
-    have = []
+    text = ""
     if os.path.exists(gi):
         with open(gi, encoding="utf-8") as f:
-            have = f.read().splitlines()
-    with open(gi, "a", encoding="utf-8") as f:
-        for line in GITIGNORE_LINES:
-            if line not in have:
-                f.write(line + "\n")
+            text = f.read()
+    missing = [line for line in GITIGNORE_LINES if line not in text.splitlines()]
+    if missing:
+        with open(gi, "a", encoding="utf-8") as f:
+            # a last line without its newline (many editors save it so) would run into ours: neither would work
+            f.write(("\n" if text and not text.endswith("\n") else "") + "".join(line + "\n" for line in missing))
     print("brain-kit %s installed in %s. Next: `brain doctor`." % (__version__, repo))
     return 0
 
