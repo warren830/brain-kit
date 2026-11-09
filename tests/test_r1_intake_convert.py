@@ -513,7 +513,8 @@ class R1_63OneBadFile(unittest.TestCase):
                        % (W, wp("第一条：退款规则说明，十四天内可以退款。") * 200))
         with zipfile.ZipFile(bad) as z:
             info = z.getinfo("word/document.xml")
-        data = bytearray(open(bad, "rb").read())
+        with open(bad, "rb") as f:
+            data = bytearray(f.read())
         start = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
         for k in range(start + 10, start + 40):              # flip bytes inside the compressed member
             data[k] ^= 0x5A
