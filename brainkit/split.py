@@ -47,6 +47,11 @@ RANGE_RE = re.compile(r"(?<![A-Za-z0-9-])(US|AC|BR)-([1-9][0-9]{0,3})"
                       r"(?:\s*(?:\.{2,3}|…|~|～)\s*(?:(US|AC|BR)-)?|[–—](?:(US|AC|BR)-)?"
                       r"|\s*(?:[–—]|\bto\b|到|至)\s*(US|AC|BR)-)"
                       r"([1-9][0-9]{0,3})(?![0-9])")
+# a Stories / ACs column, by its whole name ("Data store" is not one): stories, ACs, or both (Stories / ACs)
+_S = r"(?:user\s+)?stor(?:y|ies)(?:\s+ids?)?|用户故事|故事"
+_A = r"acs?(?:\s+ids?)?|acceptance\s+criteria|验收标准|验收条件"
+_J = r"\s*(?:/|&|\+|,|\band\b|和|与|及)\s*"
+STORIES_COL_RE = re.compile(r"^(?:(?:{s})(?:{j}(?:{a}))?|(?:{a})(?:{j}(?:{s}))?)$".format(s=_S, a=_A, j=_J))
 LOOSE_RANGE_RE = re.compile(r"(?<![A-Za-z0-9-])(?:US|AC|BR)-[0-9]+(?:\s*(?:\.{2,3}|…|~|～)|\s*[–—]\s*[0-9])")
 CLONE_RE = re.compile(r"^[0-9a-f]{6}$")
 FIELDS = ("title", "body", "acs", "refs", "expected_paths", "depends_on", "contracts")
@@ -142,14 +147,15 @@ def parse_units(text, warnings=None) -> tuple:
     """(units, problems) of unit-of-work.md. A unit: {name, owner, paths, depends_on (unit names), contracts,
     stories (US-/AC-/BR- ids, ranges expanded), status}. Names and paths as Lean's Project.units() reads them (first
     table, first column, the first header with "path" / "owner" or "team"); the other columns as the template names
-    them. `warnings` (a list) gets what is read but not as written (a range that cannot be expanded)."""
+    them, Stories / ACs by the whole name (every such column). `warnings` (a list) gets what is read but not as
+    written: a range that cannot be expanded, no Stories / ACs column."""
     warnings = [] if warnings is None else warnings
     header, rows = _lean_first_table(text)
     pcol = _col(header, lambda h: "path" in h)
     ocol = _col(header, lambda h: "owner" in h or "team" in h)
     dcol = _col(header, lambda h: "depend" in h)
     ccol = _col(header, lambda h: "contract" in h)
-    scol = _col(header, lambda h: "stor" in h or re.search(r"\bacs?\b", h) is not None)
+    scols = [i for i, h in enumerate(header) if STORIES_COL_RE.match(" ".join(re.sub(r"[`*]", " ", h.lower()).split()))]
     stcol = _col(header, lambda h: "status" in h)
     units, problems, seen = [], [], set()
     for cells in rows:
@@ -169,10 +175,14 @@ def parse_units(text, warnings=None) -> tuple:
                       "paths": _lean_paths(_cell(cells, pcol)) if pcol is not None else [],
                       "depends_on": [d for d in deps if d and d.lower() not in ("-", "—", "none", "n/a")],
                       "contracts": _items(_cell(cells, ccol)),
-                      "stories": list(dict.fromkeys(_ids(_cell(cells, scol), name, warnings))),
+                      "stories": list(dict.fromkeys(_ids("; ".join(_cell(cells, i) for i in scols), name,
+                                                          warnings))),
                       "status": _cell(cells, stcol)})
     if pcol is None and units:
         problems.append("unit-of-work.md has no Paths column (Lean's gates read it)")
+    if not scols and units:
+        warnings.append("unit-of-work.md has no Stories / ACs column (its columns: %s): the children get no stories "
+                        "or ACs from it; name the column Stories / ACs" % ", ".join(h for h in header if h))
     names = {u["name"] for u in units}
     for u in units:
         if not u["paths"]:

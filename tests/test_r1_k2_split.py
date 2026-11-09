@@ -138,6 +138,26 @@ class UnitsTable(unittest.TestCase):
         self.assertEqual(len(warnings), 1, warnings)
         self.assertIn("unit jobs: 'AC-3..AC-1' in Stories / ACs is not expanded (it runs backwards)", warnings[0])
 
+    def test_r1_39_a_column_named_like_store_is_not_the_stories_column(self):
+        text = """# Units of Work: x
+
+| Unit | Owner team | Paths | Data store | Depends on | Contracts | Stories / ACs | Status |
+|---|---|---|---|---|---|---|---|
+| api | api | services/api/** | PostgreSQL refunds | - | - | US-1, AC-1, AC-2 | not started |
+| jobs | jobs | jobs/** | - | - | - | US-3, AC-4 | not started |
+"""
+        units, probs = split.parse_units(text)
+        self.assertEqual(probs, [])
+        self.assertEqual([u["stories"] for u in units], [["US-1", "AC-1", "AC-2"], ["US-3", "AC-4"]])
+        self.assertEqual(self.child_acs(units[0]), ["AC-1", "AC-2"])
+        # no column it knows by name: every child would get no ACs, so it says so
+        warnings = []
+        units, probs = split.parse_units(text.replace("Stories / ACs", "Delivers"), warnings)
+        self.assertEqual(([u["stories"] for u in units], probs), ([[], []], []))
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("unit-of-work.md has no Stories / ACs column (its columns: Unit, Owner team, Paths, Data store",
+                      warnings[0])
+
 
 if __name__ == "__main__":
     unittest.main()
