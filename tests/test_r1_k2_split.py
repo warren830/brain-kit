@@ -188,6 +188,37 @@ class ClaimRace(unittest.TestCase):
         self.assertEqual(split.claims.read(people["bob"], "PAY-2")["owner"], "alice")
 
 
+class ShowParent(unittest.TestCase):
+    """R1-45: `brain intent show` of a split parent (a plain claim from `brain start`)."""
+
+    def test_r1_45_a_parent_shows_as_a_plain_claim_with_its_children(self):
+        T.isolate(self)
+        repo = git_repo(os.path.join(tmpdir(self), "repo"))
+        sh("git", "-C", repo, "config", "brain.user", "alice")
+        T.write(repo, ".brain/kit.json", json.dumps({"version": 1, "req_prefix": "PAY", "tracker": "none"}))
+        T.commit_all(repo, "kit")
+        split.claims.claim(repo, "PAY", "alice", "退款大需求", key="PAY-1")         # what `brain start` files
+        body = "Unit api of PAY-1."
+        sp = {"intent": "261110-pay-1-big", "branch": "ai/alice/PAY-1-big", "commit": "a" * 40,
+              "design_sha256": "b" * 64, "units_sha256": "c" * 64}
+        split.claims.claim(repo, "PAY", None, "api · 通过接口提交退款", key="PAY-2", extra={
+            "source": "split", "body": body, "acs": [], "refs": [],
+            "hash": split.intents.digest("split", "api · 通过接口提交退款", body), "filed_by": "alice",
+            "parent": "PAY-1", "unit": "api", "expected_paths": ["services/api/**"], "depends_on": [],
+            "contracts": [], "split": sp})
+        rc, out = T.brain(repo, "intent", "show", "PAY-1")
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(out.startswith("# PAY-1 · 退款大需求\n\nSource: product · claimed by alice at "), out)
+        self.assertNotIn("## Description", out)                                    # no text was filed with it
+        self.assertNotIn("Carry the acceptance criteria", out)
+        self.assertIn("大需求：已合并 0/1，进行中\n  PAY-2      api          待认领", out)
+        # the child still shows as the unit it is, and --json is the enriched claim
+        rc, out = T.brain(repo, "intent", "show", "PAY-2")
+        self.assertIn("Source: split · unit api of PAY-1", out)
+        rc, out = T.brain(repo, "intent", "show", "PAY-1", "--json")
+        self.assertEqual(json.loads(out)["children"], ["PAY-2"])
+
+
 @unittest.skipUnless(T.HAVE_LEAN, "AI-DLC Lean checkout not found")
 class StartChild(T.Family):
     """`brain start --key CHILD` through a real Lean install (test_split.Family's project and helpers)."""
