@@ -188,5 +188,30 @@ class ClaimRace(unittest.TestCase):
         self.assertEqual(split.claims.read(people["bob"], "PAY-2")["owner"], "alice")
 
 
+@unittest.skipUnless(T.HAVE_LEAN, "AI-DLC Lean checkout not found")
+class StartChild(T.Family):
+    """`brain start --key CHILD` through a real Lean install (test_split.Family's project and helpers)."""
+
+    # only the tests below: the inherited end-to-end tests run in test_split
+    test_split_claim_build_release = test_split_needs_the_design_approval_to_cover_the_units = None
+    test_resplit_after_a_new_design = test_build_on_a_dependency_branch = test_bots_and_strangers = None
+
+    def test_r1_42_after_on_the_hint_is_to_wait_for_the_other(self):
+        self.inception(rows=["| api | api | services/api/** | - | - | US-1 | not started |",
+                             "| jobs | jobs | jobs/** | - | - | US-3 | not started |",
+                             "| web | web | web/** | api, jobs | - | US-2 | not started |"])
+        self.ok("alice", self.alice, "split", "PAY-1")                     # PAY-2 api, PAY-3 jobs, PAY-4 web
+        self.ok("alice", self.alice, "start", "--key", "PAY-2")
+        self.ok("bob", self.bob, "start", "--key", "PAY-3")
+        carol = self.p.clone("carol")
+        self.assertIn("Wait for them to merge.", self.refused("carol", carol, "start", "--key", "PAY-4"))
+        for on, other in (("PAY-2", "PAY-3"), ("PAY-3", "PAY-2")):
+            out = self.refused("carol", carol, "start", "--key", "PAY-4", "--on", on)
+            self.assertIn("PAY-4 depends on %s (unit" % other, out)
+            self.assertIn("--on builds on one dependency's branch (%s's); wait for it to merge." % on, out)
+            self.assertNotIn("--on %s`" % other, out)                     # no hint that sends carol round in circles
+        self.assertIsNone(self.claim("PAY-4")["owner"])
+
+
 if __name__ == "__main__":
     unittest.main()

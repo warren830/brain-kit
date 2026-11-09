@@ -884,8 +884,13 @@ def start_child(repo, cfg, a, doc, me, version) -> int:
         waiting.remove(on)
     if waiting:
         who = ["%s (unit %s, %s)" % (k, (by_key.get(k) or {}).get("unit"), _who(by_key.get(k))) for k in waiting]
-        hint = (" Wait for it, or build on its branch: `brain start --key %s --on %s`." % (key, waiting[0])
-                if len(waiting) == 1 else " Wait for them to merge.")
+        if on:                                    # --on builds on one branch: the others have to merge first
+            hint = " --on builds on one dependency's branch (%s's); wait for %s to merge." % (
+                on, "it" if len(waiting) == 1 else "them")
+        elif len(waiting) == 1:
+            hint = " Wait for it, or build on its branch: `brain start --key %s --on %s`." % (key, waiting[0])
+        else:
+            hint = " Wait for them to merge."
         raise BrainError("%s depends on %s, which %s not merged into %s yet.%s" % (
             key, ", ".join(who), "has" if len(waiting) == 1 else "have", sp["branch"], hint))
     rp = runrec.path(cfg["runs_dir"], key).replace(os.sep, "/")
