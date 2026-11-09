@@ -159,5 +159,34 @@ class UnitsTable(unittest.TestCase):
                       warnings[0])
 
 
+class ClaimRace(unittest.TestCase):
+    """R1-40: two people claim the next free key at once. The server's hook lets bob's claim of PAY-1 in while
+    alice's push of PAY-1 is between git's ref check and its lock, which is how the race reaches the loser."""
+
+    def test_r1_40_the_later_claim_takes_the_next_key(self):
+        d = tmpdir(self)
+        seed = git_repo(os.path.join(d, "seed"))
+        T.commit_file(seed, "README", "x\n")
+        origin = os.path.join(d, "origin.git")
+        sh("git", "clone", "-q", "--bare", seed, origin)
+        people = {}
+        for who in ("alice", "bob"):
+            c = people[who] = os.path.join(d, who)
+            sh("git", "clone", "-q", origin, c)
+            with open(os.path.join(c, ".git", "config"), "a", encoding="utf-8") as f:
+                f.write("[user]\n\tname = %s\n\temail = %s@example.com\n" % (who, who) + T.no_hooks_config(c))
+        bobs = split.claims._commit(people["bob"], split.claims.claim_doc("PAY-1", "bob", "对账告警"))
+        sh("git", "-C", people["bob"], "push", "-q", "origin", "%s:refs/racing/PAY-1" % bobs)   # its objects only
+        T.write(origin, "hooks/pre-receive", "#!/bin/sh\nif [ ! -e raced ]; then\n  : > raced\n"
+                "  env -u GIT_QUARANTINE_PATH git update-ref refs/heads/claim/PAY-1 %s\nfi\nexit 0\n" % bobs)
+        os.chmod(os.path.join(origin, "hooks", "pre-receive"), 0o755)
+        sh("git", "-C", origin, "config", "core.hooksPath", os.path.join(origin, "hooks"))
+        doc = split.claims.claim(people["alice"], "PAY", "alice", "退款加索引")
+        self.assertEqual(doc["key"], "PAY-2")
+        self.assertTrue(os.path.exists(os.path.join(origin, "raced")))           # the race did happen
+        self.assertEqual(split.claims.read(people["alice"], "PAY-1")["owner"], "bob")
+        self.assertEqual(split.claims.read(people["bob"], "PAY-2")["owner"], "alice")
+
+
 if __name__ == "__main__":
     unittest.main()

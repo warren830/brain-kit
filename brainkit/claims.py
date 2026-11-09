@@ -82,6 +82,11 @@ def _try_create(repo, key, sha) -> bool:
             git(repo, "update-ref", ref(key), sha)
             return True
         msg = (p.stderr + p.stdout).lower()
+        # someone else's push created it between git's ref check and its lock ("remote rejected ... (reference
+        # already exists)"), or before: taken, the caller tries the next key
+        if "reference already exists" in msg or \
+                git(repo, "ls-remote", "--exit-code", "origin", ref(key), check=False).returncode == 0:
+            return False
         if "remote rejected" in msg or "hook declined" in msg:      # the server refused this claim: not "taken"
             raise BrainError("could not push claim %s: %s" % (key, (p.stderr or p.stdout).strip()))
         if "rejected" in msg or "already exists" in msg or "non-fast-forward" in msg or "fetch first" in msg:
