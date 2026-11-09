@@ -19,7 +19,11 @@ has them (open, started or closed) instead of claiming a new key; two filers rac
 claim (the later one closes itself as a duplicate).
 Alert and tech-debt text is untrusted input. Every text field must pass the Brain's content checks (no secrets,
 personal data, amounts, contract numbers, masked placeholders, instruction lines); otherwise nothing is filed:
-refused, never masked. The pre-receive hook applies the same checks to claim branches (doc_problems).
+refused, never masked. The pre-receive hook applies the same checks to claim branches (doc_problems): to the whole
+claim when it is created, to the fields a later push changes (an intent filed under older rules can still be
+closed by its owner). Filing the same source, title and body again returns the claim that has them, also when
+today's rules would refuse that text. `brain start --key` refuses a claim that is malformed and only warns about
+content today's rules flag in text that was accepted when it was filed (it is on the claim branch already).
 An intent is open while it is not closed and no run has started on it: no <prefix>/<owner>/<KEY>-<slug> branch,
 no runs/<KEY>/run.json on the default branch. `brain start --key KEY` takes its title and writes the rest to
 runs/<KEY>/intent.md for the run's agent.
@@ -68,20 +72,30 @@ def _content(where, text, errs, warns):
     warns += ["%s: %s" % (where, x) for x in w]
 
 
-def problems(source, title, body, acs=(), refs=(), extra=None) -> tuple:
-    """(errors, warnings) for an intent's text. Errors refuse the intent."""
+def problems(source, title, body, acs=(), refs=(), extra=None, content=True, skip=()) -> tuple:
+    """(errors, warnings) for an intent's text. Errors refuse the intent. content=False: the shape only (lengths,
+    one line, source), not the Brain's content checks. `skip`: fields not looked at (source, title, body, acs, refs,
+    or an extra field's name)."""
     errs, warns = [], []
-    if source not in SOURCES:
+    check = (lambda where, text: _content(where, text, errs, warns)) if content else (lambda where, text: None)
+    if "source" not in skip and source not in SOURCES:
         errs.append("source must be one of %s" % ", ".join(SOURCES))
-    if not plain(title) or not title.strip() or len(title) > LIMITS["title"]:
+    if "title" in skip:
+        pass
+    elif not plain(title) or not title.strip() or len(title) > LIMITS["title"]:
         errs.append("title: one line, 1-%d characters" % LIMITS["title"])
     else:
-        _content("title", title, errs, warns)
-    if not isinstance(body, str) or not body.strip() or len(body) > LIMITS["body"]:
+        check("title", title)
+    if "body" in skip:
+        pass
+    elif not isinstance(body, str) or not body.strip() or len(body) > LIMITS["body"]:
         errs.append("body: 1-%d characters" % LIMITS["body"])
     else:
-        _content("body", body, errs, warns)
-    for name, items, n, size in (("AC", acs, LIMITS["acs"], LIMITS["ac"]), ("ref", refs, LIMITS["refs"], LIMITS["ref"])):
+        check("body", body)
+    for name, field, items, n, size in (("AC", "acs", acs, LIMITS["acs"], LIMITS["ac"]),
+                                        ("ref", "refs", refs, LIMITS["refs"], LIMITS["ref"])):
+        if field in skip:
+            continue
         if not isinstance(items, (list, tuple)) or len(items) > n:
             errs.append("%ss: a list of at most %d" % (name, n))
             continue
@@ -89,8 +103,10 @@ def problems(source, title, body, acs=(), refs=(), extra=None) -> tuple:
             if not plain(x) or not x.strip() or len(x) > size:
                 errs.append("%s-%d: one line, 1-%d characters" % (name, i, size))
             else:
-                _content("%s-%d" % (name, i), x, errs, warns)
+                check("%s-%d" % (name, i), x)
     for k, v in (extra or {}).items():
+        if k in skip:
+            continue
         if k not in EXTRA_FIELDS:
             errs.append("unknown field %s" % k)
         elif k == "gap_kind" and v not in GAP_KINDS:
@@ -100,21 +116,33 @@ def problems(source, title, body, acs=(), refs=(), extra=None) -> tuple:
     return errs, warns
 
 
-def doc_problems(doc) -> list:
-    """What is wrong with a claim.json that carries intent fields or is closed (old plain claims: nothing new)."""
+_MISSING = object()
+TEXT_FIELDS = ("source", "title", "body", "acs", "refs") + EXTRA_FIELDS
+
+
+def doc_problems(doc, before=None, content=True) -> list:
+    """What is wrong with a claim.json that carries intent fields or is closed (old plain claims: nothing new).
+    `before`: the claim.json this one replaces (an update, e.g. closing it): only what the update changes is
+    checked, so a claim accepted under older rules can still be changed. content=False: shape only (see problems)."""
     if not isinstance(doc, dict):
         return ["claim.json is not an object"]
+    before = before if isinstance(before, dict) else None
+    same = {k for k in TEXT_FIELDS + ("hash", "closed")
+            if before is not None and doc.get(k, _MISSING) == before.get(k, _MISSING)}
     errs = []
-    unknown = sorted(set(doc) - set(KNOWN_FIELDS))
+    unknown = sorted(set(doc) - set(KNOWN_FIELDS) - (set(before) if before is not None else set()))
     if unknown:
         errs.append("unknown fields %s" % ", ".join(unknown))
     if is_intent(doc):
         e, _ = problems(doc.get("source"), doc.get("title", ""), doc.get("body", ""), doc.get("acs", []),
-                        doc.get("refs", []), {k: doc[k] for k in EXTRA_FIELDS if k in doc})
+                        doc.get("refs", []), {k: doc[k] for k in EXTRA_FIELDS if k in doc}, content=content,
+                        skip=same)
         errs += e
-        if not e and doc.get("hash") != digest(doc.get("source"), doc.get("title", ""), doc.get("body", "")):
+        unchanged = {"source", "title", "body", "hash"} <= same
+        if not e and not unchanged and \
+                doc.get("hash") != digest(doc.get("source"), doc.get("title", ""), doc.get("body", "")):
             errs.append("hash does not match source, title and body")
-    if "closed" in doc:
+    if "closed" in doc and "closed" not in same:
         c = doc["closed"]
         if not isinstance(c, dict) or set(c) - {"at", "by", "reason", "duplicate_of"}:
             errs.append("closed must be {at, by, reason[, duplicate_of]}")
@@ -272,6 +300,12 @@ def add(repo, cfg, source, title, body, acs=None, refs=None, key=None, owner=Non
     extra = dict(extra or {})
     errs, warns = problems(source, title, body, acs, refs, extra)
     if errs:
+        # the same alert filed again (the daily job): the claim that has this text already is the answer, also when
+        # it was filed under older rules that let it through. Nothing new is stored.
+        first = find(repo, digest(source, title, body)) if source in SOURCES and title and body else None
+        if first:
+            return dict(first, duplicate=True, warnings=warns + ["filed before; today's rules would refuse it: " + x
+                                                                 for x in errs])
         raise BrainError("not filed (refused, not masked):\n  " + "\n  ".join(errs))
     owner = owner or _whoami(repo, cfg)
     if owner in cfg.get("bot_users", []):

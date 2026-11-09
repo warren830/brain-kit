@@ -79,6 +79,8 @@ class BridgeTest(unittest.TestCase):
         self.notes_db = {}
         self.issues = {}
         self.versions = {}
+        self.posted = {}
+        self.graphql_down = False
         self.fake = self.build_fake()
         self.bridge = self.new_bridge()
 
@@ -112,10 +114,35 @@ class BridgeTest(unittest.TestCase):
             return (200, p.stdout) if p.returncode == 0 else (404, {"message": "404"})
 
         def commit(m, qy, body):
-            p = subprocess.run(["git", "-C", self.origin, "rev-list", "--parents", "-n", "1", m.group(1) + "^{commit}"],
-                               capture_output=True, text=True)
-            ids = p.stdout.split()
-            return (200, {"id": ids[0], "parent_ids": ids[1:]}) if p.returncode == 0 and ids else (404, {})
+            # as GitLab's commit API shows it: id, parent_ids, author_* and committer_* (name, email)
+            p = subprocess.run(["git", "-C", self.origin, "log", "-1", "--format=%H %P%x00%an%x00%ae%x00%cn%x00%ce",
+                                m.group(1) + "^{commit}"], capture_output=True, text=True)
+            if p.returncode != 0 or not p.stdout.strip():
+                return 404, {}
+            ids, an, ae, cn, ce = p.stdout.rstrip("\n").split("\0")
+            ids = ids.split()
+            return 200, {"id": ids[0], "parent_ids": ids[1:], "author_name": an, "author_email": ae,
+                         "committer_name": cn, "committer_email": ce}
+
+        def graphql(m, qy, body):
+            # GitLab GraphQL: an MR's notes with lastEditedAt / lastEditedBy, shaped as measured on gitlab.aws.dev
+            # (2026-11-09): lastEditedAt follows updated_at (creation time when untouched, moved by an award emoji
+            # too); lastEditedBy names the editor only for a text edit (here: the body is not what was posted,
+            # unless a test says who edited it).
+            if getattr(self, "graphql_down", False):
+                return 502, b"Bad Gateway"
+            v = (body or {}).get("variables") or {}
+            if "notes(" not in str((body or {}).get("query")) or v.get("path") != P:
+                return 200, {"errors": [{"message": "unexpected query"}]}
+            nodes = []
+            for n in self.notes_db.get(int(v.get("iid") or 0), []):
+                edited = n["body"] != self.__dict__.setdefault("posted", {}).get(n["id"], n["body"])
+                at = n.get("last_edited_at", n.get("updated_at") or n.get("created_at"))
+                by = n.get("last_edited_by", "maintainer" if edited else None)
+                nodes.append({"id": "gid://gitlab/Note/%d" % n["id"], "author": {"username": n["author"]["username"]},
+                              "lastEditedAt": at, "lastEditedBy": {"username": by} if by else None})
+            return 200, {"data": {"project": {"mergeRequest": {"notes": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None}, "nodes": nodes}}}}}
 
         def mrs(m, qy, body):
             label = qy.get("labels")
@@ -157,6 +184,7 @@ class BridgeTest(unittest.TestCase):
         f.on("POST", r"/api/chat/slots/([^/]+)/project", lambda m, qy, b: (200, {"ok": True}))
         f.on("POST", r"/api/chat/slots/([^/]+)/stop", lambda m, qy, b: (200, {"ok": True}))
         f.on("POST", r"/api/chat", send)
+        f.on("POST", r"/api/graphql", graphql)
         return f
 
     def add_note(self, m, qy, b, author="brain-bridge"):
@@ -165,6 +193,7 @@ class BridgeTest(unittest.TestCase):
         n = {"id": 1000 + sum(len(v) for v in self.notes_db.values()), "body": b["body"], "author": {"username": author},
              "system": False, "created_at": tick()}
         rows.append(n)
+        self.__dict__.setdefault("posted", {})[n["id"]] = n["body"]   # as posted (the GraphQL fake tells edits by it)
         return 201, n
 
     def reply(self, iid, user, body):
@@ -528,7 +557,17 @@ class BridgeTest(unittest.TestCase):
         self.rejected_with("added by brain-bot")
 
     def test_label_removed_last_is_not_a_handoff(self):
+        """The label's newest event takes it off: nothing to hand over, and nothing to reject either (R2 #21: a
+        poll between `brain handoff`'s remove and add must not drop the hand-over)."""
         self.events[5] = [self.ev("alice", "add"), self.ev("alice", "remove")]
+        self.assertEqual(self.bridge.process(P, self.bridge.kit(P), self.mrs[5]), "unlabelled")
+        self.assertEqual((self.notes(), self.labels()), ([], []))
+        self.assertIsNone(self.bridge.ledger.db.execute("SELECT * FROM handoffs").fetchone())
+        self.events[5].append(self.ev("alice", "add"))                      # labelled again: checked as usual
+        self.assertEqual(self.bridge.process(P, self.bridge.kit(P), self.mrs[5]), "accepted")
+
+    def test_no_label_event_at_all_is_rejected(self):
+        self.events[5] = []
         self.rejected_with("added by unknown")
 
     def test_jira_404_rejects_instead_of_crashing(self):

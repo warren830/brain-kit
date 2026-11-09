@@ -12,10 +12,16 @@ The bridge posts it on the MR as D-<n> (once GitLab has recorded the push as an 
 line names the commit and park.json's hash. It waits for a reply line `answer D-<n> <A|approve|reject> [note]`.
 What counts is one pure function, check_answer(), which an outside signer can import too:
   bound          the question note is on the MR, is the text the bridge posts for park.json at that commit (not
-                 edited), was posted after GitLab recorded that push, and no other note binds this D-n to another
-                 run, commit or park.json (a D-n is never bound twice)
+                 edited; ticking the boxes of its review checklist is fine), was posted after GitLab recorded that
+                 push, and no other note binds this D-n to another run, commit or park.json (a D-n is never bound
+                 twice)
   right person   the GitLab author is allowed for this kind of decision (decision_roles from main, not from the run)
   right question the reply names this decision id; the decision belongs to this run
+  as written     the reply says what its author wrote: never edited by anyone else, and not changed since the bridge
+                 first read it (the bridge records each reply's text hash then; GitLab GraphQL's lastEditedAt /
+                 lastEditedBy tells, at first sight, whether someone edited it before: award emoji and resolving
+                 do not count as edits). A reply it cannot tell about does not count (fail closed); an allowed
+                 person's reply that does not count for this reason still holds the round (a conflict)
   still current  the MR head has not moved since the question (otherwise the question is void)
   once only      the first valid reply wins (compare-and-set); later replies are told so;
                  different answers from different people in one round are not delivered (conflict)
@@ -29,6 +35,7 @@ import json
 import os
 import re
 import sqlite3
+from datetime import timedelta
 
 from .. import sign
 from ..common import SHA_RE, BrainError, iso, plain, utcnow, write_json
@@ -70,11 +77,22 @@ CREATE TABLE IF NOT EXISTS decisions (
   answer TEXT, answerer TEXT, voucher_id TEXT, created TEXT NOT NULL, updated TEXT NOT NULL,
   qnote_id INTEGER, told_id INTEGER, sign_told INTEGER,
   UNIQUE (run_id, sha, park_hash));
+CREATE TABLE IF NOT EXISTS replies (
+  note_id INTEGER PRIMARY KEY, decision TEXT NOT NULL, author TEXT NOT NULL, body_hash TEXT NOT NULL,
+  state TEXT NOT NULL, told TEXT, created TEXT NOT NULL);
 """
 # note_id: replies after this note count (the question, or the end of a round); qnote_id: the question note;
-# told_id: replies up to here have been told why they do not count; sign_told: the MR was told that an answer could
-# not be signed yet (once). States: posting (row written, question not on the MR yet), open, answered, delivered,
+# told_id: replies up to here have been looked at (before the replies table, also: told why they do not count);
+# sign_told: the MR was told that an answer could not be signed yet (once). States: posting (row written, question
+# not on the MR yet), asking (one bridge process is posting it now; another one waits), open, answered, delivered,
 # delivery_unknown, refused (the signer would not sign), stale, void, invalid, closed.
+# replies: each reply to a decision as the bridge first read it. state: original (as its author wrote it: not
+# edited, or edited by its author only, before that), edited (someone else edited it before), unknown (GitLab could
+# not tell: it does not count); body_hash: sha256 of its text then (a later different text is an edit); told: hash
+# of the last thing the MR was told about it ("legacy": told under told_id, before this table).
+REPLY_STATES = ("original", "edited", "changed", "unknown")
+# a decision row in 'asking' longer than this was left by a bridge that stopped while posting it: asked again
+ASKING_STALE_S = 300
 ADDED_COLUMNS = ("qnote_id", "told_id", "sign_told")
 # fields of a voucher that change from one attempt to the next; the rest says what is signed
 VOUCHER_TIME_FIELDS = ("issued_at", "expires_at", "voucher_id")
@@ -191,10 +209,23 @@ def question_text(did, run_id, park, who, kind, sha, park_hash) -> str:
     return "\n\n".join(lines)
 
 
-def conflict_text(did, valid) -> str:
-    return "%s 收到不同的回答（%s），都不送。请商量后由一个人重新回答。" % (
-        did, "、".join("@%s=%s%s" % (a, c, " " + ",".join(items) if items else "")
-                      for a, (c, _, _, items) in sorted(valid.items())))
+def conflict_text(did, valid, held=None) -> str:
+    """The note that ends a round with different answers. `held`: allowed people's replies that do not count
+    because they were edited (or could not be checked): what they said first is not known, so they count as
+    different answers."""
+    shown = ["@%s=%s%s" % (a, c, " " + ",".join(items) if items else "")
+             for a, (c, _, _, items) in sorted(valid.items())]
+    shown += ["@%s=%s（这条回复被改过，不算）" % (a, c) for a, (c, _, _, _) in sorted((held or {}).items())]
+    extra = "被改过的回复看不出原来写的是什么，也算一个不同的回答。" if held else ""
+    return "%s 收到不同的回答（%s），都不送。%s请商量后由一个人重新回答。" % (did, "、".join(shown), extra)
+
+
+EDIT_FEEDBACK = {
+    "edited": "%s：这条回复发出后被编辑过，编辑过的回复不算（别人也可能改过它）。请另发一条新的回复。",
+    "changed": "%s：这条回复发出后被编辑过，编辑过的回复不算（别人也可能改过它）。请另发一条新的回复。",
+    "unknown": "%s：这条回复发出后有过改动（编辑、表情或别的更新），桥查不到它是不是被别人改过，这条回复不算。"
+               "请另发一条新的回复。",
+}
 
 
 class Verdict:
@@ -203,7 +234,9 @@ class Verdict:
     status  answer    deliver it: author, choice, note (the reply's free text), items (rejected review items, in
                       park.json's order), review (every review item id), note_id (the reply)
             none      no reply counts yet
-            conflict  allowed people answered differently: conflict = {author: (choice, note, note_id, items)}
+            conflict  allowed people answered differently: conflict = {author: (choice, note, note_id, items)};
+                      held = {author: (choice, note, note_id, items)} of allowed people whose reply does not count
+                      as written (edited): it still holds the round
             stale     the MR head moved since the question
             void      the question is not bound to its push and park.json (reason says why): no reply to it counts
     reason   why it is not an answer (English, ids and hashes only)
@@ -217,6 +250,7 @@ class Verdict:
         self.items, self.review = tuple(kw.get("items", ())), list(kw.get("review", ()))
         self.note_id, self.last_id = kw.get("note_id", 0), kw.get("last_id", 0)
         self.feedback, self.conflict = list(kw.get("feedback", ())), dict(kw.get("conflict", {}))
+        self.held = dict(kw.get("held", {}))
         self.kind, self.who, self.question = kw.get("kind", ""), set(kw.get("who", ())), kw.get("question")
 
     @property
@@ -246,14 +280,54 @@ def _norm(text) -> str:
     return "\n".join(l.rstrip() for l in str(text or "").replace("\r\n", "\n").split("\n")).strip()
 
 
+# a GitLab task-list item: "- [ ] ", "- [x] ", "- [~] " (and * or + bullets)
+TASK_BOX_RE = re.compile(r"^(\s*[-*+] )\[[ xX~]\](?= )", re.M)
+
+
+def _unticked(text) -> str:
+    """The question note as the bridge posted it: ticking its review checklist's boxes is an edit of the note, but
+    changes nothing the bridge binds (the reply says what is approved or rejected)."""
+    return TASK_BOX_RE.sub(r"\1[ ]", _norm(text))
+
+
+def _touched(note) -> bool:
+    """Did anything move the note after it was posted (updated_at differs from created_at)? GitLab moves updated_at
+    for an edit, but also for an award emoji and other updates: this alone does not say "edited". A note without
+    updated_at (not from GitLab's API) is taken as posted; one whose times cannot be read, as touched."""
+    if note.get("updated_at") in (None, ""):
+        return False
+    c, u = gl_time(note.get("created_at")), gl_time(note.get("updated_at"))
+    return c is None or u is None or u != c
+
+
 def _edited(note) -> bool:
-    """GitLab moves updated_at when a note is edited (its author, and Maintainers or admins for others' notes): such
-    a reply may not say what its author wrote. A note without updated_at (not from GitLab's API) is taken as posted;
-    one whose times cannot be read is taken as edited."""
+    """Kept for callers of the earlier interface: updated_at later than created_at (see _touched)."""
     if note.get("updated_at") in (None, ""):
         return False
     c, u = gl_time(note.get("created_at")), gl_time(note.get("updated_at"))
     return c is None or u is None or u > c
+
+
+def body_hash(note) -> str:
+    return hashlib.sha256(str(note.get("body") or "").encode("utf-8")).hexdigest()
+
+
+def edit_state(note, edit_info) -> str:
+    """How a reply the bridge reads for the first time stands, from GitLab GraphQL's view of it (`edit_info`: the
+    entry rest.GitLab.note_edits returns for it, None when it could not be read): "original" when nothing touched
+    it, or GitLab shows no edit (an award emoji, say), or only its author edited it; "edited" when someone else did;
+    "unknown" when it was touched and GitLab cannot tell."""
+    if not _touched(note):
+        return "original"
+    if not isinstance(edit_info, dict):
+        return "unknown"
+    # Measured on gitlab.aws.dev 2026-11-09: a note nobody touched has lastEditedAt == its creation time; an award
+    # emoji moves updated_at AND lastEditedAt but leaves lastEditedBy empty; a text edit sets lastEditedBy to the
+    # editor. So lastEditedBy is the edit signal, lastEditedAt is not.
+    by = str(edit_info.get("last_edited_by") or "").lower()
+    if not by:
+        return "original"
+    return "original" if by == _author(note) else "edited"
 
 
 def _recorded_question(decision):
@@ -270,7 +344,8 @@ def _recorded_question(decision):
     return False, None
 
 
-def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, question_id=None, after=None):
+def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, question_id=None, after=None,
+                 edits=None):
     """Does an answer on the MR count for this decision, and which one? Pure: no GitLab, no ledger, no clock.
 
     decision     {"id": "D-5", "run_id": "RUN-PAY-3-1", "sha": <40 hex>, "park_hash": <sha256 hex of park.json>}
@@ -289,6 +364,10 @@ def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, 
                  else it is found on the MR; then kit bridge_user tells the bridge's notes from people's)
     after        only replies after this note count (the bridge's round: a conflict starts a new one); default the
                  question. With bridge_user known, the bridge's own conflict notes end a round as well.
+    edits        {reply note id: "original" | "edited" | "changed" | "unknown"}: whether each reply still says what
+                 its author wrote (the bridge's replies ledger; edit_state with GitLab GraphQL's lastEditedAt /
+                 lastEditedBy for a caller without one). A reply missing from it does not count. None: no such
+                 knowledge, so any reply GitLab shows as touched after posting (updated_at) does not count.
     -> Verdict
     """
     did, run_id = str(decision.get("id") or ""), str(decision.get("run_id") or "")
@@ -346,7 +425,7 @@ def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, 
             return void("%s on the MR is bound to %s @ %s (park %s): a decision id is never bound twice"
                         % (did, m.group(3), m.group(4), m.group(5)))
         want = question_text(did, run_id, park, [u[1:] for u in m.group(6).split("、")], kind, sha, ph)
-        if _norm(n.get("body")) != _norm(want):
+        if _unticked(n.get("body")) != _unticked(want):
             return void("note %d is not the question the bridge posts for park.json at %s (edited?)"
                         % (_nid(n), sha[:12]))
         asked.append(n)
@@ -372,7 +451,7 @@ def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, 
     review = [i["id"] for i in park.get("review_items") or [] if isinstance(i, dict) and "id" in i] \
         if kind == "acceptance" else []
     options = {o.get("id") for o in park.get("options", []) if isinstance(o, dict)}
-    valid, feedback, last = {}, [], start
+    valid, held, feedback, last = {}, {}, [], start
     for n in notes:
         nid = _nid(n)
         if nid <= start or n.get("system"):
@@ -386,9 +465,11 @@ def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, 
         if author not in who:
             feedback.append((nid, "@%s 不在 %s 的可回答名单里，这条回复不算。" % (author, did)))
             continue
-        if _edited(n):
-            feedback.append((nid, "%s：这条回复发出后被编辑过，编辑过的回复不算（别人也可能改过它）。请另发一条新的回复。"
-                             % did))
+        state = (edits.get(nid, "unknown") if edits is not None else ("unknown" if _touched(n) else "original"))
+        if state != "original":
+            # not counted, but an allowed person's word is on the MR: it holds the round (see below)
+            feedback.append((nid, EDIT_FEEDBACK.get(state, EDIT_FEEDBACK["unknown"]) % did))
+            held.setdefault(author, (choice, "", nid, ()))
             continue
         # a Lean request, or a question without options, is answered approve/reject (question_text says so)
         if not (choice in ("approve", "reject") if park.get("lean_request") or not options else choice in options):
@@ -411,9 +492,13 @@ def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, 
             items = tuple(i for i in review if i in listed)     # the park's order, each once
             note = im.group(2)
         valid.setdefault(author, (choice, note, nid, items))
+    held = {a: x for a, x in held.items() if a not in valid}     # a person's own valid reply stands for them
     common = dict(feedback=feedback, last_id=last, kind=kind, who=who, question=q, review=review)
     if not valid:
         return Verdict("none", "no reply counts yet", **common)
+    if held:
+        return Verdict("conflict", "an allowed person's reply was edited: what it said is not known",
+                       conflict=valid, held=held, **common)
     if len({(c, items) for c, _, _, items in valid.values()}) > 1:
         return Verdict("conflict", "allowed people answered differently", conflict=valid, **common)
     author, (choice, note, nid, items) = min(valid.items(), key=lambda kv: kv[1][2])
@@ -438,11 +523,12 @@ class DecisionLoop:
                     db.execute("ALTER TABLE decisions ADD COLUMN %s INTEGER" % col)
                 except sqlite3.OperationalError:      # another process added it meanwhile
                     continue
-                if col == "qnote_id":
-                    # Questions an older bridge asked name neither their commit nor park.json: ask them once more.
-                    db.execute("UPDATE runs SET last_sha=NULL WHERE run_id IN "
-                               "(SELECT run_id FROM decisions WHERE state='open')")
-                    db.execute("UPDATE decisions SET state='posting' WHERE state='open'")
+            # An open decision without a question note id cannot be answered (an answer counts only for the note it
+            # is bound to): asked once more. Those are questions an older bridge asked (497633a: their text names
+            # neither commit nor park.json; c9e59d1: GitLab's response to the post carried no note id).
+            db.execute("UPDATE runs SET last_sha=NULL WHERE run_id IN (SELECT run_id FROM decisions WHERE "
+                       "state='open' AND (qnote_id IS NULL OR qnote_id<=0))")
+            db.execute("UPDATE decisions SET state='posting' WHERE state='open' AND (qnote_id IS NULL OR qnote_id<=0)")
         self._ddb_ready = True
         return db
 
@@ -517,8 +603,8 @@ class DecisionLoop:
             find = lambda: db.execute("SELECT * FROM decisions WHERE run_id=? AND sha=? AND park_hash=?",  # noqa
                                       (row["run_id"], head, ph)).fetchone()
             old = find()
-            if old is not None and old["state"] != "posting":
-                seen()
+            if old is not None and old["state"] not in ("posting", "asking"):
+                seen()                                     # asked already (or invalid): this head is done
                 continue
             probs = validate_park(park)
             owner = row["owner"]
@@ -532,34 +618,41 @@ class DecisionLoop:
                     # asked before GitLab records the push, the question would read as older than its commit
                     self.out("%s: GitLab has no MR version for %s yet; asking next round" % (row["run_id"], head[:12]))
                     continue
-            now = iso(utcnow())
+            now = utcnow()
+            stale = iso(now - timedelta(seconds=ASKING_STALE_S))
             with self.ledger.lock:
-                # looked up again, with the insert, as one step: two threads watching at once ask one question
-                posting = self.__dict__.setdefault("_posting", set())
+                # looked up again, with the insert, as one step. Who posts the question is claimed in the ledger
+                # (state 'asking', compare-and-set): two threads, or two bridge processes on one ledger file, ask
+                # one question; a claim left by a bridge that stopped while posting is taken over once stale.
                 old = find()
-                if old is not None and (old["state"] != "posting" or old["id"] in posting):
-                    continue                                   # asked meanwhile, or being asked by another thread
+                if old is not None and not (old["state"] == "posting" or
+                                            (old["state"] == "asking" and old["updated"] < stale)):
+                    continue                                   # asked meanwhile, or being asked by another bridge
                 if old is not None:
                     did = old["id"]
                     if probs:
-                        db.execute("UPDATE decisions SET state='invalid', updated=? WHERE id=?", (now, did))
+                        db.execute("UPDATE decisions SET state='invalid', updated=? WHERE id=?", (iso(now), did))
+                    elif not db.execute("UPDATE decisions SET state='asking', updated=? WHERE id=? AND (state='posting'"
+                                        " OR (state='asking' AND updated<?))", (iso(now), did, stale)).rowcount:
+                        continue                               # another process claimed it just now
                 else:
                     did = "D-%d" % (db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] + 1)
                     try:
                         db.execute("INSERT INTO decisions(id,run_id,project,iid,sha,park_hash,kind,lean_request,"
                                    "state,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                                    (did, row["run_id"], row["project"], row["iid"], head, ph, kind,
-                                    park.get("lean_request"), "invalid" if probs else "posting", now, now))
-                    except sqlite3.IntegrityError as e:          # another process on this ledger asked it
-                        raise BrainError("%s: decision for %s not recorded: %s" % (row["run_id"], head[:12], e))
-                posting.add(did)
+                                    park.get("lean_request"), "invalid" if probs else "asking", iso(now), iso(now)))
+                    except sqlite3.IntegrityError as e:
+                        # another process on this ledger recorded this question (or took this D-n) just now: it
+                        # asks it; this round goes on with the next run
+                        self.out("%s: decision for %s not recorded this round: %s" % (row["run_id"], head[:12], e))
+                        continue
+            if probs:
+                self.gl.comment(row["project"], row["iid"], "%s 无法发出（%s）：\n%s" % (
+                    did, row["run_id"], "\n".join("- " + x for x in probs)))
+                seen()
+                continue
             try:
-                if probs:
-                    self.gl.comment(row["project"], row["iid"], "%s 无法发出（%s）：\n%s" % (
-                        did, row["run_id"], "\n".join("- " + x for x in probs)))
-                    seen()
-                    continue
-                # a failed post leaves the row 'posting' and the head unseen: the next round posts it again
                 note = self.gl.comment(row["project"], row["iid"], question_text(did, row["run_id"], park, who,
                                                                                  kind, head, ph))
                 try:
@@ -569,11 +662,13 @@ class DecisionLoop:
                 if nid <= 0:     # a decision is bound to its question note's id; without one nothing could count
                     raise BrainError("%s: GitLab did not return the id of its question note; asked again next round"
                                      % did)
-                db.execute("UPDATE decisions SET state='open', qnote_id=?, note_id=?, told_id=?, updated=? "
-                           "WHERE id=? AND state='posting'", (nid, nid, nid, iso(utcnow()), did))
-            finally:
-                with self.ledger.lock:
-                    posting.discard(did)
+            except BaseException:
+                # a failed post gives the claim back and leaves the head unseen: the next round posts it again
+                db.execute("UPDATE decisions SET state='posting', updated=? WHERE id=? AND state='asking'",
+                           (iso(utcnow()), did))
+                raise
+            db.execute("UPDATE decisions SET state='open', qnote_id=?, note_id=?, told_id=?, updated=? "
+                       "WHERE id=? AND state='asking'", (nid, nid, nid, iso(utcnow()), did))
             seen()
             posted += 1
             self.out("asked %s for %s (%s)" % (did, row["run_id"], ", ".join(who)))
@@ -616,11 +711,12 @@ class DecisionLoop:
             return False
         raw = self.gl.file_raw(d["project"], "%s/%s/park.json" % (kit["runs_dir"], row["req"]), d["sha"])
         notes = self.gl.mr_notes(d["project"], d["iid"])
+        edits = self.reply_states(d, notes)
         v = check_answer(dict(d), raw, notes, kit, self.roles, row["owner"], mr.get("sha", ""), pushed,
-                         question_id=d["qnote_id"], after=d["note_id"])
+                         question_id=d["qnote_id"], after=d["note_id"], edits=edits)
         told = d["told_id"] or 0
         for nid, text in v.feedback:                          # each reply that does not count is told so once
-            if nid > told:
+            if self._tell_once(nid, text, told):
                 self.gl.comment(d["project"], d["iid"], text)
         if v.status in ("void", "stale"):
             if db.execute("UPDATE decisions SET state=?, told_id=?, updated=? WHERE id=? AND state='open'",
@@ -635,12 +731,65 @@ class DecisionLoop:
             db.execute("UPDATE decisions SET note_id=? WHERE id=? AND state='open'", (v.last_id, d["id"]))
             return False
         if v.status == "conflict":
-            note = self.gl.comment(d["project"], d["iid"], conflict_text(d["id"], v.conflict))
+            note = self.gl.comment(d["project"], d["iid"], conflict_text(d["id"], v.conflict, v.held))
             start = max(v.last_id, int((note or {}).get("id") or 0))   # a new round starts after the bridge's note
             db.execute("UPDATE decisions SET note_id=?, told_id=?, updated=? WHERE id=? AND state='open'",
                        (start, start, now, d["id"]))
             return False
         return self.deliver(d, row, v.author, v.choice, v.note, items=v.items, review=v.review)
+
+    def reply_states(self, d, notes) -> dict:
+        """{note id: edit state} of the replies to decision `d` after its round started (check_answer's `edits`).
+        A reply seen for the first time is recorded with its text's hash: as its author wrote it ("original"), or
+        not ("edited": GitLab GraphQL names someone else as its last editor; "unknown": it was touched after it was
+        posted and GraphQL could not say by whom). Later, a reply whose text is not the recorded one is "changed"."""
+        db, did = self.ledger.db, d["id"]
+        start, legacy = int(d["note_id"] or 0), int(d["told_id"] or 0)
+        out, info = {}, []
+        for n in notes or []:
+            if not isinstance(n, dict) or n.get("system") or _nid(n) <= start:
+                continue
+            m = ANSWER_RE.match(str(n.get("body") or "").split("\n", 1)[0])
+            if not m or m.group(1).upper() != did:
+                continue
+            nid, h = _nid(n), body_hash(n)
+            rec = db.execute("SELECT state, body_hash FROM replies WHERE note_id=?", (nid,)).fetchone()
+            if rec is None:
+                state = "original"
+                if _touched(n):
+                    if not info:
+                        info.append(self._note_edits(d))
+                    state = edit_state(n, None if info[0] is None else info[0].get(nid))
+                db.execute("INSERT OR IGNORE INTO replies(note_id, decision, author, body_hash, state, told, created) "
+                           "VALUES (?,?,?,?,?,?,?)", (nid, did, _author(n), h, state,
+                                                      "legacy" if nid <= legacy else None, iso(utcnow())))
+                rec = db.execute("SELECT state, body_hash FROM replies WHERE note_id=?", (nid,)).fetchone()
+            state = rec["state"] if rec["state"] in REPLY_STATES else "unknown"
+            out[nid] = "changed" if state == "original" and rec["body_hash"] != h else state
+        return out
+
+    def _note_edits(self, d):
+        """GitLab GraphQL's edit marks for the MR's notes, or None when they cannot be read (fail closed)."""
+        fn = getattr(self.gl, "note_edits", None)
+        if fn is None:
+            return None
+        try:
+            return fn(d["project"], d["iid"])
+        except BrainError as e:
+            self.out("%s: GitLab GraphQL did not say who edited the replies (they do not count): %s" % (d["id"], e))
+            return None
+
+    def _tell_once(self, nid, text, told_id=0) -> bool:
+        """Claim telling the MR `text` about reply `nid`: True once per reply and text (a reply told it does not
+        count is not told again; one that stops counting later is told then)."""
+        db = self.ledger.db
+        h = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+        rec = db.execute("SELECT told FROM replies WHERE note_id=?", (nid,)).fetchone()
+        if rec is None:
+            return nid > told_id                              # not a reply the ledger records: the old rule
+        if rec["told"] in (h, "legacy"):
+            return False
+        return db.execute("UPDATE replies SET told=? WHERE note_id=? AND told IS ?", (h, nid, rec["told"])).rowcount == 1
 
     def deliver(self, d, row, author, choice, note, items=(), review=()) -> bool:
         db = self.ledger.db

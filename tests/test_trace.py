@@ -8,6 +8,7 @@ import sys
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -15,7 +16,7 @@ from brainkit import cli, config, sign, trace  # noqa: E402
 from brainkit.bridge.decisions import SCHEMA as DECISIONS_SCHEMA  # noqa: E402
 from brainkit.bridge.ledger import Ledger  # noqa: E402
 from brainkit.common import BrainError, write_json  # noqa: E402
-from tests.helpers import LEAN_SRC, git_repo, keypair, sh, tmpdir  # noqa: E402
+from tests.helpers import LEAN_SRC, keypair, sh, tmpdir  # noqa: E402
 
 BOT = "brain-bot@noreply.invalid"
 KIT = {"version": 1, "req_prefix": "PAY", "bot_users": ["brain-bot"], "bot_emails": [BOT]}
@@ -27,6 +28,18 @@ PRODUCT = ("# PRODUCT\n\n<!-- id:P-PAY-1-1 type:correction side:product rel:new 
            "<!-- id:P-PAY-1-2 type:model side:product rel:new src:D-1 -->\n**退款单**：一次退款的记录。\n\n"
            "<!-- id:P-PAY-1-3 type:model side:product rel:new src:D-1 -->\n**退款单**：退款申请。\n")
 AS_OF = "2026-11-30T00:00:00Z"
+
+
+def git_repo(path):
+    """A throwaway test repo (tests.helpers.git_repo, in one git call): the test identity, no signing, and no hooks
+    or background maintenance. A machine-wide core.hooksPath (a secret scanner, say) costs about half a second a
+    commit; these repos hold only made-up data and are deleted after the test."""
+    from tests.helpers import no_hooks_config
+    os.makedirs(path, exist_ok=True)
+    sh("git", "init", "-q", "-b", "main", path)
+    with open(os.path.join(path, ".git", "config"), "a", encoding="utf-8") as f:
+        f.write("[user]\n\tname = t\n\temail = t@example.com\n[commit]\n\tgpgsign = false\n" + no_hooks_config(path))
+    return path
 
 
 def vid(key, n):
@@ -372,8 +385,9 @@ class Trace(unittest.TestCase):
         out = io.StringIO()
         cwd = os.getcwd()
         os.chdir(self.w.repo)
-        try:
-            with redirect_stdout(out), redirect_stderr(out):
+        try:   # an intake store that does not exist: never the developer's own ~/.brain/intake
+            with mock.patch.dict(os.environ, {"BRAIN_INTAKE_DIR": os.path.join(self.w.d, "no-intake")}), \
+                    redirect_stdout(out), redirect_stderr(out):
                 rc = cli.main(["trace", "PAY-2", "--ledger", self.w.ledger_path, "--vouchers", self.w.vouchers,
                                "--as-of", AS_OF])
                 rc2 = cli.main(["trace", "PAY-2", "--json", "--as-of", AS_OF, "--vouchers", self.w.vouchers])
@@ -460,9 +474,11 @@ class TraceRealLean(unittest.TestCase):
     """The audit events a real Lean install writes are the ones the trace reads."""
 
     def test_real_lean_events(self):
-        os.environ["BRAIN_USER"] = "alice"
-        self.addCleanup(os.environ.pop, "BRAIN_USER", None)
-        repo = git_repo(os.path.join(tmpdir(self), "proj"))
+        d = tmpdir(self)
+        env = mock.patch.dict(os.environ, {"BRAIN_USER": "alice", "BRAIN_INTAKE_DIR": os.path.join(d, "no-intake")})
+        env.start()
+        self.addCleanup(env.stop)
+        repo = git_repo(os.path.join(d, "proj"))
         commit(repo, {"src/app.py": "print('hi')\n"}, "init", "2026-11-01T00:00:00Z")
         out = io.StringIO()
         cwd = os.getcwd()

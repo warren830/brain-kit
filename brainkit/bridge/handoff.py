@@ -15,7 +15,8 @@ What a hand-over must prove (otherwise the MR gets a comment and the 'rejected' 
   3. the owner is in brain-authz and is not a bot;
   4. the requirement is theirs: Jira assignee + claim status (tracker jira), or claim/<KEY> names them (none);
   5. run.json at the MR head is valid for this branch and was handed off by the owner, and the MR head is the commit
-     that wrote it (`brain handoff`'s commit): a commit pushed on top of it is not part of the hand-over;
+     that wrote it (`brain handoff`'s commit): a commit pushed on top of it is not part of the hand-over, and a
+     commit a bot authored or committed (kit bot_emails / bot_users) never is;
   6. the Lean hand-over note (aidlc-state.md) at the MR head is filled in;
   7. the Brain commit exists; material packages are in brain-intake with the recorded hash;
      no other run is open for this requirement.
@@ -26,7 +27,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
+import subprocess
 import sys
+import threading
 import time
 
 from .. import claims, config as kitconfig, lean, runrec, sign
@@ -50,6 +54,7 @@ BRIDGE_DEFAULTS = {
     "contract_ttl_hours": 72,
     "interval": 60,
     "publish_vouchers": False,
+    "publish_timeout": 60,      # seconds for each git push / pull of the vouchers repo (brain-intake)
     "intake_dir": "",
     "runner_runs_root": "",
     "kirocrew": {"base": "http://127.0.0.1:5476", "app": "brain-bridge", "secret_file": "",
@@ -89,13 +94,9 @@ class Bridge(DecisionLoop):
         self.jira = jira
         self.kc = kirocrew
         self.out = out
-        # a subclass may also bring its signer as a class attribute
-        self.signer = signer or getattr(self, "signer", None)
-        if self.signer is None:
-            probs = sign.signer_file_problems(cfg)
-            if probs:
-                raise BrainError("bridge config: " + "; ".join(probs))
-            self.signer = sign.signer_from_config(cfg)
+        # a subclass may also bring its signer as a class attribute. A spool signer's allowed_signers is checked
+        # when it signs (sign.SpoolSigner.sign): report, dispatch and reconcile run without it.
+        self.signer = signer or getattr(self, "signer", None) or sign.signer_from_config(cfg)
         self.ledger = Ledger(cfg["ledger"])
         try:
             authz = load_json(cfg["identities"])
@@ -104,6 +105,13 @@ class Bridge(DecisionLoop):
         self.ids = authz.get("users", {})
         self.roles = authz.get("roles", {})
         self._kit = {}
+
+    @property
+    def reservation_ttl(self) -> float:
+        """Seconds after which a run reservation or a 'checking' hand-over row was left by a bridge that stopped
+        mid-way: max(900, 4 x the signer's timeout). A signer whose `timeout` is not a number of seconds (an HTTP
+        client's (connect, read) pair, say) gets the default."""
+        return max(900.0, 4 * (sign.seconds(getattr(self.signer, "timeout", None)) or 0.0))
 
     # ---------- config from the default branch ----------
 
@@ -156,8 +164,9 @@ class Bridge(DecisionLoop):
             return ["GitLab shows no MR version with head %s: add the label '%s' again once the push shows on the MR"
                     % (sha[:12], label)]
         if pushed > added:
-            return ["%s was pushed (%s) after the label '%s' was added (%s): that commit was not handed over; add the "
-                    "label again to hand it over" % (sha[:12], iso(pushed), label, iso(added))]
+            return ["%s was pushed (%s) after the label '%s' was added (%s): that commit was not handed over; look at "
+                    "it, then run `brain handoff` again (it hands over a new commit on top)"
+                    % (sha[:12], iso(pushed), label, iso(added))]
         return []
 
     def verify(self, project, kit, mr, adder=None, label_event=None):
@@ -216,7 +225,7 @@ class Bridge(DecisionLoop):
         if not rec.get("handoff"):
             p.append("run.json has no hand-over (run `brain handoff`)")
         else:
-            p += self.handoff_commit_problems(project, sha, runrec.path(kit["runs_dir"], b["key"]), raw)
+            p += self.handoff_commit_problems(project, sha, runrec.path(kit["runs_dir"], b["key"]), raw, kit=kit)
         f.update(intent=rec["intent"], brain_commit=rec["brain_commit"], materials=rec.get("materials", []),
                  expected_paths=rec.get("expected_paths", []))
         p += self.check_materials(f["materials"])
@@ -227,16 +236,20 @@ class Bridge(DecisionLoop):
             p += ["hand-over note: " + x for x in lean.handover_text_problems(state.decode("utf-8", "replace"))]
         if not self.gl.commit_exists(project, rec["brain_commit"]):
             p.append("brain_commit %s does not exist" % rec["brain_commit"][:12])
-        other = self.ledger.open_run_for(b["key"])
+        # a reservation left by a bridge that stopped while signing does not count once it is stale (reserve_run
+        # drops it); a fresh one of this very hand-over is the one being signed right now
+        other = self.ledger.open_run_for(b["key"], stale_after=self.reservation_ttl)
         if other is not None and not self.ledger.is_reservation_for(other, project, mr["iid"], sha):
             p.append("%s already has an open run on the team runner" % b["key"])
         return p, f
 
-    def handoff_commit_problems(self, project, sha, path, raw) -> list:
+    def handoff_commit_problems(self, project, sha, path, raw, kit=None) -> list:
         """The MR head must be the commit that wrote run.json's hand-over (`brain handoff` commits run.json and
         nothing else on top of the owner's work). A commit someone pushes on top of it - between `brain handoff`'s
         push and its label, say - leaves run.json as it was: it was not handed over, however the label times fall.
-        Rule: the head has one parent, and run.json there differs from run.json at that parent."""
+        Rule: the head has one parent, run.json there differs from run.json at that parent, and the head was
+        neither authored nor committed by a bot (kit bot_emails / bot_users: pre-receive makes every bot commit carry
+        a bot email, so a runner's commit that rewrites run.json on top of the hand-over is told apart)."""
         c = self.gl.commit(project, sha)
         parents = c.get("parent_ids") if isinstance(c, dict) else None
         if not isinstance(parents, list) or not parents or not all(isinstance(x, str) for x in parents):
@@ -244,6 +257,18 @@ class Bridge(DecisionLoop):
         if len(parents) != 1:
             return ["the MR head %s is a merge, not the hand-over commit `brain handoff` makes: run it again"
                     % sha[:12]]
+        kit = kit if kit is not None else self.kit(project)
+        people = [(c.get(k + "_email"), c.get(k + "_name")) for k in ("author", "committer")]
+        if not all(isinstance(e, str) and e.strip() for e, _ in people):
+            return ["GitLab does not show who authored and committed %s: cannot tell that it is the owner's hand-over "
+                    "commit" % sha[:12]]
+        bot_emails = {str(x).strip().lower() for x in kit.get("bot_emails") or []}
+        bot_users = {str(x).strip().lower() for x in kit.get("bot_users") or []}
+        bots = sorted({e.strip().lower() for e, n in people if e.strip().lower() in bot_emails or
+                       str(n or "").strip().lower() in bot_users})
+        if bots:
+            return ["the MR head %s was made by a bot account (%s), not by `brain handoff`: a runner's commit is never "
+                    "handed over; look at it, then run `brain handoff` again" % (sha[:12], ", ".join(bots))]
         if self.gl.file_raw(project, path, parents[0]) == raw:
             return ["the MR head %s is not the hand-over commit (it does not change %s): a commit pushed after "
                     "`brain handoff` was not handed over; look at it, then run `brain handoff` again"
@@ -311,27 +336,53 @@ class Bridge(DecisionLoop):
                     self.out("error on %s!%s: %s" % (project, mr.get("iid"), e))
 
     def process(self, project, kit, mr):
+        """-> "accepted", "rejected", "seen" (this head and label event were checked before), "unlabelled" (the
+        newest event on the hand-over label takes it off: nothing to do, e.g. `brain handoff` re-adding it right
+        now) or "waiting" (this very hand-over is being signed elsewhere: looked at again next round)."""
         iid, sha = int(mr["iid"]), mr.get("sha", "")
         ev = self.last_label_event(project, iid, kit["handoff_label"])
+        if ev is not None and ev.get("action") == "remove":
+            return "unlabelled"
         adder, event = self._adder(ev)
         # One check per (head commit, label event): re-adding the label after fixing Jira re-checks the same commit.
+        # A check left 'checking' by a bridge that stopped mid-way is taken over once it is stale.
         key = "%s#%s" % (sha, event)
-        if not self.ledger.claim_handoff(project, iid, key):
+        if not self.ledger.claim_handoff(project, iid, key, stale_after=self.reservation_ttl):
             return "seen"
         try:
             return self._process(project, kit, mr, iid, sha, key, adder, label_event=ev)
-        except Exception:
-            # Leave nothing half-done: an MR still 'checking' is retried on the next poll.
+        except BaseException:
+            # Leave nothing half-done: an MR still 'checking' is retried on the next poll (also on SIGTERM).
             self.ledger.release_handoff(project, iid, key)
             raise
 
+    def _label_event_is_current(self, project, iid, kit, key) -> bool:
+        """Is the label event this check was for (key = sha#event) still the newest one on the hand-over label? A
+        newer one (the owner, or `brain handoff`, labelled again meanwhile) is checked next round: this check's
+        verdict then goes to the ledger only, so its comment and label change do not undo the newer label."""
+        try:
+            ev = self.last_label_event(project, iid, kit["handoff_label"])
+        except BrainError:
+            return True
+        return str((ev or {}).get("id", "")) == key.rsplit("#", 1)[-1]
+
     def _reject(self, project, kit, iid, sha, key, probs):
         self.ledger.set_handoff(project, iid, key, "checking", "rejected", reason="; ".join(probs)[:2000])
-        self.gl.comment(project, iid, "AI 接手被拒（%s）：\n" % sha[:12] + "\n".join("- " + x for x in probs) +
-                        "\n\n改好后重新推送，再打一次标签 `%s`。" % kit["handoff_label"])
-        self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
         self.out("rejected %s!%d @%s: %s" % (project, iid, sha[:12], "; ".join(probs)))
+        if not self._label_event_is_current(project, iid, kit, key):
+            return "rejected"
+        self.gl.comment(project, iid, "AI 接手被拒（%s）：\n" % sha[:12] + "\n".join("- " + x for x in probs) +
+                        "\n\n" + self.retry_advice(kit))
+        self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
         return "rejected"
+
+    @staticmethod
+    def retry_advice(kit) -> str:
+        """What works after a rejection: only `brain handoff`'s own commit is handed over, so a fix pushed on top is
+        handed over by running it again; a fix outside the branch (Jira, the claim, brain-authz) needs only the
+        label on the same commit."""
+        return ("改好后在分支上重新运行 `brain handoff`（它提交交接、推送并打标签）；只改了分支以外的东西（Jira、认领、"
+                "brain-authz）的话，也可以直接再打一次标签 `%s`。" % kit["handoff_label"])
 
     def _process(self, project, kit, mr, iid, sha, key, adder, label_event=None):
         probs, f = self.verify(project, kit, mr, adder, label_event=label_event)
@@ -342,9 +393,17 @@ class Bridge(DecisionLoop):
             overlap_note += "\n\n注意：和 %s 预计改动重叠（%s），合并时留意顺序。" % (other, ", ".join(both[:5]))
         # The run id is taken before signing, as one step with the check that the requirement has no open run:
         # two hand-overs of one requirement (two MRs, two threads) never both get a contract.
-        run_id = self.ledger.reserve_run(f["key"], project, iid, sha,
-                                         stale_after=max(900, 4 * float(getattr(self.signer, "timeout", 0) or 0)))
+        run_id = self.ledger.reserve_run(f["key"], project, iid, sha, stale_after=self.reservation_ttl)
         if run_id is None:
+            other = self.ledger.open_run_for(f["key"], stale_after=self.reservation_ttl)
+            if other is not None and self.ledger.is_reservation_for(other, project, iid, sha):
+                # this very hand-over is being signed (another thread or process), or a bridge that stopped while
+                # signing it left its reservation: not a reason to reject; looked at again next round (a stale one
+                # is dropped then)
+                self.ledger.release_handoff(project, iid, key)
+                self.out("%s!%d @%s: its contract is being signed elsewhere (%s); looked at again next round"
+                         % (project, iid, sha[:12], other["run_id"]))
+                return "waiting"
             return self._reject(project, kit, iid, sha, key, ["%s already has an open run on the team runner"
                                                               % f["key"]])
         try:
@@ -363,11 +422,12 @@ class Bridge(DecisionLoop):
             self.ledger.release_run(run_id)
             why = "; ".join(e.reasons)
             self.ledger.set_handoff(project, iid, key, "checking", "rejected", reason=("signer: " + why)[:2000])
-            self.gl.comment(project, iid, "AI 接手被拒（%s）：交接的检查都过了，但签名服务没有签这份合同：\n%s\n\n"
-                            "请负责人看一下签名服务的记录；改好后重新推送，再打一次标签 `%s`。"
-                            % (sha[:12], "\n".join("- " + x for x in e.reasons), kit["handoff_label"]))
-            self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
             self.out("signer refused %s!%d @%s: %s" % (project, iid, sha[:12], why))
+            if self._label_event_is_current(project, iid, kit, key):
+                self.gl.comment(project, iid, "AI 接手被拒（%s）：交接的检查都过了，但签名服务没有签这份合同：\n%s\n\n"
+                                "请负责人看一下签名服务的记录。%s"
+                                % (sha[:12], "\n".join("- " + x for x in e.reasons), self.retry_advice(kit)))
+                self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
             return "rejected"
         except BaseException:
             self.ledger.release_run(run_id)
@@ -397,13 +457,31 @@ class Bridge(DecisionLoop):
         return "accepted"
 
     def publish(self, run_id, voucher_id):
-        """Commit and push the voucher to the brain-intake repo (the bridge is its only writer)."""
+        """Commit and push the voucher to the brain-intake repo (the bridge is its only writer). Safe to repeat: a
+        round whose push failed left its commit; the next round asks for that same voucher (sign_voucher), finds
+        nothing new to commit, and pushes what is there. Each push and pull ends after publish_timeout seconds."""
         vd = self.cfg["vouchers_dir"]
         git(vd, "add", "--", run_id)
-        git(vd, "commit", "-q", "-m", "voucher %s %s" % (run_id, voucher_id))
-        if git(vd, "push", "-q", check=False).returncode != 0:
-            git(vd, "pull", "-q", "--rebase")
-            git(vd, "push", "-q")
+        if git(vd, "diff", "--cached", "--quiet", check=False).returncode != 0:
+            git(vd, "commit", "-q", "-m", "voucher %s %s" % (run_id, voucher_id))
+        if self._git_remote(vd, "push", "-q").returncode != 0:
+            self._git_remote(vd, "pull", "-q", "--rebase", check=True)
+            self._git_remote(vd, "push", "-q", check=True)
+
+    def _git_remote(self, repo, *args, check=False):
+        """A git command that talks to the vouchers repo's remote: never waits for a password prompt, and is
+        stopped after publish_timeout seconds (a hung push must not hold the bridge's round)."""
+        timeout = sign.seconds(self.cfg.get("publish_timeout"), 60.0)
+        cmd = ["git", "-C", repo] + list(args)
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                               env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+        except subprocess.TimeoutExpired:
+            raise BrainError("%s did not finish within %gs" % (" ".join(cmd), timeout))
+        if check and p.returncode != 0:
+            raise BrainError("command failed (%d): %s\n%s" % (p.returncode, " ".join(cmd),
+                                                              (p.stderr or p.stdout).strip()))
+        return p
 
     # ---------- dispatch ----------
 
@@ -469,6 +547,10 @@ class Bridge(DecisionLoop):
     # ---------- reconcile ----------
 
     def reconcile(self):
+        # what a bridge that stopped mid-way left (a reservation, a hand-over still 'checking') is cleared once stale
+        n = self.ledger.drop_stale(self.reservation_ttl)
+        if n:
+            self.out("dropped %d stale reservation(s) / hand-over check(s) left by a stopped bridge" % n)
         for row in self.ledger.runs_in("dispatched", "spooled", "ready", "send_unknown"):
             mr = self.gl.mr(row["project"], row["iid"])
             if mr.get("state") in ("merged", "closed"):
@@ -505,6 +587,23 @@ def main(argv=None):
     ap.add_argument("--config", required=True)
     ap.add_argument("cmd", choices=("poll", "dispatch", "watch", "collect", "reconcile", "report", "loop"))
     a = ap.parse_args(argv)
+    # SIGTERM (systemctl stop/restart, a deploy) ends the bridge like Ctrl-C: what it was doing is given back
+    # (a run reservation, a hand-over check) instead of being left until it is stale
+    old = None
+    if threading.current_thread() is threading.main_thread():
+        old = signal.signal(signal.SIGTERM, _terminate)
+    try:
+        return _main(a)
+    finally:
+        if old is not None:
+            signal.signal(signal.SIGTERM, old)
+
+
+def _terminate(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+def _main(a):
     try:
         br = build(a.config)
         if a.cmd in ("dispatch", "collect", "loop") and not br.kc:

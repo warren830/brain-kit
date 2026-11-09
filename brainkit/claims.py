@@ -16,6 +16,7 @@ from .common import ZERO_SHA, BrainError, git, git_out, iso, run, utcnow
 
 CLAIM_PREFIX = "refs/heads/claim/"
 CLAIM_FILE = "claim.json"
+MAX_DIGITS = 7          # a key's number: 1 to 9999999 (common.JIRA_RE)
 
 
 def ref(key) -> str:
@@ -48,12 +49,14 @@ def taken_numbers(repo, prefix) -> set:
         names = [l.split("\t", 1)[1] for l in out.splitlines() if "\t" in l]
     else:
         names = git_out(repo, "for-each-ref", "--format=%(refname)", CLAIM_PREFIX).splitlines()
-    # a hand-made ref with more than 7 digits (or a leading zero) is not a key: it must not push the next key out
-    taken = {int(m.group(1)) for m in (rx.search(n) for n in names) if m and len(m.group(1)) <= 7}
+    # a hand-made ref or runs/ folder with more than 7 digits (or a leading zero) is not a key: it must not push
+    # the next key out of the range every command takes
+    taken = {int(m.group(1)) for m in (rx.search(n) for n in names) if m and len(m.group(1)) <= MAX_DIGITS}
     run_rx = re.compile(r"^runs/%s-([1-9][0-9]*)/" % re.escape(prefix))
     for tree in ("HEAD", "refs/remotes/origin/main"):
         p = git(repo, "ls-tree", "-r", "--name-only", tree, "--", "runs", check=False)
-        taken |= {int(m.group(1)) for m in (run_rx.match(l) for l in p.stdout.splitlines()) if m}
+        taken |= {int(m.group(1)) for m in (run_rx.match(l) for l in p.stdout.splitlines())
+                  if m and len(m.group(1)) <= MAX_DIGITS}
     return taken
 
 
@@ -86,6 +89,8 @@ def claim(repo, prefix, owner, title, key=None, retries=8, extra=None) -> dict:
         return doc
     n = max(taken_numbers(repo, prefix) or {0}) + 1
     for _ in range(retries):
+        if n >= 10 ** MAX_DIGITS:
+            raise BrainError("no free %s-<n> with at most %d digits left" % (prefix, MAX_DIGITS))
         k = "%s-%d" % (prefix, n)
         doc = claim_doc(k, owner, title, extra)
         if _try_create(repo, k, _commit(repo, doc)):

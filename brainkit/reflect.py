@@ -542,7 +542,13 @@ def locate_run(repo, cfg, key) -> dict:
             if b and b["key"] == key:
                 return {"ref": short + name, "read": short + name, "fetch": None}
     if has_origin:
-        out = git(repo, "ls-remote", "origin", "refs/heads/%s/*" % prefix, check=False).stdout
+        p = git(repo, "ls-remote", "origin", "refs/heads/%s/*" % prefix, check=False)
+        if p.returncode != 0:
+            why = ((p.stderr or p.stdout).strip().splitlines() or ["exit %d" % p.returncode])[-1][:200]
+            raise BrainError("no run for %s on this machine (not on %s, no %s/*/%s-* branch here), and origin could not "
+                             "be asked (git ls-remote origin failed: %s; offline?). --draft does not fetch: once origin "
+                             "can be reached, run `git fetch origin`, or pass --ref" % (key, main, prefix, key, why))
+        out = p.stdout
         for line in sorted(out.splitlines()):
             sha, _, full = line.partition("\t")
             name = full[len("refs/heads/"):]

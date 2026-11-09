@@ -18,14 +18,12 @@ Sources
   Brain usage       brainkit.usage: entries loaded at brain_commit, cited ids, stale and unknown citations
   credits           passed in by the KiroCrew app, optional. Kiro reports no token counts (input/output/cache = 0)
 
-Which copy of the run branch (branch_tip): the branch as merged (second parent of the merge commit on the default
-branch) when there is one; otherwise the freshest of refs/heads/<branch> and refs/remotes/origin/<branch> (the one
-that contains the other); when they diverged, origin's, and the trace says so (src.git.tip_note).
-Merged (git_history: merge_of, landing), without asking GitLab: the tip is on the default branch (merge commit or
-fast-forward); else
-runs/<KEY>/run.json arrived on the default branch's first-parent line (squash or rebase merge, or a fast-forward
-whose branch is gone): the merge is the last commit of the run there (see _run_stretch). The run's own commits are
-never counted as hotfixes.
+Git (docs/eval.md §2 has every rule, each with a test in tests/test_qa_r2_trace.py): how the run was merged
+(landing, rules M1-M6: merge commit, squash + merge commit, fast-forward, rebase, squash, branch gone), which commits
+are the run's own (the range, rules C1-C3, and on the default branch run_stretch, rules R1-R5), and which time is used
+(a commit's "at" is its author date; a merge's is the committer date of the commit that landed it). Branch copies
+(local, origin) that are older, ahead or diverged are named in src.git.tip_note. The run's own commits are never
+counted as hotfixes; a revert, or a person's commit naming the key with a fix word, is never the run's own.
 
 People: only GitLab usernames and pseudonyms already in the sources. Git and Lean identities (emails, names, hosts)
 become a pseudonym G-<6 hex> of the email; Lean's audit file names (<host>-<6 hex>.jsonl) become L-<6 hex>; emails
@@ -285,14 +283,89 @@ def checks_of(events, tree, intent) -> dict:
 
 
 # ---------- git ----------
+# The rules here are written down, one by one, in docs/eval.md §2 ("怎么认合并", "这个 run 自己的提交", "用哪个时间");
+# tests/test_qa_r2_trace.py has a test for each of them.
 
-def default_ref(repo, cfg, ref):
+GITLAB_MERGE = "Merge branch '%s' into '%s'"                       # GitLab's merge commit subject (M1)
+MERGE_INTO_RE = re.compile(r"^Merge\b.* into '?(?P<into>[^'\s]+)'?\s*$")   # git's and GitLab's "... into <branch>"
+REVERT_RE = re.compile(r'^Revert "|This reverts commit [0-9a-f]{7,40}', re.M)
+LOG_FORMAT = "--format=%x01%H%x00%P%x00%ae%x00%ce%x00%aI%x00%cI%x00%B%x02"
+
+
+def _raw(repo, *args, data=None):
+    """git's stdout as text (bytes that are not UTF-8 replaced), or None when git fails."""
+    p = subprocess.run(["git", "-C", repo] + list(args), input=data, capture_output=True)
+    return p.stdout.decode("utf-8", "replace") if p.returncode == 0 else None
+
+
+_META = {}   # (repo, sha) -> (parents, committer date): a commit's never change, so every read is kept
+
+
+def _remember(repo, sha, parents, committed):
+    if len(_META) > 200000:
+        _META.clear()
+    _META[(repo, sha)] = (tuple(parents), committed)
+
+
+def _log(repo, *args) -> list:
+    """The commits `git log args` lists: {sha, parents, ae, ce, authored, committed, subject, msg, files}.
+    -z and --no-renames: file names come as they are (never quoted), a rename lists the old and the new name.
+    A merge commit lists no files (git log shows no diff for merges)."""
+    rows = []
+    for chunk in (_raw(repo, "log", "-z", "--no-renames", "--name-only", LOG_FORMAT, *args) or "").split("\x01")[1:]:
+        head, _, files = chunk.partition("\x02")
+        f = head.split("\0", 6)
+        if len(f) < 7:
+            continue
+        rows.append({"sha": f[0], "parents": f[1].split(), "ae": f[2].lower(), "ce": f[3].lower(),
+                     "authored": _utc(f[4]), "committed": _utc(f[5]), "msg": f[6],
+                     "subject": f[6].split("\n", 1)[0].strip(),
+                     "files": [x for x in files.lstrip("\0\n").split("\0") if x]})
+        _remember(repo, f[0], rows[-1]["parents"], rows[-1]["committed"])
+    return rows
+
+
+def _blobs(repo, specs) -> list:
+    """The text of each "<rev>:<path>" in `specs` (None when it is not there), read in one `git cat-file --batch`."""
+    if not specs:
+        return []
+    p = subprocess.run(["git", "-C", repo, "cat-file", "--batch"], input="".join(x + "\n" for x in specs).encode(),
+                       capture_output=True)
+    out, buf, i = [], p.stdout if p.returncode == 0 else b"", 0
+    for _ in specs:
+        j = buf.find(b"\n", i)
+        if j < 0:
+            out.append(None)
+            continue
+        head = buf[i:j].split()
+        if len(head) == 3 and head[2].isdigit():
+            n = int(head[2])
+            out.append(buf[j + 1:j + 1 + n].decode("utf-8", "replace") if head[1] == b"blob" else None)
+            i = j + 1 + n + 1
+        else:
+            out.append(None)
+            i = j + 1
+    return out
+
+
+def _has(repo, rev, path) -> bool:
+    return git(repo, "cat-file", "-e", "%s:%s" % (rev, path), check=False).returncode == 0
+
+
+def _refs(repo) -> dict:
+    """{ref name: sha} of the local branches and origin's, in one `git for-each-ref`."""
+    out = _g(repo, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/remotes/origin/") or ""
+    return {r: h for h, _, r in (line.partition(" ") for line in out.splitlines()) if r}
+
+
+def default_ref(repo, cfg, ref, refs=None):
     d = cfg["default_branch"]
+    refs = _refs(repo) if refs is None else refs
     if ref and _short_ref(ref) == d and _commit(repo, ref):   # name it one way, however it was given
         full = ("refs/remotes/origin/" if ref.startswith(("origin/", "refs/remotes/origin/")) else "refs/heads/") + d
-        return full if _commit(repo, full) == _commit(repo, ref) else ref
+        return full if refs.get(full) == _commit(repo, ref) else ref
     for r in ("refs/remotes/origin/" + d, "refs/heads/" + d):
-        if _commit(repo, r):
+        if refs.get(r):
             return r
     return None
 
@@ -302,68 +375,52 @@ def _merges(repo, dref_sha) -> tuple:
     """((sha, parents, subject), ...) of the merge commits on dref_sha's first-parent line, newest first (a commit's
     history never changes, so one read per default-branch head serves every trace of an eval)."""
     out = []
-    for line in (_g(repo, "log", "--merges", "--first-parent", "--format=%H%x00%P%x00%s", dref_sha) or "").splitlines():
+    for line in (_g(repo, "log", "--merges", "--first-parent", "--format=%H%x00%P%x00%s%x00%cI", dref_sha)
+                 or "").splitlines():
         parts = line.split("\0")
-        if len(parts) == 3:
-            out.append((parts[0], tuple(parts[1].split()), parts[2]))
+        if len(parts) == 4:
+            out.append((parts[0], tuple(parts[1].split()), parts[2].strip()))
+            _remember(repo, parts[0], parts[1].split(), _utc(parts[3]))
     return tuple(out)
 
 
 def _parents(repo, sha) -> list:
-    return (_g(repo, "rev-list", "--parents", "-n", "1", sha) or "").split()[1:]
+    if (repo, sha) in _META:
+        return list(_META[(repo, sha)][0])
+    out = (_g(repo, "log", "-1", "--format=%P%x00%cI", sha) or "").strip().split("\0")
+    if len(out) != 2:
+        return []
+    _remember(repo, sha, out[0].split(), _utc(out[1]))
+    return out[0].split()
 
 
 def first_added(repo, dref, path):
-    """The first commit on the default branch's first-parent line that brought `path` (oldest), or None."""
+    """S: the first commit on the default branch's first-parent line that brought `path` (oldest), or None."""
     if not dref:
         return None
-    out = (_g(repo, "log", "--first-parent", "--diff-filter=A", "--format=%H", dref, "--", path) or "").split()
-    return out[-1] if out else None
+    out = (_g(repo, "log", "--first-parent", "--diff-filter=A", "--format=%H%x00%P%x00%cI", dref, "--", path)
+           or "").splitlines()
+    if not out or len(out[-1].split("\0")) != 3:
+        return None
+    h, ps, cd = out[-1].split("\0")
+    _remember(repo, h, ps.split(), _utc(cd))
+    return h
 
 
-def merged_tip(repo, branch, dref, run_json):
-    """(sha, how) of the run branch as merged: the second parent of GitLab's merge commit ("Merge branch '<branch>'
-    into '<default>'"), or of the merge commit that brought run.json to the default branch; (None, None)."""
-    dsha = _commit(repo, dref) if dref else None
-    if not dsha:
-        return None, None
-    for h, parents, subject in _merges(repo, dsha):
-        if branch and ("'%s'" % branch) in subject and len(parents) >= 2:
-            return parents[1], "second parent of merge commit %s on %s" % (h[:12], dref)
-    s = first_added(repo, dref, run_json)
-    ps = _parents(repo, s) if s else []
-    if len(ps) >= 2 and git(repo, "cat-file", "-e", "%s:%s" % (ps[1], run_json), check=False).returncode == 0:
-        return ps[1], "second parent of merge commit %s on %s (the commit that brought %s)" % (s[:12], dref, run_json)
-    return None, None
-
-
-def branch_tip(repo, branch, ref, dref, run_json=None):
-    """(sha, how, note) of the run branch's last commit, or (None, None, None).
-    The branch as merged wins (a stale local branch must not cut the run short). Otherwise the freshest of origin's
-    and the local copy: the one that contains the other; diverged: origin's. `note` says what was not used."""
+def copies_of(repo, branch, ref, refs=None) -> list:
+    """[(ref name, sha)] of the run branch here: --ref when it names the branch; else origin's, then the local one."""
     if ref and branch and _short_ref(ref) == branch and _commit(repo, ref):
-        return _commit(repo, ref), "ref %s" % ref, None
-    cands = []
-    for r in (("refs/remotes/origin/" + branch, "refs/heads/" + branch) if branch else ()):
-        c = _commit(repo, r)
-        if c:
-            cands.append((r, c))
-    m, how = merged_tip(repo, branch, dref, run_json) if run_json else (None, None)
-    if m:
-        notes = []
-        for r, c in cands:
-            if c == m:
-                continue
-            if _ancestor(repo, c, m):
-                notes.append("%s (%s) is older: the merged branch contains it" % (r, c[:12]))
-            elif _ancestor(repo, m, c):
-                notes.append("%s (%s) has commits after the merge: not part of it" % (r, c[:12]))
-            else:
-                notes.append("%s (%s) has diverged from the merged branch: not used" % (r, c[:12]))
-        return m, how, "; ".join(notes) or None
-    if not cands:
+        return [("ref %s" % ref, _commit(repo, ref))]
+    refs = _refs(repo) if refs is None else refs
+    return [(r, refs[r]) for r in (("refs/remotes/origin/" + branch, "refs/heads/" + branch) if branch else ())
+            if refs.get(r)]
+
+
+def freshest(repo, copies):
+    """(sha, ref, note) of the copy to read: the one that contains the other; diverged: origin's (listed first)."""
+    if not copies:
         return None, None, None
-    (r0, c0), rest = cands[0], cands[1:]
+    (r0, c0), rest = copies[0], copies[1:]
     if not rest or rest[0][1] == c0:
         return c0, r0, None
     (r1, c1) = rest[0]
@@ -372,42 +429,6 @@ def branch_tip(repo, branch, ref, dref, run_json=None):
     if _ancestor(repo, c0, c1):
         return c1, r1, "%s is ahead of %s (%s): commits not pushed yet" % (r1, r0, c0[:12])
     return c0, r0, "%s (%s) and %s (%s) have diverged: using %s" % (r1, c1[:12], r0, c0[:12], r0)
-
-
-def _run_stretch(repo, cfg, dref, start, key, intent, match=None, match_first=0):
-    """(commits, matched): the run's commits on the default branch's first-parent line, oldest first, from `start`
-    (the commit that brought run.json) up to the last one that belongs to the run: it touches runs/<KEY>/ or
-    aidlc-docs/<intent>/, a bot made it (kit.json bot_emails), or `match` (patch-ids of the branch's commits) says it
-    is a copy of one. The walk ends at a merge commit or at a commit that touches another run's runs/<KEY2>/.
-    Commits in between that belong to nobody (a person's push inside the run) are part of it."""
-    parent = (_parents(repo, start) or [None])[0]
-    shas = (_g(repo, "rev-list", "--first-parent", "--reverse", ("%s..%s" % (parent, dref)) if parent else dref)
-            or "").split()
-    shas = shas[shas.index(start):] if start in shas else []
-    bots = {x.lower() for x in cfg.get("bot_emails", [])}
-    runs = cfg["runs_dir"] + "/"
-    docs = "%s/%s/" % (lean.DOCS, intent) if intent else None
-    cands, done = [], False
-    for i in range(0, len(shas), 64):
-        log = _g(repo, "-c", "core.quotepath=false", "show", "--name-only",
-                 "--format=%x01%H%x00%P%x00%ae%x00%ce", *shas[i:i + 64]) or ""
-        for chunk in log.split("\x01")[1:]:
-            lines = chunk.split("\n")
-            h, parents, ae, ce = (lines[0].split("\0") + [""] * 4)[:4]
-            files = [x for x in lines[1:] if x.strip()]
-            if cands and (len(parents.split()) > 1 or any(
-                    f.startswith(runs) and JIRA_RE.match(f[len(runs):].split("/", 1)[0]) and
-                    f[len(runs):].split("/", 1)[0] != key for f in files)):
-                done = True
-                break
-            own = any(f.startswith("%s%s/" % (runs, key)) or (docs and f.startswith(docs)) for f in files) or \
-                ae.lower() in bots or ce.lower() in bots
-            cands.append((h, own or not cands))
-        if done:
-            break
-    matched = match([h for h, _ in cands[match_first:]]) if match and cands else set()
-    last = max([i for i, (h, own) in enumerate(cands) if own or h in matched] or [-1])
-    return [h for h, _ in cands[:last + 1]], matched
 
 
 def _patch_ids(repo, *revs) -> set:
@@ -424,6 +445,8 @@ def _pids(repo, patch) -> set:
 
 def _pid_of(repo, sha_list) -> dict:
     """{sha: patch-id} for these commits."""
+    if not sha_list:
+        return {}
     p = subprocess.run(["git", "-C", repo, "show", "-p", "--format=commit %H", *sha_list], capture_output=True)
     q = subprocess.run(["git", "-C", repo, "patch-id", "--stable"], input=p.stdout, capture_output=True)
     out = {}
@@ -434,37 +457,56 @@ def _pid_of(repo, sha_list) -> dict:
     return out
 
 
-def landing(repo, cfg, dref, tip, key, intent):
-    """The tip is not on the default branch, but runs/<KEY>/run.json is: a squash or rebase merge (the branch is
-    still here). The merge is the last run commit after the one that brought run.json; rebased copies of the branch's
-    commits are recognised by patch-id. None when run.json never reached the default branch."""
-    rp = "%s/%s/run.json" % (cfg["runs_dir"], key)
-    s = first_added(repo, dref, rp)
-    if not s or _ancestor(repo, s, tip):
-        return None
-    base = (_g(repo, "merge-base", tip, dref) or "").strip()
-    branch = _patch_ids(repo, tip, *(["^" + base] if base else []))
-    n = len((_g(repo, "rev-list", "--no-merges", tip, *(["^" + base] if base else [])) or "").split())
-
-    def match(shas):
-        pid = _pid_of(repo, shas[:n + 5]) if branch else {}
-        return {h for h, x in pid.items() if x in branch}
-    seq, matched = _run_stretch(repo, cfg, dref, s, key, intent, match=match)
-    src = "%s on the first-parent line of %s from %s (the commit that brought %s)" % (
-        "patch-ids of the branch's commits and the run's records" if matched else "the run's records", dref, s[:12],
-        rp)
-    if matched:
-        return {"commit": seq[-1], "at": _cdate(repo, seq[-1]), "how": "rebase merge (the branch is still here)",
-                "src": src, "own": seq, "start": s, "rebased": True,
-                "note": "%d of the commits on %s are copies of the branch's" % (len(matched), dref)}
-    note = None
-    if base:
-        d = subprocess.run(["git", "-C", repo, "diff", base, tip], capture_output=True)
-        same = _pids(repo, d.stdout) == set(_pid_of(repo, [s]).values()) if d.returncode == 0 else False
-        note = "the squash commit carries exactly the branch's changes" if same else \
-            "the squash commit differs from the branch's changes (conflicts resolved, or the branch moved on)"
-    return {"commit": seq[-1], "at": _cdate(repo, seq[-1]), "how": "squash merge (the branch is still here)",
-            "src": src, "own": seq, "note": note}
+def run_stretch(repo, cfg, dref, start, key, intent, branch, floor=None, pids=None, n=0):
+    """(commits, copies): the run's own commits on the default branch's first-parent line, oldest first, from S =
+    `start` (docs/eval.md §2, rules R1-R5). Walking from S, each commit:
+      R1  S, and every commit up to `floor` (the branch's last commit there) or with the patch-id of one of the
+          branch's commits (`pids`: a rebased copy) is the run's;
+      R2  a merge commit is the run's when it was made on the run branch (subject "Merge ... into <branch>": main or
+          origin merged into the branch) or by the bot (kit.json bot_emails); any other merge ends the stretch;
+      R3  a person's (not the bot's) revert ("This reverts commit", 'Revert "') or commit whose message names KEY
+          with a fix word (FIX_RE), and anyone's commit that touches another run's runs/<KEY2>/, end the stretch:
+          never the run's (the bot works only on its run: its reverts and fixes are the run's, R4);
+      R4  a commit that touches runs/<KEY>/ or aidlc-docs/<intent>/, or that the bot made, is the run's;
+      R5  any other commit (a person's push that names nothing) is the run's only when a later commit is (R1, R2, R4).
+    The stretch is S up to its last own commit."""
+    parent = (_parents(repo, start) or [None])[0]
+    shas = (_g(repo, "rev-list", "--first-parent", "--reverse", ("%s..%s" % (parent, dref)) if parent else dref)
+            or "").split()
+    shas = shas[shas.index(start):] if start in shas else []
+    if not shas:
+        return [], set()
+    pid = _pid_of(repo, shas[:n + 5]) if pids else {}
+    if floor and floor not in shas:   # the branch's commit came in through a second parent
+        floor = merge_of(repo, floor, dref)
+    floor_i = shas.index(floor) if floor in shas else 0
+    bots = {x.lower() for x in cfg.get("bot_emails", [])}
+    runs = cfg["runs_dir"] + "/"
+    mine = ("%s%s/" % (runs, key),) + (("%s/%s/" % (lean.DOCS, intent),) if intent else ())
+    key_re = re.compile(r"(?<![A-Za-z0-9-])%s(?![0-9])" % re.escape(key))
+    copies, last, i = set(), 0, 0
+    for k in range(0, len(shas), 64):
+        for c in _log(repo, "--no-walk=unsorted", *shas[k:k + 64]):
+            bot = c["ae"] in bots or c["ce"] in bots
+            if pid.get(c["sha"]) in (pids or ()):
+                copies.add(c["sha"])
+            if i <= floor_i or c["sha"] in copies:                                    # R1
+                own = True
+            elif len(c["parents"]) > 1:                                              # R2
+                m = MERGE_INTO_RE.match(c["subject"])
+                if not (bot or (m and branch and m.group("into") == branch)):
+                    return shas[:last + 1], copies
+                own = True
+            elif (not bot and (REVERT_RE.search(c["msg"]) or (key_re.search(c["msg"]) and FIX_RE.search(c["msg"])))) \
+                    or any(f.startswith(runs) and JIRA_RE.match(f[len(runs):].split("/", 1)[0])
+                           and f[len(runs):].split("/", 1)[0] != key for f in c["files"]):   # R3
+                return shas[:last + 1], copies
+            else:                                                                    # R4 / R5
+                own = bot or any(f.startswith(mine) for f in c["files"])
+            if own:
+                last = i
+            i += 1
+    return shas[:last + 1], copies
 
 
 def merge_of(repo, tip, dref):
@@ -484,93 +526,219 @@ def merge_of(repo, tip, dref):
 
 
 def _cdate(repo, sha):
-    out = _g(repo, "log", "-1", "--format=%cI", sha)
-    return _utc(out.strip()) if out else None
+    """The committer date (when it landed on the branch it is on: merged, squashed, rebased)."""
+    if (repo, sha) not in _META:
+        _parents(repo, sha)
+    return _META[(repo, sha)][1] if (repo, sha) in _META else None
 
 
-def git_history(repo, cfg, rec, ref, key):
+def _same_changes(repo, base, tip, squash) -> str:
+    d = subprocess.run(["git", "-C", repo, "diff", base, tip], capture_output=True)
+    same = d.returncode == 0 and _pids(repo, d.stdout) == set(_pid_of(repo, [squash]).values())
+    return "the squash commit carries exactly the branch's changes" if same else \
+        "the squash commit differs from the branch's changes (conflicts resolved, or the branch moved on)"
+
+
+def landing(repo, cfg, dref, key, intent, branch, copies, refs=None):
+    """How the run reached the default branch, without asking GitLab (docs/eval.md §2, rules M1-M6), or None.
+    {"merge": {commit, at, how, src, own?, note?}, "tip": the run's last commit as merged, "tip_src",
+     "notes": [what was not used], "exclude": [commits whose history is not the run's]}.
+    S = the first commit on the default branch's first-parent line that brought runs/<KEY>/run.json."""
+    rp = "%s/%s/run.json" % (cfg["runs_dir"], key)
+    dsha = ((refs or {}).get(dref) or _commit(repo, dref)) if dref else None
+    s = first_added(repo, dsha, rp) if dsha else None
+    if not s:
+        return None
+    tip, tref, tnote = freshest(repo, copies)
+    # M1: a merge commit: GitLab's subject, or S itself when its second parent has run.json
+    mc = next(((h, ps, "GitLab's merge commit %s" % h[:12]) for h, ps, subject in _merges(repo, dsha)
+               if branch and len(ps) >= 2 and subject == GITLAB_MERGE % (branch, cfg["default_branch"])), None)
+    sp = _parents(repo, s)
+    if not mc and len(sp) >= 2 and _has(repo, sp[1], rp):
+        mc = (s, sp, "the merge commit %s that brought %s" % (s[:12], rp))
+    if mc:
+        h, (m1, p2), found = mc[0], mc[1][:2], mc[2]
+        mp = _parents(repo, p2) if tip else []
+        merge = {"commit": h, "at": _cdate(repo, h), "how": "merge commit",
+                 "src": "%s on the first-parent line of %s" % (found, dref)}
+        # M1a: GitLab's "squash commits" with a merge commit: the second parent is a squash commit on the merge base
+        if tip and len(mp) == 1 and _ancestor(repo, mp[0], m1) and \
+                not any(_ancestor(repo, c, p2) or _ancestor(repo, p2, c) for _, c in copies):
+            merge.update(how="squash and merge commit (the branch is still here)", own=[p2],
+                         note=_same_changes(repo, mp[0], tip, p2))
+            return {"merge": merge, "tip": tip, "tip_src": tref, "exclude": [m1],
+                    "notes": [tnote, "second parent of merge commit %s (%s) is the squash commit: the branch's "
+                                     "commits are used" % (h[:12], p2[:12])]}
+        notes = []
+        for r, c in copies:
+            if c == p2:
+                continue
+            if _ancestor(repo, c, p2):
+                notes.append("%s (%s) is older: the merged branch contains it" % (r, c[:12]))
+            elif _ancestor(repo, p2, c):
+                notes.append("%s (%s) has commits after the merge: not part of it" % (r, c[:12]))
+            else:
+                notes.append("%s (%s) has diverged from the merged branch: not used" % (r, c[:12]))
+        return {"merge": merge, "tip": p2, "tip_src": "second parent of merge commit %s on %s" % (h[:12], dref),
+                "exclude": [m1], "notes": notes}
+    base = sp[0] if sp else None
+    # M2: fast-forward: S is one of the branch's own commits
+    on = [(r, c) for r, c in copies if _ancestor(repo, s, c)] if len(sp) <= 1 else []
+    if on:
+        t = freshest(repo, on)[0]
+        floor = t if _ancestor(repo, t, dsha) else (_g(repo, "merge-base", t, dsha) or "").strip()
+        seq, _ = run_stretch(repo, cfg, dref, s, key, intent, branch, floor=floor)
+        last = seq[-1]
+        notes = []
+        for r, c in on:
+            if c == last:
+                continue
+            notes.append("%s (%s) %s" % (r, c[:12], "is older: the run continues on %s" % dref
+                                         if _ancestor(repo, c, last) else "has commits after the merge: not part of it"
+                                         if _ancestor(repo, last, c) else "has diverged from the merged run: not used"))
+        return {"merge": {"commit": last, "at": _cdate(repo, last), "how": "fast-forward", "own": seq,
+                          "src": "the run's commits on the first-parent line of %s from %s (the commit that brought "
+                                 "%s; git keeps no time of a fast-forward: the last run commit's)" % (dref, s[:12], rp)},
+                "tip": last, "tip_src": "last run commit on the first-parent line of %s (fast-forward)" % dref,
+                "exclude": [base] if base else [], "notes": notes}
+    # M6: the branch's tip is on the default branch anyway (a merge commit with another subject)
+    m = merge_of(repo, tip, dref) if tip else None
+    if m:
+        return {"merge": {"commit": m, "at": _cdate(repo, m), "how": "merge commit" if m != tip else "fast-forward",
+                          "src": "first-parent line of %s" % dref},
+                "tip": tip, "tip_src": tref, "notes": [tnote],
+                "exclude": [_parents(repo, m)[0]] if m != tip else ([base] if base else [])}
+    if tip:
+        # M3 / M4: the branch is here, its commits are not on the default branch: rebase (copies) or squash
+        mb = (_g(repo, "merge-base", tip, dsha) or "").strip()
+        bp = _patch_ids(repo, tip, *(["^" + mb] if mb else []))
+        n = len((_g(repo, "rev-list", "--no-merges", tip, *(["^" + mb] if mb else [])) or "").split())
+        seq, matched = run_stretch(repo, cfg, dref, s, key, intent, branch, pids=bp, n=n)
+        src = "%s on the first-parent line of %s from %s (the commit that brought %s)" % (
+            "patch-ids of the branch's commits and the run's records" if matched else "the run's records", dref,
+            s[:12], rp)
+        at = _cdate(repo, seq[-1])
+        if matched:   # M3: the run as merged = its copies on the default branch
+            return {"merge": {"commit": seq[-1], "at": at, "how": "rebase merge (the branch is still here)",
+                              "src": src, "own": seq, "start": s, "rebased": True,
+                              "note": "%d of the commits on %s are copies of the branch's" % (len(matched), dref)},
+                    "tip": seq[-1], "exclude": [base] if base else [],
+                    "tip_src": "last run commit on the first-parent line of %s (rebase merge)" % dref,
+                    "notes": ["%s (%s): its commits were rebased onto %s, the copies there are used" % (
+                        tref, tip[:12], dref), tnote]}
+        # M4: squash: the branch's commits made after the squash commit are not part of it
+        made = [(x["sha"], x["authored"]) for x in _log(repo, "--first-parent", tip, *(["^" + mb] if mb else []))]
+        cut = next((i for i, (_, a) in enumerate(made) if a and at and a <= at), None)
+        notes = [tnote]
+        if cut:
+            notes.append("%s (%s): %d commit(s) made after the squash merge are not part of it" % (
+                tref, tip[:12], cut))
+        as_merged = made[cut][0] if cut else tip
+        return {"merge": {"commit": seq[-1], "at": at, "how": "squash merge (the branch is still here)", "src": src,
+                          "own": seq, "note": _same_changes(repo, mb, as_merged, s) if mb else None},
+                "tip": as_merged, "tip_src": tref, "exclude": [dref], "notes": notes}
+    # M5: no branch here: the run's commits on the default branch say how it was merged
+    seq, _ = run_stretch(repo, cfg, dref, s, key, intent, branch)
+    src = "the run's records on the first-parent line of %s from %s (the commit that brought %s)" % (dref, s[:12], rp)
+    if len(seq) == 1:   # one commit carries the run: its own commits are not listed
+        return {"merge": {"commit": s, "at": _cdate(repo, s), "how": "squash merge (the branch is gone): the commit "
+                          "that brought run.json", "src": src, "own": seq}, "tip": None}
+    return {"merge": {"commit": seq[-1], "at": _cdate(repo, seq[-1]), "how": "fast-forward or rebase merge (the "
+                      "branch is gone): the last run commit", "src": src, "own": seq},
+            "tip": seq[-1], "exclude": [base] if base else [], "notes": [],
+            "tip_src": "last run commit on the first-parent line of %s (fast-forward or rebase merge, the branch is "
+                       "gone)" % dref}
+
+
+def foreign_parents(repo, merges, rp) -> list:
+    """The other parents (not the first) of these merge commits [(sha, parents)] that have no runs/<KEY>/run.json:
+    main merged into the branch (the runner may not force-push). Their history is main's, not the run's (rule C2)."""
+    ps = sorted({p for _, parents in merges for p in parents[1:]})
+    if not ps:
+        return []
+    out = _raw(repo, "cat-file", "--batch-check", data="".join("%s:%s\n" % (p, rp) for p in ps).encode()) or ""
+    return [p for p, line in zip(ps, out.splitlines()) if line.endswith(" missing")]
+
+
+def _ancestry(log, sha) -> set:
+    """`sha` and its ancestors among the commits of `log` (the parents git log gave: no git call)."""
+    parents = {c["sha"]: c["parents"] for c in log}
+    seen, todo = set(), [sha]
+    while todo:
+        h = todo.pop()
+        if h in parents and h not in seen:
+            seen.add(h)
+            todo += parents[h]
+    return seen
+
+
+def git_history(repo, cfg, rec, ref, key, refs=None):
     """Commits of the run branch, the hand-over commit, the merge, park.json history."""
     branch = rec.get("branch") if isinstance(rec.get("branch"), str) else ""
     bc = rec.get("brain_commit") if isinstance(rec.get("brain_commit"), str) else None
     intent = rec.get("intent") if isinstance(rec.get("intent"), str) else None
     rp = "%s/%s/run.json" % (cfg["runs_dir"], key)
-    dref = default_ref(repo, cfg, ref)
-    tip, tip_how, tip_note = branch_tip(repo, branch, ref, dref, rp)
+    pp = "%s/%s/park.json" % (cfg["runs_dir"], key)
+    refs = _refs(repo) if refs is None else refs
+    dref = default_ref(repo, cfg, ref, refs)
+    copies = copies_of(repo, branch, ref, refs)
+    tip, tip_how, tip_note = freshest(repo, copies)
     out = {"tip": tip, "tip_src": tip_how, "tip_note": tip_note, "default_ref": dref, "merge": None, "commits": None,
            "range": None, "handover_commit": None, "park": None}
-    if tip:
-        m = merge_of(repo, tip, dref)
-        if m:
-            out["merge"] = {"commit": m, "at": _cdate(repo, m), "how": "merge commit" if m != tip else "fast-forward",
-                            "src": "first-parent line of %s" % dref}
-            exclude = m + "^1" if m != tip else (bc if _commit(repo, bc) else None)
-        else:
-            out["merge"] = landing(repo, cfg, dref, tip, key, intent) if dref else None
-            exclude = dref or (bc if _commit(repo, bc) else None)
-            if out["merge"] and out["merge"].get("rebased"):   # the run as merged: its copies on the default branch
-                note = "%s (%s): its commits were rebased onto %s, the copies there are used" % (tip_how, tip[:12],
-                                                                                               dref)
-                tip = out["merge"]["commit"]
-                exclude = (_parents(repo, out["merge"]["start"]) or [None])[0]
-                out.update(tip=tip, tip_src="last run commit on the first-parent line of %s (rebase merge)" % dref,
-                           tip_note="; ".join(x for x in (note, tip_note) if x))
-    else:   # no branch: run.json on the default branch says how it was merged
-        s = first_added(repo, dref, rp)
-        if not s:
+    land = landing(repo, cfg, dref, key, intent, branch, copies, refs)
+    if land:
+        out["merge"] = land["merge"]
+        if not land["tip"]:
             return out
-        seq, _ = _run_stretch(repo, cfg, dref, s, key, intent)
-        src = "the run's records on the first-parent line of %s from %s (the commit that brought %s)" % (dref, s[:12],
-                                                                                                      rp)
-        if len(seq) == 1:   # one commit carries the run: its own commits are not listed
-            out["merge"] = {"commit": s, "at": _cdate(repo, s), "how": "squash merge (the branch is gone): the "
-                            "commit that brought run.json", "src": src, "own": seq}
-            return out
-        tip = seq[-1]
-        out.update(tip=tip, tip_src="last run commit on the first-parent line of %s (fast-forward or rebase merge, "
-                                    "the branch is gone)" % dref)
-        out["merge"] = {"commit": tip, "at": _cdate(repo, tip), "how": "fast-forward or rebase merge (the branch "
-                        "is gone): the last run commit", "src": src, "own": seq}
-        exclude = (_parents(repo, s) or [None])[0]
-    rng = [tip] + (["^" + exclude] if exclude else [])
-    out["range"] = "%s ^%s" % (tip[:12], exclude[:40] if exclude else "(root)")
+        tip = land["tip"]
+        out.update(tip=tip, tip_src=land["tip_src"], tip_note="; ".join(x for x in land["notes"] if x) or None)
+        exclude = land["exclude"]
+    elif tip:
+        exclude = [dref] if dref else ([bc] if _commit(repo, bc) else [])
+    else:
+        return out
+    rng = [tip] + ["^" + x for x in exclude]
+    log = _log(repo, "--topo-order", "--reverse", *rng)
+    foreign = foreign_parents(repo, [(c["sha"], c["parents"]) for c in log if len(c["parents"]) > 1], rp)
+    if foreign:   # C2: main merged into the branch
+        rng += ["^" + x for x in foreign]
+        log = _log(repo, "--topo-order", "--reverse", *rng)
+    out["range"] = " ".join([tip[:12]] + ([x[:41] for x in rng[1:]] or ["^(root)"]))
     bots = {x.lower() for x in cfg.get("bot_emails", [])}
-    log = _g(repo, "-c", "core.quotepath=false", "log", "--topo-order", "--reverse",
-             "--format=%x01%H%x00%ae%x00%ce%x00%cI%x00%P", "--name-only", *rng) or ""
     commits = []
-    for chunk in log.split("\x01")[1:]:
-        lines = chunk.split("\n")
-        h, ae, ce, cd, parents = (lines[0].split("\0") + [""] * 5)[:5]
-        files = [x for x in lines[1:] if x.strip()]
-        bot = ae.lower() in bots or ce.lower() in bots
-        commits.append({"sha": h, "at": _utc(cd), "by": "bot" if bot else "person",
-                        "who": None if bot else pseudonym(ae), "files": len(files),
-                        "records_only": bool(files) and all(f.startswith((lean.DOCS + "/", cfg["runs_dir"] + "/"))
-                                                            for f in files),
-                        "merge": len(parents.split()) > 1, "after_handover": None, "src": "git log " + out["range"]})
-    rp = "%s/%s/run.json" % (cfg["runs_dir"], key)
+    for c in log:
+        bot = c["ae"] in bots or c["ce"] in bots
+        commits.append({"sha": c["sha"], "at": c["authored"], "committed_at": c["committed"],
+                        "by": "bot" if bot else "person", "who": None if bot else pseudonym(c["ae"]),
+                        "files": len(c["files"]),
+                        "records_only": bool(c["files"]) and all(f.startswith((lean.DOCS + "/", cfg["runs_dir"] + "/"))
+                                                                  for f in c["files"]),
+                        "merge": len(c["parents"]) > 1, "after_handover": None, "src": "git log " + out["range"]})
+    # the hand-over commit (the first whose run.json has a handoff) and park.json's versions: one read for all
+    rps = [c for c in log if rp in c["files"]]
+    pps = [c for c in log if pp in c["files"]]
+    texts = _blobs(repo, ["%s:%s" % (c["sha"], rp) for c in rps] + ["%s:%s" % (c["sha"], pp) for c in pps])
     hand = None
-    for h in (_g(repo, "log", "--topo-order", "--reverse", "--format=%H", *rng, "--", rp) or "").split():
+    for c, text in zip(rps, texts):
         try:
-            r = json.loads(_show(repo, h, rp) or "null")
+            r = json.loads(text or "null")
         except ValueError:
             continue
         if isinstance(r, dict) and r.get("handoff"):
-            hand = h
+            hand = c["sha"]
             break
     out["handover_commit"] = hand
     if hand:
-        after = set((_g(repo, "rev-list", tip, "^" + hand) or "").split())
+        before = _ancestry(log, hand)
         for c in commits:
-            c["after_handover"] = c["sha"] in after
+            c["after_handover"] = c["sha"] not in before
     elif not rec.get("handoff"):
         for c in commits:
             c["after_handover"] = False
     out["commits"] = commits
-    pp = "%s/%s/park.json" % (cfg["runs_dir"], key)
     park, last = [], None
-    for line in (_g(repo, "log", "--topo-order", "--reverse", "--format=%H%x00%cI", *rng, "--", pp) or "").splitlines():
-        h, cd = (line.split("\0") + [""])[:2]
-        row = _park_row(_show(repo, h, pp), "%s@%s" % (pp, h[:12]), _utc(cd), h)
+    for c, text in zip(pps, texts[len(rps):]):
+        row = _park_row(text, "%s@%s" % (pp, c["sha"][:12]), c["authored"], c["sha"])
         if row and (row["kind"], row["lean_request"], row["status"], row["question_sha256"]) != last:
             park.append(row)
             last = (row["kind"], row["lean_request"], row["status"], row["question_sha256"])
@@ -599,7 +767,7 @@ def _park_row(raw, src, at, commit=None):
             "question_sha256": _sha(q.encode())[:12] if isinstance(q, str) else None, "src": src}
 
 
-def after_merge(repo, cfg, key, merge, commits, dref, as_of):
+def after_merge(repo, cfg, key, merge, commits, dref, as_of, refs=None):
     """Reverts, hotfix commits and defect claims within WINDOW_DAYS after the merge. Messages are read, not kept.
     "After the merge" = on the default branch and not in the merge's history (no `git log --since`: one commit with
     an older committer date would stop the walk); the window is then judged by each commit's committer date. The
@@ -628,14 +796,16 @@ def after_merge(repo, cfg, key, merge, commits, dref, as_of):
             ev.append({"sha": h, "at": at, "rule": "reverts %s" % rv[0][:12], "src": "git log %s" % dref})
         elif key_re.search(body) and FIX_RE.search(body):
             ev.append({"sha": h, "at": at, "rule": "names %s with a fix word" % key, "src": "git log %s" % dref})
-    refs = (_g(repo, "for-each-ref", "--format=%(refname)", "refs/heads/claim/", "refs/remotes/origin/claim/") or "")
+    refs = _refs(repo) if refs is None else refs
+    claims = sorted(r for r in refs if r.startswith(("refs/heads/claim/", "refs/remotes/origin/claim/")) and
+                    r.rsplit("/", 1)[-1] != key)
     seen = set()
-    for r in sorted(refs.split()):
+    for r, text in zip(claims, _blobs(repo, ["%s:claim.json" % refs[r] for r in claims])):
         k2 = r.rsplit("/", 1)[-1]
-        if k2 == key or k2 in seen:
+        if k2 in seen:
             continue
         try:
-            doc = json.loads(_show(repo, r, "claim.json") or "null")
+            doc = json.loads(text or "null")
         except ValueError:
             continue
         if not isinstance(doc, dict) or doc.get("source") not in DEFECT_SOURCES:
@@ -690,9 +860,10 @@ def classify_who(who, bot_users=()):
       check                     -> check
       <P-xxxx> <V-xxxxxxxxxx>   -> person       (who shown: the pseudonym)
       owner                     -> person       (local half: the run owner answered in chat; kit/.kiro/steering)
-    each optionally followed by a note in brackets ("agent (A-2)"). Empty -> (None, None). Anything else is
+    each optionally followed by a note in brackets ("agent (A-2)"). Markdown code marks are ignored anywhere in the
+    cell (brain `T-PAY-1-1`: the steering writes entry ids as code). Empty -> (None, None). Anything else is
     ("unclassified", None): not guessed, and not shown (it may be a real name); eval lists where it is."""
-    w = str(who or "").strip().strip("`").strip()
+    w = " ".join(str(who or "").replace("`", " ").split())
     if not w:
         return None, None
     if w.lower() in {b.lower() for b in bot_users}:
@@ -923,8 +1094,9 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
     dec_text = tree.read(dec_path) if dec_path else None
     req_path = docs + "/inception/requirements/requirements.md" if docs else None
 
-    hist = git_history(repo, cfg, rec, ref, key) if branch else {
-        "tip": None, "tip_src": None, "tip_note": None, "default_ref": default_ref(repo, cfg, ref), "merge": None,
+    refs = _refs(repo)
+    hist = git_history(repo, cfg, rec, ref, key, refs) if branch else {
+        "tip": None, "tip_src": None, "tip_note": None, "default_ref": default_ref(repo, cfg, ref, refs), "merge": None,
         "commits": None, "range": None, "handover_commit": None, "park": None}
     if hist["tip"] is None:
         missing.append("run branch %s (not found locally, on origin, or as a merge on the default branch)"
@@ -1129,7 +1301,7 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
         "accepted": accepted,
         "merged_at": merged_at,
         "reverted_or_hotfixed_within_14d": after_merge(repo, cfg, key, merged, hist["commits"], hist["default_ref"],
-                                                       as_of_dt),
+                                                       as_of_dt, refs),
     }
 
     if credits is None:

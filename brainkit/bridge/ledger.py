@@ -9,6 +9,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from datetime import timedelta
 
 from ..common import BrainError, iso, utcnow
@@ -89,23 +90,36 @@ class SharedConnection:
 
 
 class Ledger:
+    # how often, and how long apart, giving a reservation back is tried when sqlite is busy ("database is locked":
+    # another process on this ledger file holds its write lock longer than sqlite's own 5 s wait)
+    RELEASE_TRIES, RELEASE_PAUSE = 3, 1.0
+
     def __init__(self, path):
         d = os.path.dirname(os.path.abspath(path))
         os.makedirs(d, exist_ok=True)
         self.db = SharedConnection(path)
         self.lock = self.db.lock
+        self.sleep = time.sleep
         self.db.executescript(SCHEMA)
 
     def close(self):
         self.db.close()
 
     # handoffs: one row per (MR, head sha)
-    def claim_handoff(self, project, iid, sha) -> bool:
-        """Insert as 'checking'; False if this MR+sha was already seen."""
-        now = iso(utcnow())
+    def claim_handoff(self, project, iid, sha, stale_after=None) -> bool:
+        """Insert as 'checking'; False if this MR+sha was already seen. With `stale_after` (seconds), a 'checking'
+        row older than that was left by a bridge that stopped while checking it: it is taken over (True)."""
+        now = utcnow()
         cur = self.db.execute("INSERT OR IGNORE INTO handoffs(project,iid,sha,state,created,updated) "
-                              "VALUES (?,?,?,?,?,?)", (project, iid, sha, "checking", now, now))
-        return cur.rowcount == 1
+                              "VALUES (?,?,?,?,?,?)", (project, iid, sha, "checking", iso(now), iso(now)))
+        if cur.rowcount == 1:
+            return True
+        if stale_after is None:
+            return False
+        return self.db.execute("UPDATE handoffs SET updated=? WHERE project=? AND iid=? AND sha=? AND "
+                               "state='checking' AND updated<?", (iso(now), project, iid, sha,
+                                                                  iso(now - timedelta(seconds=stale_after)))
+                               ).rowcount == 1
 
     def release_handoff(self, project, iid, sha):
         self.db.execute("DELETE FROM handoffs WHERE project=? AND iid=? AND sha=? AND state='checking'",
@@ -126,11 +140,16 @@ class Ledger:
         n = self.db.execute("SELECT COUNT(*) FROM runs WHERE req=?", (req,)).fetchone()[0]
         return "RUN-%s-%d" % (req, n + 1)
 
-    def open_run_for(self, req):
-        """An open run of `req` (a reservation counts), or None."""
+    def open_run_for(self, req, stale_after=None):
+        """An open run of `req` (a reservation counts), or None. With `stale_after` (seconds), a reservation older
+        than that does not count: a bridge that stopped while signing left it (reserve_run drops it)."""
         states = OPEN_RUN_STATES + (RESERVED,)
         q = "SELECT * FROM runs WHERE req=? AND state IN (%s)" % ",".join("?" * len(states))
-        return self.db.execute(q, (req,) + states).fetchone()
+        args = (req,) + states
+        if stale_after is not None:
+            q += " AND NOT (state=? AND updated<?)"
+            args += (RESERVED, iso(utcnow() - timedelta(seconds=stale_after)))
+        return self.db.execute(q + " ORDER BY created", args).fetchone()
 
     @staticmethod
     def is_reservation_for(row, project, iid, sha) -> bool:
@@ -166,9 +185,27 @@ class Ledger:
                     raise BrainError("ledger: could not reserve a run for %s: %s" % (req, e))
                 raise
 
-    def release_run(self, run_id):
-        """Give a reserved run id back (its contract was not signed)."""
-        self.db.execute("DELETE FROM runs WHERE run_id=? AND state=?", (run_id, RESERVED))
+    def release_run(self, run_id) -> bool:
+        """Give a reserved run id back (its contract was not signed). Never raises (it runs while another error is
+        on its way up): when sqlite stays busy the reservation is left, and counts for nobody once it is stale
+        (open_run_for, reserve_run, drop_stale). False then."""
+        for n in range(self.RELEASE_TRIES):
+            try:
+                self.db.execute("DELETE FROM runs WHERE run_id=? AND state=?", (run_id, RESERVED))
+                return True
+            except sqlite3.Error:
+                if n + 1 < self.RELEASE_TRIES:
+                    self.sleep(self.RELEASE_PAUSE * (n + 1))
+        return False
+
+    def drop_stale(self, stale_after) -> int:
+        """Rows a bridge that stopped mid-way left behind, older than `stale_after` seconds: run reservations and
+        hand-over checks still 'checking' (looked at again next poll). How many were dropped."""
+        cut = iso(utcnow() - timedelta(seconds=stale_after))
+        with self.lock:
+            n = self.db.execute("DELETE FROM runs WHERE state=? AND updated<?", (RESERVED, cut)).rowcount
+            n += self.db.execute("DELETE FROM handoffs WHERE state='checking' AND updated<?", (cut,)).rowcount
+        return n
 
     def add_run(self, run_id, project, req, iid, sha, voucher_id, paths=(), owner="", voucher=None):
         """Record the run as 'spooled': its reservation (reserve_run) when there is one, else a new row."""

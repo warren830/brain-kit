@@ -8,9 +8,11 @@
   brain start <slug> [--key KEY] [--title T] [--doc PATH ...] [--package PKG] [--paths a,b]
                                                   claim (or check the claim), branch, Lean intent, run.json
   brain handoff [--no-push] [--no-label]          publish materials, commit the hand-over, label the MR
-  brain crew-agent [--force]                      install the KiroCrew version of brain-dev (~/.kiro/agents/brain-dev.json)
+                                                  (exit 1: pushed but NOT labelled, nothing handed over)
+  brain crew-agent [--force | --reset]            install the KiroCrew version of brain-dev (~/.kiro/agents/brain-dev.json)
                                                   KiroCrew does not read .kiro/hooks/: Lean's hooks ride on this spec;
-                                                  --force refreshes brain-kit's fields and Lean's hooks, keeps the rest
+                                                  --force adds what is missing (Lean's hooks, absent fields) and keeps
+                                                  your model, tools, resources and prompt; --reset takes brain-kit's
   brain status
   brain lint [--base REF] [--static]              Brain rules; against the merge-base with main by default
   brain entry add|replace|withdraw|same|adds-to|repeat|purge|show ...
@@ -31,6 +33,7 @@ import re
 import shutil
 import stat
 import sys
+import time
 
 from . import __version__, brainlint, claims, config, entries, lean, reflect, runrec, usage
 from .common import (BrainError, JIRA_RE, SLUG_RE, USER_RE, branch_name, git, git_out, iso, load_json,
@@ -366,17 +369,26 @@ def add_lean_hooks(spec, missing) -> dict:
     return spec
 
 
-# brain-dev.json fields brain-kit writes and `brain crew-agent --force` refreshes; any other field (Kiro's own, other
-# tools') and other tools' hooks are left as they are
+# brain-dev.json fields brain-kit writes when they are absent; the owner may set their own (a model their KiroCrew
+# offers, an MCP tool): `brain crew-agent --reset` takes brain-kit's again. Any other field (Kiro's own, other
+# tools') and other tools' hooks are left as they are. What brain-kit enforces is Lean's hooks.
 CREW_OWNED_FIELDS = ("name", "description", "model", "prompt", "tools", "resources")
 
 
-def crew_agent_update(have, ship) -> tuple:
-    """(spec, what differs) to bring an installed brain-dev.json up to brain-kit's: the owned fields from `ship`
-    (not when the installed one has another JSON type: Kiro rewrote it, leave it), and Lean's hooks."""
+def crew_agent_custom(have, ship) -> list:
+    """brain-kit's fields the installed spec sets to its own values (kept unless `--reset`)."""
+    return [k for k in CREW_OWNED_FIELDS if k in ship and k in have and have[k] != ship[k]]
+
+
+def crew_agent_update(have, ship, reset=False) -> tuple:
+    """(spec, what changes) to bring an installed brain-dev.json up to what brain-kit needs: Lean's hooks, and
+    brain-kit's fields where the spec has none. reset=True: brain-kit's fields replace the owner's as well (not
+    when the installed one has another JSON type: Kiro rewrote it, leave it)."""
     new, changed = dict(have), []
     for k in CREW_OWNED_FIELDS:
-        if k not in ship or have.get(k) == ship[k] or (k in have and type(have[k]) is not type(ship[k])):
+        if k not in ship or have.get(k) == ship[k]:
+            continue
+        if k in have and (not reset or type(have[k]) is not type(ship[k])):
             continue
         new[k] = ship[k]
         changed.append(k)
@@ -404,11 +416,16 @@ def crew_checks(repo) -> list:
                 ("FAIL", "KiroCrew brain-dev.json lacks Lean's %s hook(s) as Lean needs them (run `brain crew-agent "
                          "--force`)" % ", ".join(t for t, _ in missing))
             out.append(add)
-            _, changed = crew_agent_update(have, load_json(CREW_AGENT_SRC))
+            ship = load_json(CREW_AGENT_SRC)
+            _, changed = crew_agent_update(have, ship)
             fields = [c for c in changed if c in CREW_OWNED_FIELDS]
             if fields:
-                out.append(("WARN", "KiroCrew brain-dev.json differs from brain-kit's in %s (`brain crew-agent "
-                                    "--force` refreshes them)" % ", ".join(fields)))
+                out.append(("WARN", "KiroCrew brain-dev.json has no %s (`brain crew-agent --force` adds brain-kit's)"
+                                    % ", ".join(fields)))
+            custom = crew_agent_custom(have, ship)
+            if custom:
+                out.append(("OK", "KiroCrew brain-dev uses your own %s (`brain crew-agent --reset` takes brain-kit's)"
+                                  % ", ".join(custom)))
         except ValueError:
             out.append(("FAIL", "~/.kiro/agents/brain-dev.json is not valid JSON"))
     if not os.path.exists(os.path.join(repo, CREW_HOOK)):
@@ -431,15 +448,20 @@ def cmd_crew_agent(a):
             raise BrainError("%s is not valid JSON; fix or remove it by hand" % p)
         if not isinstance(have, dict):
             raise BrainError("%s is not an agent spec (a JSON object); fix or remove it by hand" % p)
-        new, changed = crew_agent_update(have, ship)
+        reset = getattr(a, "reset", False)
+        new, changed = crew_agent_update(have, ship, reset=reset)
+        custom = [] if reset else crew_agent_custom(have, ship)
+        kept = (" Your own %s stay (`brain crew-agent --reset` takes brain-kit's)." % ", ".join(custom)) if custom \
+            else ""
         if not changed:
-            print("%s is up to date (Lean's hooks included)." % p)
+            print("%s is up to date (Lean's hooks included).%s" % (p, kept))
             return 0
-        if not a.force:
-            raise BrainError("%s differs from brain-kit's brain-dev in: %s. Rerun with --force to refresh them "
-                             "(other tools' hooks and other settings stay)" % (p, ", ".join(changed)))
+        if not (a.force or reset):
+            raise BrainError("%s lacks %s. Rerun with --force to add them (your model, tools, resources, prompt and "
+                             "other tools' hooks stay)" % (p, ", ".join(changed)))
         write_json(p, new)
-        print("Refreshed %s: %s; other tools' hooks and other settings kept." % (p, ", ".join(changed)))
+        print("%s %s: %s; other tools' hooks and other settings kept.%s"
+              % ("Reset" if reset else "Updated", p, ", ".join(changed), kept))
         return 0
     os.makedirs(os.path.dirname(p), exist_ok=True)
     write_json(p, ship)
@@ -526,9 +548,15 @@ def cmd_start(a):
                 raise BrainError("%s is claimed by %s" % (key, doc.get("owner")))
             if doc and doc.get("closed"):
                 raise BrainError("%s is closed (%s)" % (key, (doc["closed"] or {}).get("reason", "")))
-            bad = intents.doc_problems(doc) if intents.is_intent(doc) else []
+            # a malformed claim is refused; content today's rules flag in text accepted when it was filed (it is
+            # on the claim branch already) is shown, not refused
+            bad = intents.doc_problems(doc, content=False) if intents.is_intent(doc) else []
             if bad:
                 raise BrainError("claim/%s: %s" % (key, "; ".join(bad)))
+            for w in (intents.doc_problems(doc) if intents.is_intent(doc) else []):
+                if w not in bad:
+                    print("WARN: claim/%s: %s (filed before this rule; check runs/%s/%s before you hand over)"
+                          % (key, w, key, intents.INTENT_MD))
         key = _claim(repo, cfg, me, key, a.title or (doc or {}).get("title") or slug.replace("-", " "))
         checked = True
     title = a.title or (doc or {}).get("title") or slug.replace("-", " ")
@@ -623,10 +651,13 @@ def _label_check(gl, project, iid, sha, timeout=None):
     is still `sha`. Otherwise (why, mr or None). The bridge hands over the MR head it sees when the label lands, so
     only the commit this command pushed is labelled: if someone pushed on top of it, the label would hand over
     their commit under the owner's name."""
-    import time
     from .rest import head_pushed_at
-    timeout = float(os.environ.get("BRAIN_MR_VERSION_WAIT", "60")) if timeout is None else timeout
-    deadline = time.time() + timeout
+    if timeout is None:
+        try:
+            timeout = max(0.0, float(os.environ.get("BRAIN_MR_VERSION_WAIT", "60")))
+        except ValueError:
+            timeout = 60.0
+    deadline = time.monotonic() + timeout
     while True:
         try:
             recorded = head_pushed_at(gl.mr_versions(project, iid), sha) is not None
@@ -638,9 +669,10 @@ def _label_check(gl, project, iid, sha, timeout=None):
                 return "", mr
             return ("the MR head is now %s, not %s which this hand-over pushed: someone pushed to the branch after "
                     "you" % (str(mr.get("sha") or "?")[:12], sha[:12])), mr
-        if time.time() >= deadline:
+        left = deadline - time.monotonic()
+        if left <= 0:
             return "GitLab has not recorded the push of %s on the MR within %ds" % (sha[:12], timeout), None
-        time.sleep(2)
+        time.sleep(min(2.0, left))
 
 
 def _label_names(mr) -> list:
@@ -705,10 +737,11 @@ def cmd_handoff(a):
     label = cfg["handoff_label"]
     why, now = _label_check(gl, proj, mr["iid"], head)
     if why:
+        # exit 1: nothing was handed over (a caller going by the exit status must not take it for a hand-over)
         print("Pushed %s, but NOT labelled MR !%s: %s.\nNothing was handed over. Look at the MR: if its latest version "
               "is %s and nothing came after it, add the label '%s' by hand; if someone pushed on top, pull, look at "
               "their commit and run `brain handoff` again." % (head[:12], mr["iid"], why, head[:12], label))
-        return 0
+        return 1
     if label in _label_names(now):
         # GitLab records no event when a label the MR already has is added again; the bridge would see the old one
         gl.edit_labels(proj, mr["iid"], remove=[label])
@@ -1042,7 +1075,8 @@ def main(argv=None):
     s.add_argument("--store")
     s.set_defaults(fn=cmd_handoff)
     s = sub.add_parser("crew-agent")
-    s.add_argument("--force", action="store_true")
+    s.add_argument("--force", action="store_true", help="add Lean's hooks and absent fields; keep your settings")
+    s.add_argument("--reset", action="store_true", help="take brain-kit's model, tools, resources and prompt too")
     s.set_defaults(fn=cmd_crew_agent)
     sub.add_parser("status").set_defaults(fn=cmd_status)
     s = sub.add_parser("lint")

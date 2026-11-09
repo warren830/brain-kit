@@ -66,9 +66,14 @@ Write `runs/<KEY>/park.json` and nothing else for the question:
 
 ## 6. Done
 When checks pass and review is done: make sure every rejected or corrected decision has a proposal (reflect
-warns about rejections nobody wrote down), then run `lean release`, fill in its Open items, run `lean request RELEASE`, then park
+warns about rejections nobody wrote down), then run `lean release`, fill in its Open items, run `lean request RELEASE`.
+Then write the MR description: `brain mr-desc --write` writes `runs/<KEY>/MR.md` from the records (what changed, AC
+evidence, decisions, assumptions, approvals, how to review). It is generated, never written or edited by you: if it
+reads wrong, fix the record it came from (requirements.md, the plan's Tests table, decisions.md, release.md) and run
+it again. Commit MR.md with the work. If `brain mr-desc --write` refuses because `runs/` counts as code in
+`aidlc-docs/lean.json`, do not work around it: say so in the acceptance question and go on without MR.md. Then park
 for acceptance: `"kind": "acceptance", "options": [], "lean_request": "RELEASE <hash>"`, with the AC ids the acceptor
-should look at in the question, and `review_items`: every decision you took yourself (decisions.md rows with
+should look at and the line `变更说明见 runs/<KEY>/MR.md` in the question, and `review_items`: every decision you took yourself (decisions.md rows with
 `Who` = `agent`) and every assumption `A-n` from requirements.md, each with its id and one line (at most 200
 characters, no line breaks):
 ```json

@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -157,10 +158,15 @@ class World:
             return (200, p.stdout) if p.returncode == 0 else (404, {"message": "404"})
 
         def commit(m, qy, b):
-            p = subprocess.run(["git", "-C", self.origin, "rev-list", "--parents", "-n", "1", m.group(1)],
-                               capture_output=True, text=True)
-            ids = p.stdout.split()
-            return (200, {"id": ids[0], "parent_ids": ids[1:]}) if p.returncode == 0 and ids else (404, {})
+            # as GitLab's commit API shows it: id, parent_ids, author_* and committer_* (name, email)
+            p = subprocess.run(["git", "-C", self.origin, "log", "-1", "--format=%H %P%x00%an%x00%ae%x00%cn%x00%ce",
+                                m.group(1)], capture_output=True, text=True)
+            if p.returncode != 0 or not p.stdout.strip():
+                return 404, {}
+            ids, an, ae, cn, ce = p.stdout.rstrip("\n").split("\0")
+            ids = ids.split()
+            return 200, {"id": ids[0], "parent_ids": ids[1:], "author_name": an, "author_email": ae,
+                         "committer_name": cn, "committer_email": ce}
 
         def note(m, qy, b):
             n = {"id": 2000 + len(self.notes), "body": b["body"], "author": {"username": "brain-bridge"},
@@ -254,7 +260,7 @@ class HandoffLabelsWhatItPushed(unittest.TestCase):
     def check_foreign_push(self):
         rc, out = brain(self.repo, "handoff")
         pushed = sh("git", "-C", self.repo, "rev-parse", "HEAD").stdout.strip()
-        self.assertEqual(rc, 0, out)
+        self.assertEqual(rc, 1, out)                        # R2 #22: nothing was handed over, so not exit 0
         self.assertNotEqual(self.world.head(), pushed)
         self.assertNotIn("ai-handoff", self.world.labels, out)
         self.assertIn("NOT labelled", out)
@@ -266,15 +272,15 @@ class HandoffLabelsWhatItPushed(unittest.TestCase):
         self.assertIn("someone pushed", self.check_foreign_push())
 
     def test_the_wait_timing_out_does_not_label(self):
-        env(self, BRAIN_MR_VERSION_WAIT="1")
+        env(self, BRAIN_MR_VERSION_WAIT="0")                # the wait ends at once (not a second of wall time)
         self.world.concurrent_push, self.world.push_first = self.push_by_another_person, True
         self.check_foreign_push()
 
     def test_no_version_for_the_push_within_the_wait_does_not_label(self):
-        env(self, BRAIN_MR_VERSION_WAIT="1")
+        env(self, BRAIN_MR_VERSION_WAIT="0")
         self.world.record = lambda: None                    # GitLab is slow to record the push
         rc, out = brain(self.repo, "handoff")
-        self.assertEqual(rc, 0, out)
+        self.assertEqual(rc, 1, out)
         self.assertIn("has not recorded", out)
         self.assertNotIn("ai-handoff", self.world.labels)
 
@@ -589,8 +595,12 @@ class SpoolSignerConfig(unittest.TestCase):
         self.assertIn("allowed_signers", str(e.exception))
         with open(os.path.join(self.d, "ids.json"), "w") as f:
             f.write('{"users": {}}')
-        with self.assertRaises(BrainError) as e:                              # the bridge does not start on it
-            Bridge(cfg, None, None, out=lambda *_: None)
+        # R2 #27: the bridge starts on it (report, dispatch and reconcile never sign); its signer still refuses to
+        # take any signature while the file is not there
+        br = Bridge(cfg, None, None, out=lambda *_: None)
+        with self.assertRaises(BrainError) as e:
+            br.signer.sign(v)
+        self.assertNotIsInstance(e.exception, sign.SignerRefused)
         self.assertIn("no-such-file", str(e.exception))
 
     def test_timeout_or_poll_that_is_not_a_number(self):
@@ -749,11 +759,16 @@ class PreToolUseMustSeeEveryTool(unittest.TestCase):
         lean_pre = [h for h in have["hooks"] if cli.CREW_HOOK in json.dumps(h) and h["trigger"] == "preToolUse"]
         self.assertEqual([h.get("matcher") for h in lean_pre], ["*"])        # the narrow one is gone
 
-    def test_force_refreshes_an_outdated_spec(self):
+    def test_reset_takes_brain_kits_fields_force_keeps_the_owners(self):
+        """R2 #29: the owner's model and prompt are theirs; Lean's hooks are what brain-kit enforces."""
         ship = load_json(cli.CREW_AGENT_SRC)
         old = dict(ship, prompt="an old prompt", model="old-model", extra={"kept": True})
-        self.assertEqual(self.crew(old)[0], 2)                               # outdated: says so, changes nothing
+        rc, have, out = self.crew(old)
+        self.assertEqual((rc, have), (0, old))                               # all hooks there: nothing to do
+        self.assertIn("--reset", out)                                        # and it says how to take brain-kit's
         rc, have, _ = self.crew(old, "--force")
+        self.assertEqual((rc, have), (0, old))
+        rc, have, _ = self.crew(old, "--reset")
         self.assertEqual(rc, 0)
         self.assertEqual((have["prompt"], have["model"], have["extra"]),
                          (ship["prompt"], ship["model"], {"kept": True}))
@@ -786,6 +801,11 @@ def slow_service(spool, key, stop, delay):
 
 @unittest.skipUnless(sign.available(), "ssh-keygen not found")
 class LateSignatureIsUsed(unittest.TestCase):
+    """The signing service answers after the bridge stopped waiting (it waits 0.3 s; the service answers no sooner
+    than 0.6 s after it sees the request, however slow ssh-keygen is). The next round must use that late answer.
+    Nothing here depends on how long a step takes (R2 #38): the test waits for the signed file to appear, and the
+    bridge's clock is moved on by hand between rounds (a new round is a later time, so a new voucher would differ)."""
+
     def setUp(self):
         t = self.t = fixture(self)
         self.spool = os.path.join(t.d, "signer-spool")
@@ -798,10 +818,23 @@ class LateSignatureIsUsed(unittest.TestCase):
         self.addCleanup(th.join)
         self.addCleanup(stop.set)
         t.bridge = t.new_bridge()
+        self.offset = [0]
+        real = decisions.utcnow
+        for mod in (handoff, decisions):
+            patcher = mock.patch.object(mod, "utcnow", lambda: real() + timedelta(seconds=self.offset[0]))
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def signed(self):
         d = os.path.join(self.spool, "signed")
         return os.listdir(d) if os.path.isdir(d) else []
+
+    def next_round(self, want_signed):
+        """Wait (up to a minute) until the service has answered `want_signed` requests; then a later round."""
+        deadline = time.monotonic() + 60
+        while len(self.signed()) < want_signed and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.offset[0] += 5
 
     def test_handoff(self):
         t, outcomes = self.t, []
@@ -810,7 +843,7 @@ class LateSignatureIsUsed(unittest.TestCase):
                 outcomes.append(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5]))
             except sign.SignerUnavailable:
                 outcomes.append("unavailable")
-            time.sleep(1.1)                                  # the next round is a later second
+            self.next_round(1)
         self.assertEqual(outcomes, ["unavailable", "accepted", "seen"])
         self.assertEqual(len(self.signed()), 1)
 
@@ -823,7 +856,7 @@ class LateSignatureIsUsed(unittest.TestCase):
         t.bridge.watch()
         t.reply(5, "alice", "answer D-1 A")
         self.assertEqual(t.bridge.collect(), 0)              # the signer is late
-        time.sleep(1.0)
+        self.next_round(1)
         self.assertEqual(t.bridge.collect(), 1)              # its late signature is used
         self.assertEqual(len(self.signed()), 1)
 

@@ -180,13 +180,26 @@ def _signer_cfg(cfg) -> dict:
     return {"type": s} if isinstance(s, str) else dict(s) if isinstance(s, dict) else {"type": repr(s)}
 
 
+def seconds(x, default=None):
+    """A number of seconds > 0 as a float: an int or float, or a string that spells one ("30", " 2.5 "), as
+    c9e59d1 read signer.timeout with float(). `default` for anything else (a bool, NaN, "30s", a tuple)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float, str)):
+        return default
+    try:
+        f = float(x.strip() if isinstance(x, str) else x)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return f if math.isfinite(f) and f > 0 else default
+
+
 def _seconds(x) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
+    return seconds(x) is not None
 
 
 def signer_problems(cfg) -> list:
     """What is wrong with the signing part of a bridge config (`signing_key`, `signer`). Files are not looked at here
-    (signer_file_problems)."""
+    (signer_file_problems; a spool signer checks its allowed_signers each time it signs, so commands that never
+    sign - report, dispatch, reconcile - run while the signing service's public key is being deployed)."""
     s = _signer_cfg(cfg)
     kind = s.get("type") or "key"
     if kind not in SIGNER_TYPES:
@@ -229,5 +242,5 @@ def signer_from_config(cfg):
         return KeySigner(s.get("key") or cfg.get("signing_key", ""))
     if p:
         raise BrainError("bridge config: " + "; ".join(p))
-    return SpoolSigner(s["spool_dir"], s["allowed_signers"], timeout=float(s.get("timeout", 30)),
-                       poll=float(s.get("poll", 0.25)))
+    return SpoolSigner(s["spool_dir"], s["allowed_signers"], timeout=seconds(s.get("timeout", 30), 30.0),
+                       poll=seconds(s.get("poll", 0.25), 0.25))

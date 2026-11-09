@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -27,6 +28,42 @@ HIDDEN = ("import unittest\nfrom calc import add\n\n\nclass H(unittest.TestCase)
           "    def test_d(self):\n        self.assertEqual(add(2, 2), 4)\n")
 PATCHED = ["import unittest", "from calc import add", "", "", "class P(unittest.TestCase):",
            "    def test_neg(self):", "        self.assertEqual(add(-2, -3), -5)"]
+
+
+def ceiling_at_the_temp_root():
+    """Snapshots are refused below any git work tree, so with TMPDIR inside a checkout (a CI job) every snapshot in
+    these tests would be. GIT_CEILING_DIRECTORIES at the temp root (which the check honours) keeps git from looking
+    above it: the tests do not depend on where TMPDIR is. Returns the old value, for restore_ceiling()."""
+    old = os.environ.get("GIT_CEILING_DIRECTORIES")
+    tmp = os.path.realpath(tempfile.gettempdir())
+    os.environ["GIT_CEILING_DIRECTORIES"] = os.pathsep.join(x for x in (tmp, old) if x)
+    return old
+
+
+def restore_ceiling(old):
+    if old is None:
+        os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+    else:
+        os.environ["GIT_CEILING_DIRECTORIES"] = old
+
+
+_OLD_CEILING = []
+
+
+def setUpModule():
+    _OLD_CEILING.append(ceiling_at_the_temp_root())
+
+
+def tearDownModule():
+    restore_ceiling(_OLD_CEILING.pop())
+
+
+class ClassScope:
+    """Lets the helpers that take a test (tmpdir, make_repo) clean up at the end of the class instead: one repo per
+    class, not per test (each repo is a few git commands)."""
+
+    def __init__(self, cls):
+        self.addCleanup = cls.addClassCleanup
 
 
 def entry(eid, etype, side, text):
@@ -102,8 +139,9 @@ def make_task(root, tid, base, **over):
 
 
 class Snapshot(unittest.TestCase):
-    def setUp(self):
-        self.d, self.repo, self.base = make_repo(self)
+    @classmethod
+    def setUpClass(cls):
+        cls.d, cls.repo, cls.base = make_repo(ClassScope(cls))      # the tests only read it
 
     def test_full_snapshot_is_clean(self):
         out = os.path.join(self.d, "snap")
@@ -204,9 +242,10 @@ class Tasks(unittest.TestCase):
 
 
 class Score(unittest.TestCase):
-    def setUp(self):
-        self.d, self.repo, self.base = make_repo(self)
-        self.task = G.load_task(make_task(self.d, "G-1", self.base))
+    @classmethod
+    def setUpClass(cls):
+        cls.d, cls.repo, cls.base = make_repo(ClassScope(cls))      # each test scores its own snapshot
+        cls.task = G.load_task(make_task(cls.d, "G-1", cls.base))
 
     def workdir(self, name, calc):
         out = os.path.join(self.d, name)

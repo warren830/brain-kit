@@ -1,11 +1,13 @@
 """QA findings on the Run Trace and Eval (brainkit/trace.py, brainkit/evaluate.py, brain eval gaps --file), ported
 from the reviewer's qa_findings suite. Each test names its finding (N1 ...); the docstring says what was wrong.
 Everything is local: temp git repos, a sqlite ledger and voucher files on disk."""
+import atexit
 import contextlib
 import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import unittest
@@ -20,6 +22,7 @@ from brainkit.bridge.ledger import Ledger  # noqa: E402
 from brainkit.commands import eval_cmd  # noqa: E402
 from brainkit.common import iso, utcnow, write_json  # noqa: E402
 from tests.helpers import sh, tmpdir  # noqa: E402
+from tests.test_trace import git_repo  # noqa: E402
 
 BOT = "brain-bot@noreply.invalid"
 KIT = {"version": 1, "req_prefix": "PAY", "bot_users": ["brain-bot"], "bot_emails": [BOT], "tracker": "none"}
@@ -66,10 +69,7 @@ class World:
     def __init__(self, test):
         self.d = tmpdir(test)
         self.repo = os.path.join(self.d, "proj")
-        os.makedirs(self.repo)
-        sh("git", "init", "-q", "-b", "main", self.repo)
-        for k, v in (("user.name", "t"), ("user.email", "t@example.com"), ("commit.gpgsign", "false")):
-            sh("git", "-C", self.repo, "config", k, v)
+        git_repo(self.repo)                      # no hooks, no background maintenance: see there
         self.commit({".brain/kit.json": json.dumps(KIT), "brain/TECH.md": TECH, "brain/PRODUCT.md": PRODUCT,
                      "README.md": "x\n"}, "init", "2026-10-01T00:00:00Z", "lead@example.com")
         self.vouchers = os.path.join(self.d, "vouchers")
@@ -183,14 +183,47 @@ class World:
     def voucher(self, run_id, doc):
         write_json(os.path.join(self.vouchers, run_id, doc["voucher_id"] + ".json"), {"voucher": doc, "sig": "x"})
 
+    def copy(self, test):
+        """A World of the test's own: a copy of this one's directory (a copied git repo is a repo of its own)."""
+        w = World.__new__(World)
+        w.d = tmpdir(test)
+        shutil.copytree(self.d, w.d, symlinks=True, dirs_exist_ok=True)
+        w.repo, w.vouchers, w.ledger_path = (os.path.join(w.d, os.path.relpath(x, self.d))
+                                             for x in (self.repo, self.vouchers, self.ledger_path))
+        w._ledger = None
+        return w
+
+
+class _Keep:
+    """A home for World directories that outlive one test (removed when the interpreter exits)."""
+
+    def addCleanup(self, fn, *args, **kw):
+        atexit.register(fn, *args, **kw)
+
+
+_TEMPLATES = {}
+
+
+def base_run(test, **kw):
+    """(World, run info) of the test's own: run PAY-1 (refund, day 2; the runner's RELEASE approval, plus `kw` for
+    World.run), left on its run branch. Each variant is made once and copied for every test that asks for it."""
+    k = json.dumps(kw, sort_keys=True)
+    if k not in _TEMPLATES:
+        w = World(_Keep())
+        _TEMPLATES[k] = (w, w.run("PAY-1", "refund", 2, runner_events=[release()], **kw))
+    w, r = _TEMPLATES[k]
+    return w.copy(test), dict(r)
+
 
 def run_cli(repo, args, env=None):
-    """`brain <args>` in-process with cwd = repo: (exit code, stdout, stderr)."""
+    """`brain <args>` in-process with cwd = repo: (exit code, stdout, stderr). The intake store is one that does not
+    exist next to the repo (unless env names one): the developer's own ~/.brain/intake is never read."""
     old_cwd, old_env = os.getcwd(), dict(os.environ)
     out, err = io.StringIO(), io.StringIO()
     try:
         os.chdir(repo)
         os.environ.pop("GITLAB_TOKEN", None)
+        os.environ["BRAIN_INTAKE_DIR"] = os.path.join(os.path.dirname(os.path.abspath(repo)), "no-intake")
         os.environ.update(env or {})
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             try:
@@ -220,8 +253,7 @@ class BranchAndMerge(unittest.TestCase):
     def test_n1_owner_clone_gives_the_same_trace_as_a_teammate_clone(self):
         """N1: the owner's stale local run branch (still at the hand-over commit) hid the runner's commits, a
         person's push and the park question: autonomy differed by machine."""
-        w = World(self)
-        r = w.run("PAY-1", "refund", 2, runner_events=[release()], person_after_handover=True, park=PARK)
+        w, r = base_run(self, person_after_handover=True, park=PARK)
         handover = w.git("log", "--format=%H", "--grep=PAY-1: hand off", r["branch"]).stdout.split()[0]
         w.merge(r, "merge", date="2026-11-03T00:00:00Z")
         w.git("branch", "-q", "-D", r["branch"])                       # a teammate's clone
@@ -263,8 +295,7 @@ class BranchAndMerge(unittest.TestCase):
         """N6: a squash merge with the branch still present was 'not merged' (merge_of needs ancestry)."""
         for delete in (True, False):
             with self.subTest(deleted=delete):
-                w = World(self)
-                r = w.run("PAY-1", "refund", 2, runner_events=[release()])
+                w, r = base_run(self)
                 w.merge(r, "squash", date="2026-11-03T00:00:00Z", delete_branch=delete)
                 t = trace.build(w.repo, w.cfg(), "PAY-1", as_of=AS_OF)
                 self.assertEqual(t["outcome"]["merged_at"]["value"], "2026-11-03T00:00:00Z", t["outcome"]["merged_at"])
@@ -277,8 +308,7 @@ class BranchAndMerge(unittest.TestCase):
     def test_n6_rebase_merge_with_the_old_branch_left(self):
         """N6: GitLab rebased the branch on the server (new commits on main, the local branch keeps the old ones):
         matched by patch-id; the merge is the last rebased commit, and none of them is a hotfix."""
-        w = World(self)
-        r = w.run("PAY-1", "refund", 2, runner_events=[release()])
+        w, r = base_run(self)
         w.commit({"src/fix.py": "y\n"}, "PAY-1: fix failing test", "2026-11-02T08:00:00Z", BOT)   # in the run
         handover = w.git("log", "--format=%H", "--grep=PAY-1: hand off", r["branch"]).stdout.split()[0]
         w.git("switch", "-q", "main")
@@ -605,11 +635,15 @@ class Gaps(unittest.TestCase):
 
 
 class BadInput(unittest.TestCase):
-    def setUp(self):
-        self.w = World(self)
+    @classmethod
+    def setUpClass(cls):
+        cls.template = World(_Keep())
         for n, day in enumerate((2, 4), 1):
-            r = self.w.run("PAY-%d" % n, "s%d" % n, day)
-            self.w.merge(r, "merge", date="2026-11-%02dT12:00:00Z" % (day + 1))
+            r = cls.template.run("PAY-%d" % n, "s%d" % n, day)
+            cls.template.merge(r, "merge", date="2026-11-%02dT12:00:00Z" % (day + 1))
+
+    def setUp(self):
+        self.w = self.template.copy(self)                  # two merged runs, the test's own copy
 
     def test_n25_eval_survives_a_run_json_with_conflict_markers(self):
         """N25: one malformed run.json aborted the whole `brain eval` / `eval gaps`."""
@@ -639,8 +673,7 @@ class BadInput(unittest.TestCase):
 class NoDeprecationWarnings(unittest.TestCase):
     def test_m1_trace_and_eval_raise_no_deprecation_warning(self):
         """M1: Python 3.12 with -W error must not fail on a DeprecationWarning (datetime.utcnow() and the like)."""
-        w = World(self)
-        r = w.run("PAY-1", "refund", 2, runner_events=[release()])
+        w, r = base_run(self)
         w.merge(r, "merge", date="2026-11-03T00:00:00Z")
         with warnings.catch_warnings():
             warnings.simplefilter("error", DeprecationWarning)
@@ -651,10 +684,6 @@ class NoDeprecationWarnings(unittest.TestCase):
             EV.gaps(d)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class WhoOwnerIsAPerson(unittest.TestCase):
     """The local half's steering lets the owner's chat answers be recorded as Who = owner."""
 
@@ -663,3 +692,7 @@ class WhoOwnerIsAPerson(unittest.TestCase):
         self.assertEqual(trace.classify_who("owner"), ("person", "owner"))
         self.assertEqual(trace.classify_who("Owner (chat)"), ("person", "owner"))
         self.assertEqual(trace.classify_who("owner, carol")[0], "unclassified")
+
+
+if __name__ == "__main__":
+    unittest.main()

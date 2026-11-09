@@ -233,6 +233,78 @@ class GitLab(Rest):
     def commit_exists(self, project, sha):
         return self.commit(project, sha) is not None
 
+    # ---------- GraphQL (what REST does not show) ----------
+
+    def graphql_url(self) -> str:
+        root = self.base[:-len("/api/v4")] if self.base.endswith("/api/v4") else self.base
+        return root + "/api/graphql"
+
+    def graphql(self, query, variables=None):
+        """POST <base>/api/graphql with the same token and transport as REST. The response's "data", or BrainError
+        (HTTP error, GraphQL errors, no data): a caller that cannot read it must fail closed."""
+        headers = dict(self.headers, **{"Content-Type": "application/json"})
+        body = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
+        status, payload = self.transport("POST", self.graphql_url(), headers, body)
+        if status != 200:
+            raise HttpError(status, "POST /api/graphql -> HTTP %d: %s"
+                            % (status, (payload or b"")[:300].decode("utf-8", "replace")))
+        try:
+            doc = json.loads((payload or b"").decode("utf-8"))
+        except ValueError:
+            raise BrainError("POST /api/graphql returned non-JSON")
+        if not isinstance(doc, dict):
+            raise BrainError("POST /api/graphql returned no object")
+        errs = doc.get("errors")
+        if errs:
+            first = errs[0] if isinstance(errs, list) and errs else errs
+            msg = first.get("message") if isinstance(first, dict) else first
+            raise BrainError("GitLab GraphQL: %s" % " ".join(str(msg).split())[:300])
+        if not isinstance(doc.get("data"), dict):
+            raise BrainError("GitLab GraphQL returned no data")
+        return doc["data"]
+
+    NOTE_EDITS_QUERY = (
+        "query($path: ID!, $iid: String!, $after: String) { project(fullPath: $path) { mergeRequest(iid: $iid) { "
+        "notes(first: 100, after: $after) { pageInfo { hasNextPage endCursor } "
+        "nodes { id author { username } lastEditedAt lastEditedBy { username } } } } } }")
+
+    def note_edits(self, project, iid, max_pages=20) -> dict:
+        """{note id: {"author", "last_edited_at", "last_edited_by"}} for the MR's notes, from GitLab GraphQL
+        (Note.lastEditedAt / lastEditedBy). Measured on gitlab.aws.dev 2026-11-09: lastEditedBy names the editor only
+        when a note's text was edited (by its author, or by a Maintainer or admin editing someone else's note; ticking
+        a task-list box is a text edit); an award emoji moves updated_at and lastEditedAt but leaves lastEditedBy
+        empty, and an untouched note has lastEditedAt equal to its creation time. Use lastEditedBy, not lastEditedAt.
+        BrainError when GitLab does not answer (callers fail closed)."""
+        path = str(project)
+        if path.isdigit():                      # GraphQL takes the project's full path, not its id
+            path = str((self.project(project) or {}).get("path_with_namespace") or "")
+            if not path:
+                raise BrainError("GitLab shows no path for project %s" % project)
+        out, after = {}, None
+        for _ in range(max_pages):
+            data = self.graphql(self.NOTE_EDITS_QUERY, {"path": path, "iid": str(int(iid)), "after": after})
+            mr = ((data.get("project") or {}).get("mergeRequest")) if isinstance(data.get("project"), dict) else None
+            notes = (mr or {}).get("notes") if isinstance(mr, dict) else None
+            if not isinstance(notes, dict) or not isinstance(notes.get("nodes"), list):
+                raise BrainError("GitLab GraphQL shows no notes for %s!%s" % (project, iid))
+            for n in notes["nodes"]:
+                nid = _gid_number(n.get("id")) if isinstance(n, dict) else None
+                if nid is None:
+                    continue
+                by = n.get("lastEditedBy")
+                out[nid] = {"author": str(((n.get("author") or {}).get("username")) or "").lower(),
+                            "last_edited_at": n.get("lastEditedAt") or None,
+                            "last_edited_by": str(by.get("username") or "").lower() or None
+                            if isinstance(by, dict) else None}
+            info = notes.get("pageInfo") or {}
+            if not info.get("hasNextPage"):
+                return out
+            after = info.get("endCursor")
+            if not after:
+                break
+        raise BrainError("too many notes on %s!%s for GraphQL (more than %d pages): not read" % (project, iid,
+                                                                                               max_pages))
+
 
 class Jira(Rest):
     """Jira REST (Server/DC api 2 by default; Cloud works with api 3 for these reads)."""
@@ -254,6 +326,12 @@ class Jira(Rest):
 
     def comment(self, key, text):
         return self.call("POST", "/issue/%s/comment" % q(key), body={"body": text})
+
+
+def _gid_number(gid):
+    """The number of a GitLab global id: gid://gitlab/Note/123 (also DiscussionNote, DiffNote) -> 123."""
+    m = re.match(r"^gid://gitlab/[A-Za-z:]+/([1-9][0-9]*)$", str(gid or ""))
+    return int(m.group(1)) if m else None
 
 
 def jira_user_id(user) -> str:

@@ -22,6 +22,7 @@ from brainkit import golden as G  # noqa: E402
 from brainkit.common import JIRA_RE, BrainError  # noqa: E402
 from brainkit.intake import checks  # noqa: E402
 from tests.helpers import commit_file, git_repo, sh, tmpdir  # noqa: E402
+from tests.test_golden import ceiling_at_the_temp_root, restore_ceiling  # noqa: E402
 
 PY = sys.executable
 KIT = {"version": 1, "req_prefix": "PAY", "bot_users": ["brain-bot"], "tracker": "none"}
@@ -30,6 +31,17 @@ TECH = ("# TECH\n\n<!-- id:T-PAY-1-1 type:pitfall side:builder rel:new src:D-1 -
         "<!-- id:T-PAY-1-2 type:pitfall side:builder rel:new src:D-1 -->\n%s\n" % RULE)
 PRODUCT = "# PRODUCT\n\n<!-- id:P-PAY-1-1 type:model side:product rel:new src:D-1 -->\n**退款单**：一次退款的记录。\n"
 PASSWORD_LINE = "DB_" + "PASSWORD=" + "supersecret"           # runtime: no secret-shaped literal in the source
+
+
+_OLD_CEILING = []
+
+
+def setUpModule():
+    _OLD_CEILING.append(ceiling_at_the_temp_root())    # the golden tests do not depend on where TMPDIR is
+
+
+def tearDownModule():
+    restore_ceiling(_OLD_CEILING.pop())
 
 
 def run_cli(repo, args, env=None):
@@ -253,6 +265,7 @@ class N4EnvFiles(unittest.TestCase):
 
     def test_password_assignment_refuses_the_snapshot(self):
         real = G._extract
+        d, repo = project(self)                          # one repo: the file is written in after extraction
         for rel, text, refused in (("deploy/app.env", PASSWORD_LINE + "\n", True),
                                    ("deploy/run.sh", "export " + PASSWORD_LINE + "\n", True),
                                    ("config/app.yml", 'SECRET_KEY: "' + "abc" + 'defghij"\n', True),
@@ -267,8 +280,7 @@ class N4EnvFiles(unittest.TestCase):
                 os.makedirs(os.path.dirname(p), exist_ok=True)
                 with open(p, "w") as f:
                     f.write(text)
-            d, repo = project(self)
-            out = os.path.join(d, "snap")
+            out = os.path.join(d, "snap-" + rel.replace("/", "-"))
             with self.subTest(rel), mock.patch.object(G, "_extract", extract):
                 if refused:
                     with self.assertRaises(BrainError) as cm:

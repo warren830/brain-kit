@@ -32,12 +32,22 @@ def tmpdir(test):
     return os.path.realpath(d)
 
 
+def no_hooks_config(path):
+    """Config lines for a throwaway test repo: no hooks (a machine-wide core.hooksPath such as a secret scanner costs
+    about 0.5 s per commit; these repos hold made-up data and are deleted after the test) and no background
+    maintenance. The user chose this as the default (2026-11-09); BRAIN_TEST_KEEP_HOOKS=1 keeps the hooks."""
+    if os.environ.get("BRAIN_TEST_KEEP_HOOKS") == "1":
+        return ""
+    empty = os.path.join(path, ".git", "no-hooks")
+    os.makedirs(empty, exist_ok=True)
+    return "[core]\n\thooksPath = %s\n[maintenance]\n\tauto = false\n[gc]\n\tauto = 0\n" % empty.replace("\\", "/")
+
+
 def git_repo(path):
     os.makedirs(path, exist_ok=True)
     sh("git", "init", "-q", "-b", "main", path)
-    sh("git", "-C", path, "config", "user.name", "t")
-    sh("git", "-C", path, "config", "user.email", "t@example.com")
-    sh("git", "-C", path, "config", "commit.gpgsign", "false")
+    with open(os.path.join(path, ".git", "config"), "a", encoding="utf-8") as f:
+        f.write("[user]\n\tname = t\n\temail = t@example.com\n[commit]\n\tgpgsign = false\n" + no_hooks_config(path))
     return path
 
 

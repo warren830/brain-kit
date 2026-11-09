@@ -4,7 +4,10 @@
   2. classification    given by the person; a stronger marker found in the file wins; 'unsure' = confidential;
                        confidential needs intake.allow_confidential (decision 02); secret is refused
   3. business items    amounts, company names, contract numbers: listed; the person chooses keep or mask
-  4. personal data     always masked; more than intake.bulk_pii_limit hits in one file refuses that file
+  4. personal data     masked: a value found by its form (ID, phone, card, email) everywhere in the package, a name
+                       found next to a label or in a name column where it was found; more than
+                       intake.bulk_pii_limit hits in one file refuses that file. What may be a name or a password but
+                       may as well be a word is not masked: findings.md lists it for the submitter to check
   5. secrets           masked; private keys and cloud access keys refuse the whole submission
 
 Package layout (store/packages/<PKG-ID>/):
@@ -216,7 +219,8 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
         block("门 3：找到商业敏感内容 %s，请选 --business keep（原样）或 --business mask（换占位符）；"
                          "不想交的文件请从输入里去掉" % summary.get("business"))
     mask_business = business == "mask"
-    # a value judged sensitive anywhere is masked everywhere (other files, other rows, the hidden area)
+    # a value found by its form (an ID, a phone, an email, a key ...) is masked everywhere (other files, other rows,
+    # the hidden area); a name or password found next to a label only where it was found (checks.propagate)
     values = {}
     for hs in all_hits.values():
         for h in hs:
@@ -268,6 +272,10 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
                            ("instruction", "像指令的行（已加 > 引用）"), ("link", "链接（内容未收）")):
             if f.get(cat):
                 parts.append("%s %s" % (label, ", ".join("%s×%d" % kv for kv in sorted(f[cat].items()))))
+        if f.get("review"):
+            notes = [meta(q) for q in checks.review_notes(doc.text, hits)]
+            parts.append("请你确认 %d 处（可能是人名或密码，也可能只是普通的词，没打码；是人名或密码就改原文再交）：%s"
+                         % (sum(f["review"].values()), "、".join("「%s」" % q for q in notes)))
         if doc.hidden:
             parts.append("隐藏内容 %d 处（移到 extras/hidden.md）" % len(doc.hidden))
         if doc.images:

@@ -513,6 +513,9 @@ class ReviewRegressions(unittest.TestCase):
     def test_failed_commit_leaves_nothing(self):
         r = Reflect("test_apply_commit_and_idempotent")
         r.setUp()
+        # test repos skip machine-wide hooks by default (tests/helpers.no_hooks_config): this test needs its own hook
+        sh("git", "-C", r.repo, "config", "core.hooksPath", os.path.join(r.repo, ".git", "hooks"))
+        os.makedirs(os.path.join(r.repo, ".git", "hooks"), exist_ok=True)
         hook = os.path.join(r.repo, ".git", "hooks", "pre-commit")
         with open(hook, "w") as f:
             f.write("#!/bin/sh\nexit 1\n")

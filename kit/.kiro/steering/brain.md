@@ -50,5 +50,10 @@ in any stage. Ask; do not work around a block.
 When the person says to hand over, or you must wait more than a working day:
 1. Bring `aidlc-docs/<intent>/aidlc-state.md` Session notes up to date: Status, Next (numbered, concrete),
    Open questions, Notes for the next session. Anything not written there is lost.
-2. Commit your work. Then the person runs `brain handoff` (it checks the note, pushes, labels the MR).
+2. Run `brain mr-desc --write`: it writes the MR description `runs/<KEY>/MR.md` from the records (what changed,
+   AC evidence, decisions, assumptions, approvals, how to review). Read it. It is generated, never written or edited
+   by you: if something reads wrong or is missing, fix the record it comes from (requirements.md, the plan's Tests
+   table, decisions.md) and run it again. If it refuses because `runs/` counts as code in `aidlc-docs/lean.json`,
+   tell the person (only they can change that file) and go on without it.
+3. Commit your work with MR.md. Then the person runs `brain handoff` (it checks the note, pushes, labels the MR).
 The team runner re-verifies everything you claimed (tests, reviews), so write facts with evidence.

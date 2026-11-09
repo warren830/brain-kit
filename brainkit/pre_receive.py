@@ -1,10 +1,14 @@
 """GitLab server-side pre-receive hook (a real gate: the bot cannot change it).
 
 Claim branches (claim/<KEY>): only the person claim.json names may create, change or delete one; an intent's
-text fields (intents.py: source, body, acs, refs, closed) must pass the Brain's content checks.
+text fields (intents.py: source, body, acs, refs, closed) must pass the Brain's content checks - all of them when the
+claim is created, the ones a push changes after that (closing a claim filed under older rules still works).
 Rules for run branches (<prefix>/<owner>/<JIRA>-<slug>):
   bot accounts   may push only branches under <prefix>/ (well-formed names), never delete or force-push,
-                 never push tags, and never change bot_forbidden_paths (gates/, project-agent.yaml, CI, ...).
+                 never push tags, never change bot_forbidden_paths (gates/, project-agent.yaml, CI, ...), and never
+                 change <runs_dir>/<KEY>/run.json (only `brain start` and `brain handoff`, run by the owner, write it;
+                 the runner writes park.json and its work next to it). Every bot commit is authored and committed
+                 as one of bot_emails.
   people         may push under <prefix>/ only to <prefix>/<their own username>/...; other branches are
                  left to GitLab's normal protection.
 
@@ -16,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 
@@ -28,7 +33,13 @@ DEFAULT_CFG = {
     "bot_emails": ["brain-bot@noreply.invalid"],
     "bot_forbidden_paths": ["gates/", "project-agent.yaml", ".brain/", "CODEOWNERS", ".gitlab/CODEOWNERS",
                             ".gitlab-ci.yml", "ci/"],
+    "runs_dir": "runs",
 }
+
+
+def run_record_path(path, runs_dir="runs") -> bool:
+    """Is `path` a run's run.json (<runs_dir>/<KEY>/run.json, any key)?"""
+    return re.match(r"^%s/[^/]+/run\.json$" % re.escape(str(runs_dir or "runs").strip("/")), path) is not None
 
 
 def _git(*args, cwd=None) -> subprocess.CompletedProcess:
@@ -88,6 +99,16 @@ def changed_paths(commits, default_branch="main", cwd=None) -> set:
     return out
 
 
+def own_changes(commits, cwd=None) -> set:
+    """Paths the commits themselves change: a merge counts only what differs from every parent (what the merge
+    resolved), so merging the default branch into a run branch does not count the branch's own files as changed."""
+    out = set()
+    for c in commits:
+        parents = _git("rev-list", "--parents", "-n", "1", c, cwd=cwd).stdout.split()[1:]
+        out |= _names(["--root", "-r", c] if len(parents) <= 1 else ["--cc", c], cwd)
+    return out
+
+
 def committer_emails(commits, cwd=None) -> set:
     out = set()
     for c in commits:
@@ -118,9 +139,10 @@ def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
         return ["%s: claim branches are claim/<PREFIX>-<n>" % branch]
     if is_bot:
         return ["%s: bot accounts may not claim requirements" % branch]
+    before = None
     if old != ZERO_SHA:
-        doc, err = _claim_owner(old, cwd)
-        holder = (doc or {}).get("owner")
+        before, err = _claim_owner(old, cwd)
+        holder = (before or {}).get("owner")
         if holder != user:
             return ["%s: claimed by %s; only they may change or release it" % (branch, holder or "unknown")]
     if new == ZERO_SHA:
@@ -131,7 +153,8 @@ def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
     if not isinstance(doc, dict) or doc.get("key") != key or doc.get("owner") != user:
         return ["%s: claim.json must name key %s and owner %s" % (branch, key, user)]
     from . import intents  # an intent's text reaches the run's agent: same checks as `brain intent add`
-    bad = intents.doc_problems(doc)
+    # an update is checked for what it changes: text the claim was accepted with stays as it was filed
+    bad = intents.doc_problems(doc, before=before if isinstance(before, dict) else None)
     if bad:
         return ["%s: claim.json: %s" % (branch, "; ".join(bad[:5]))]
     return []
@@ -169,10 +192,14 @@ def decide(updates, user, cfg, cwd=None) -> list:
                 reasons.append("%s: bot accounts may not force-push" % branch)
                 continue
             commits = new_commits(old, new, cfg["default_branch"], cwd)
-            bad = sorted(p for p in changed_paths(commits, cfg["default_branch"], cwd)
-                         if _forbidden(p, cfg["bot_forbidden_paths"]))
+            paths = changed_paths(commits, cfg["default_branch"], cwd)
+            bad = sorted(p for p in paths if _forbidden(p, cfg["bot_forbidden_paths"]))
             if bad:
                 reasons.append("%s: bot accounts may not change %s" % (branch, ", ".join(bad[:5])))
+            recs = sorted(p for p in own_changes(commits, cwd) if run_record_path(p, cfg.get("runs_dir", "runs")))
+            if recs:
+                reasons.append("%s: bot accounts may not change %s (run.json is written by `brain start` and "
+                               "`brain handoff` only)" % (branch, ", ".join(recs[:5])))
             emails = {e.lower() for e in cfg.get("bot_emails", [])}
             alien = sorted(committer_emails(commits, cwd) - emails)
             if alien:

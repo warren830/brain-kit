@@ -140,5 +140,25 @@ class ReflectWorktreeNamedAfterTheRepo(unittest.TestCase):
         self.assertEqual(os.path.basename(reflect.worktree_root(repo)), "demo")
 
 
+class GitLabEditSignalAsMeasured(unittest.TestCase):
+    """Measured on gitlab.aws.dev 2026-11-09 (MR !2 of the trial): an award emoji moves REST updated_at and GraphQL
+    lastEditedAt but leaves lastEditedBy empty; a text edit sets lastEditedBy; an untouched note has lastEditedAt equal
+    to its creation time. A reply someone only reacted to must still count."""
+
+    def note(self, updated):
+        return {"id": 7, "author": {"username": "dave"}, "created_at": "2026-11-08T14:51:13.961Z", "updated_at": updated,
+                "body": "answer D-1 A"}
+
+    def test_edit_state(self):
+        from brainkit.bridge import decisions as d
+        created = "2026-11-08T14:51:13.961Z"
+        self.assertEqual(d.edit_state(self.note(created), {"last_edited_at": created, "last_edited_by": None}), "original")
+        emoji = "2026-11-09T02:55:02.082Z"
+        self.assertEqual(d.edit_state(self.note(emoji), {"last_edited_at": emoji, "last_edited_by": None}), "original")
+        self.assertEqual(d.edit_state(self.note(emoji), {"last_edited_at": emoji, "last_edited_by": "mallory"}), "edited")
+        self.assertEqual(d.edit_state(self.note(emoji), {"last_edited_at": emoji, "last_edited_by": "dave"}), "original")
+        self.assertEqual(d.edit_state(self.note(emoji), None), "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()

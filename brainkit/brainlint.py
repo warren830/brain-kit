@@ -50,6 +50,8 @@ def content_problems(text, offset=0) -> tuple:
                                                                     "contract number", h.value))
         elif h.cat == "business":
             warns.append("names a company (%s): keep it only if the team may share it" % h.value)
+        elif h.cat == "review":  # may be a name or a password, may be a plain word: a person decides
+            warns.append("may be personal data or a secret (%s): check it before this is merged" % h.kind)
         elif h.cat == "instruction":
             errs.append("instruction-like line (%s): the Brain is read by every run" % h.kind)
     tail = text[offset:]

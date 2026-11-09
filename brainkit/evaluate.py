@@ -13,9 +13,10 @@ Brain usage (brainkit.usage); read-only.
   重复纠正率 / 知识有用率   from brainkit.usage
   过时与冲突        stale citations + same-term lint warnings + entries replaced / withdrawn in the period
   credits           total credits of the completed runs ÷ correct deliveries (diagnostic only, no cap)
-  决策漏斗          every decision in the period, by who settled it: person > check > brain (Who = brain <id>, or
-                    the row cites an entry) > agent (Who = agent, assumptions A-n) > unknown (Who empty); a Who outside
-                    the runner's vocabulary is "unclassified" and listed (key, id, where), never guessed; per ISO week
+  决策漏斗          every decision in the period, by who settled it: person (bridge answers; Who = <pseudonym>
+                    <voucher id>, or owner: the local half) > check > brain (Who = brain <id>, or the row cites an
+                    entry) > agent (Who = agent, assumptions A-n) > unknown (Who empty); a Who outside that vocabulary
+                    is "unclassified" and listed (key, id, where), never guessed; per ISO week
   复看队列          runs that need a human look, each with its reasons
 Answers given by an eval oracle (`eval_oracle: true`) are never counted. A run whose record cannot be read is
 skipped and listed with the reason (`skipped`); the others are still evaluated.
@@ -34,9 +35,12 @@ CATEGORIES = ("brain", "check", "agent", "person", "unknown", "unclassified")
 CAT_LABEL = {"brain": "Brain 条目（引用）", "check": "确定性检查", "agent": "agent 自己定（权限内）", "person": "人",
              "unknown": "看不出（Who 空着）", "unclassified": "没归类（Who 不是规定的写法）"}
 # a local Lean rejection has no voucher to cite: the decisions.md rows of the rejected stage, from that day on,
-# are the ones that can record it
-STAGE_WORDS = {"REQUIREMENTS": ("requirement",), "DESIGN": ("design",), "INCEPTION": ("inception",),
-               "PLAN": ("plan",), "RELEASE": ("release", "acceptance", "验收")}
+# are the ones that can record it. Lean's approvals and the stages they cover (aidlc_lean.py, "Stages in order"):
+# INCEPTION = requirements + application-design, PLAN = code-generation; Stage cells name the stage
+STAGE_WORDS = {"REQUIREMENTS": ("requirement",), "DESIGN": ("design",),
+               "INCEPTION": ("inception", "requirement", "design"), "PLAN": ("plan", "code"),
+               "RELEASE": ("release", "acceptance", "验收")}
+WHO_WORDS = "agent / brain <条目号> / check / <化名> <凭证号> / owner（本地半程，负责人在对话里答的）"
 SAME_TERM = "same name, different entries"
 COST_OUTLIER_X = 2.0     # credits above this many times the median of the runs with credits
 VERIFY_FAIL_ROUNDS = 3
@@ -186,8 +190,9 @@ def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouc
         if not t["outcome"]["handed_over"]["value"]:
             rows.append({"key": t["key"], "status": "local only"})
             continue
+        # not merged yet: known wrong or not, it waits for its merge and 14 days like a merged one (N11)
         c = correctness(t) if t["outcome"]["merged_at"]["value"] else (
-            "wrong" if t["outcome"]["accepted"]["first_time"] is False else "pending")
+            "wrong_open" if t["outcome"]["accepted"]["first_time"] is False else "pending")
         b = beyond_required(t)
         auto = None if None in b else not b
         row = {"key": t["key"], "correct": c, "autonomous": auto,
@@ -260,7 +265,7 @@ def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouc
                 unclassified.append({"key": t["key"], "id": d["id"], "src": d["src"]})
     funnel = {"total": sum(counts.values()), "counts": counts, "weeks": dict(sorted(weeks.items())),
               "unanswered_questions": unanswered, "oracle_answers_excluded": oracle, "unclassified": unclassified,
-              "rule": "每条决策只算一次：人（桥送的回答；Who 是“化名 凭证号”）> 确定性检查（Who=check）> Brain（Who=brain "
+              "rule": "每条决策只算一次：人（桥送的回答；Who 是“化名 凭证号”，或本地半程的 owner）> 确定性检查（Who=check）> Brain（Who=brain "
                       "条目号，或这一行引用了条目号）> agent（Who=agent，或需求页的假设 A-n）> 看不出（Who 空着）；Who 写了别的，"
                       "算“没归类”，列出在哪一行，不猜"}
 
@@ -338,8 +343,8 @@ def _gap(kind, subject, title, body, refs, key=None):
 
 def recorded_in(t, h) -> list:
     """decisions.md rows that can record a local Lean rejection (no voucher, no bridge decision to cite): rows of the
-    rejected stage (REQUIREMENTS -> a Stage naming requirements; RELEASE -> release / acceptance), dated that day or
-    later (or undated)."""
+    rejected stage (STAGE_WORDS: REQUIREMENTS -> requirements; INCEPTION -> requirements or (application-)design;
+    PLAN -> plan or code(-generation); RELEASE -> release / acceptance), dated that day or later (or undated)."""
     words = STAGE_WORDS.get(str(h.get("what") or "").upper())
     day = (h.get("at") or "")[:10]
     if not words:
@@ -434,7 +439,7 @@ def report(data) -> str:
     out.append("  算法：" + a["rule"])
     for r in a["runs"]:
         if r["status"] != "counted":
-            out.append("  %s：%s" % (r["key"], "已知有问题，14 天还没满，先不算" if r.get("correct") == "wrong_open" else
+            out.append("  %s：%s" % (r["key"], "已知有问题，合并满 14 天才算" if r.get("correct") == "wrong_open" else
                                      {"local only": "没交接（只在本地做），不算",
                                       "pending": "交付对不对还不知道"}.get(r["status"], r["status"])))
         elif r["beyond"]:
@@ -477,8 +482,7 @@ def report(data) -> str:
         if f["counts"].get(k):
             out.append("  %s：%s" % (CAT_LABEL[k], _pct(f["counts"][k], f["total"])))
     for x in f.get("unclassified") or []:
-        out.append("    没归类：%s %s（%s）：Who 要写 agent / brain <条目号> / check / <化名> <凭证号>" % (
-            x["key"], x["id"], x["src"]))
+        out.append("    没归类：%s %s（%s）：Who 要写 %s" % (x["key"], x["id"], x["src"], WHO_WORDS))
     if f["weeks"]:
         out.append("  每周（Brain / 检查 / agent / 人 / 看不出 / 没归类）：")
         out += ["    %s：%s" % (w, " / ".join(str(v.get(k, 0)) for k in CATEGORIES)) for w, v in f["weeks"].items()]

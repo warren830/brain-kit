@@ -10,10 +10,11 @@ hidden_tests are kept outside the snapshot: a .patch/.diff is applied in the wor
 path lives under `hidden/` in the task dir and is copied to the same path without the `hidden/` prefix.
 
   snapshot()  `git archive` of base_sha into a fresh dir outside any git repository: no .git, .gitmodules or
-              remotes, no credential / env files or key stores, no keys or password lines, no symlink that resolves
-              outside; ablation variants drop one Brain file (and its archive) and the copies of its entries in
-              proposal blocks and citing lines elsewhere. The manifest is returned, never written into the
-              snapshot, so the agent cannot learn its variant.
+              remotes, no credential / env files or key stores, no keys or secret-looking password lines (dev
+              defaults such as POSTGRES_PASSWORD: postgres are masked), no symlink that resolves outside; ablation
+              variants drop one Brain file (and its archive) and the copies of its entries (their proposal blocks in
+              run documents, the lines citing their ids); instruction files stay the same in every variant. The
+              manifest is returned, never written into the snapshot, so the agent cannot learn its variant.
   score()     apply the hidden tests, run the task's test command (scrubbed env), count passed / failed; a run in
               which no test ran is an error, not a 0.
   plan()      tasks x variants x repeats -> jobs.
@@ -52,18 +53,30 @@ YARN_AUTH_RE = re.compile(r"(?im)^[^#\n]*\bnpmAuth(?:Token|Ident)\s*:")
 # TOKEN, API_KEY ... (DB_PASSWORD=..., export X_TOKEN=..., SECRET_KEY: ..., PASSWORD = "..."). The value is a literal:
 # unquoted right after '=' (or ': '), or quoted; never ${VAR}, $VAR, an expression, a call (os.environ[...]).
 PASSWORD_LINE_RE = re.compile(
-    r"(?m)^[ \t]*(?:export[ \t]+|set[ \t]+|-[ \t]+)?[A-Z0-9_]*(?:PASSWORD|PASSWD|_PASS|_PWD|SECRET|SECRET_KEY|"
-    r"TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?)"
+    r"(?m)^[ \t]*(?:export[ \t]+|set[ \t]+|-[ \t]+)?(?P<name>[A-Z0-9_]*(?:PASSWORD|PASSWD|_PASS|_PWD|SECRET|"
+    r"SECRET_KEY|TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?))"
     r"(?:(?:=|:[ \t]+)(?![\"'])(?!(?:None|null|NULL|nil|true|false|True|False|[*xX]+)[ \t]*(?:#.*)?$)"
-    r"[^\s\"'$#{}()<>\[\]`,;]{4,}[ \t]*(?:#.*)?$"
-    r"|[ \t]*[=:][ \t]*(?:\"[^\"$\n{]{4,}\"|'[^'$\n{]{4,}'))")
+    r"(?P<u>[^\s\"'$#{}()<>\[\]`,;]{4,})[ \t]*(?:#.*)?$"
+    r"|[ \t]*[=:][ \t]*(?:\"(?P<dq>[^\"$\n{]{4,})\"|'(?P<sq>[^'$\n{]{4,})'))")
 # Source code and docs are left to the other rules: test fixtures and README examples (API_TOKEN: 'fake-...',
 # export X_TOKEN=your-token) would refuse almost every repository.
 PASSWORD_SKIP_EXTS = (".py", ".pyi", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".go", ".java", ".kt", ".kts",
                       ".scala", ".rb", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".php", ".swift", ".m",
                       ".md", ".markdown", ".rst", ".adoc", ".txt", ".ipynb")
-SECRET_RULES = (("private key", checks.PRIVATE_KEY_RE), ("cloud access key", checks.CLOUD_KEY_RE),
-                ("token", checks.TOKEN_RE), ("password assignment", PASSWORD_LINE_RE))
+# What such a line holds that is no secret: a number for a limit (MAX_TOKEN: 4096), a header name (CSRF_TOKEN:
+# X-CSRF-Token). A well-known development default (POSTGRES_PASSWORD: postgres in docker-compose, a CI service's
+# runner-test, changeme, the service's own name) is masked in place and listed, not refused.
+QUANTITY_PARTS = {"MAX", "MIN", "NUM", "COUNT", "LIMIT", "LEN", "LENGTH", "SIZE", "TTL", "EXPIRY", "EXPIRES",
+                  "TIMEOUT", "AGE", "LIFETIME", "BUDGET"}
+HEADER_NAME_RE = re.compile(r"^(?:X-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*|[A-Z][a-z]+(?:-[A-Z][a-z]+)+)$")
+DEV_DEFAULTS = set((
+    "postgres postgresql mysql mariadb root admin administrator password passwd pass secret guest user test demo "
+    "changeme changeit letmein welcome default redis mongo mongodb rabbitmq minio minioadmin elastic kibana keycloak "
+    "airflow superset grafana jenkins sonar sonarqube oracle sa toor qwerty 123456 1234567 12345678 123456789 "
+    "password1 password123 admin123 abc123 secret123 test123 pass123 root123 passw0rd p@ssw0rd").split())
+DEV_PARTS = set(("test tests testing dev devel development local localhost ci example examples sample demo dummy "
+                 "fake mock changeme placeholder your here xxx todo insecure unsafe default").split())
+MASK_FORMAT = "masked-by-brain-%d"      # the same value gets the same placeholder in one snapshot
 SCAN_MAX_BYTES = 2 * 1024 * 1024
 ENV_DROP_PARTS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL")
 ENV_DROP_PREFIXES = ("GITLAB_", "AWS_", "BRAIN_", "JIRA_", "KIROCREW_", "GIT_CONFIG_", "GIT_ASKPASS", "SSH_AUTH_SOCK",
@@ -320,20 +333,49 @@ def _submodules(repo, sha) -> list:
     return sorted(e.split("\t", 1)[1] for e in out.split("\0") if e.startswith("160000 ") and "\t" in e)
 
 
-def _scrub_ablated(root, brain_dir, fkey, ids) -> list:
+# Where copies of a Brain entry live on: the run documents (aidlc-docs/<intent>/decisions.md, runs/<KEY>/...).
+# Instruction files are never edited by an ablation: every variant runs with the same instructions.
+RUN_DOC_DIRS = ("aidlc-docs",)
+INSTRUCTION_DIRS = {".kiro", ".claude", ".cursor", ".github", ".amazonq", ".windsurf", ".continue", ".clinerules"}
+INSTRUCTION_NAMES = {"AGENTS.md", "CLAUDE.md", "GEMINI.md"}
+
+
+def _instruction_file(rel) -> bool:
+    parts = rel.split("/")
+    return parts[-1] in INSTRUCTION_NAMES or any(p in INSTRUCTION_DIRS for p in parts[:-1])
+
+
+def _scrub_ablated(root, brain_dir, fkey, ids, runs_dir="runs") -> list:
     """A Brain entry lives on outside its file: the run's brain-proposal block it came from and the decision rows
-    that cite its id stay in aidlc-docs/<intent>/decisions.md (and a reflector's reflect-proposals.md). In every
-    Markdown file outside the Brain folder, drop the brain-proposal blocks for `fkey` (file: <fkey>, or a rel target
-    in it) or citing one of its entries, and every other line that cites one. Returns [{path, blocks, lines}]."""
-    letter = E.FILES[fkey]["letter"]
-    legacy = sorted(i for i in ids if E.LEGACY_ID_RE.match(i))
-    cite = re.compile(r"(?<![A-Za-z0-9-])(?:%s-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3}%s)(?![A-Za-z0-9-])"
-                      % (letter, "".join("|" + re.escape(i) for i in legacy)))
+    that cite its id stay in aidlc-docs/<intent>/decisions.md (and a reflector's runs/<KEY>/reflect-proposals.md).
+    In Markdown outside the Brain folder, drop the copies of the removed entries (`ids`, from the removed files):
+      - in run documents (aidlc-docs/**, <runs_dir>/**): the brain-proposal blocks for `fkey` (file: <fkey>, a rel
+        target in it, or citing one of `ids`) and every other line that cites one of `ids`;
+      - elsewhere: only the lines that cite one of the full ids (T-PAY-1-2).
+    An id counts as a whole token and only when it is one of `ids` (T-PAY-88-1 in an example is not). A legacy id
+    (T-1, also a trade date: T-1 日) counts only in run documents and only written as a citation: `T-1`, (T-1),
+    [T-1], per T-1. Instruction files (.kiro/**, AGENTS.md, ...) are never edited. Returns [{path, blocks, lines}]."""
+    def alt(xs):
+        return "|".join(re.escape(i) for i in sorted(xs))
+    full = [i for i in ids if E.NEW_ID_RE.match(i)]
+    legacy = [i for i in ids if E.LEGACY_ID_RE.match(i)]
+    full_re = re.compile(r"(?<![A-Za-z0-9-])(?:%s)(?![A-Za-z0-9-])" % alt(full)) if full else None
+    legacy_re = re.compile(r"`(?:{0})`|[(\[（【,，、][ \t]*(?:{0})[ \t]*(?=[)\]）】,，、])"
+                           r"|(?i:\b(?:per|see|cites?|cited)[ \t]+)(?:{0})(?![A-Za-z0-9-])".format(alt(legacy))) \
+        if legacy else None
+    run_dirs = tuple(d.strip("/") + "/" for d in RUN_DOC_DIRS + (runs_dir,) if d.strip("/"))
+
+    def cites(line, run_doc):
+        return bool(full_re and full_re.search(line)) or bool(run_doc and legacy_re and legacy_re.search(line))
+
     out = []
     for rel in _walk_files(root):
         p = os.path.join(root, *rel.split("/"))
-        if not rel.lower().endswith(".md") or rel.startswith(brain_dir + "/") or os.path.islink(p) \
-                or os.path.getsize(p) > SCAN_MAX_BYTES:
+        if not rel.lower().endswith(".md") or rel.startswith(brain_dir + "/") or _instruction_file(rel) \
+                or os.path.islink(p) or os.path.getsize(p) > SCAN_MAX_BYTES:
+            continue
+        run_doc = rel.startswith(run_dirs)
+        if not run_doc and not full_re:
             continue
         with open(p, "rb") as fh:
             raw = fh.read()
@@ -341,11 +383,11 @@ def _scrub_ablated(root, brain_dir, fkey, ids) -> list:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
             continue
-        if not cite.search(text) and "brain-proposal" not in text:
+        if not cites(text, run_doc) and not (run_doc and "brain-proposal" in text):
             continue
         lines = text.split("\n")
         drop, blocks = set(), 0
-        for start, end, fields in reflect.block_spans(text):
+        for start, end, fields in (reflect.block_spans(text) if run_doc else ()):
             target = (fields.get("rel") or "").split()[1:2]
             try:
                 fk = E.file_key(fields["file"]) if fields.get("file") else None
@@ -353,10 +395,10 @@ def _scrub_ablated(root, brain_dir, fkey, ids) -> list:
                 fk = None
             if fk is None and target:
                 fk = E.LETTER_FILE.get(target[0][:1])
-            if fk == fkey or any(cite.search(l) for l in lines[start:end]):
+            if fk == fkey or any(cites(l, run_doc) for l in lines[start:end]):
                 drop.update(range(start, end))
                 blocks += 1
-        cited = [n for n, l in enumerate(lines) if n not in drop and cite.search(l)]
+        cited = [n for n, l in enumerate(lines) if n not in drop and cites(l, run_doc)]
         if not drop and not cited:
             continue
         drop.update(cited)
@@ -374,12 +416,14 @@ def _entry_ids(path) -> set:
 
 
 def _git_repo_above(path):
-    """The git repository (work tree or git dir) that `path` lies in, or None. GIT_* settings are ignored: an agent
-    in the snapshot would not have them either."""
+    """The git repository (work tree or git dir) that `path` lies in, or None. GIT_* settings are ignored (an agent
+    in the snapshot would not have them either), except GIT_CEILING_DIRECTORIES: git's own way to say "do not look
+    above here", for a temp dir that has to be inside a checkout (CI); the agent's run then needs the same setting,
+    so snapshot() records it (_ceiling_note)."""
     d = os.path.realpath(path)
     while not os.path.isdir(d):
         d = os.path.dirname(d)
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k == "GIT_CEILING_DIRECTORIES"}
     p = subprocess.run(["git", "-C", d, "rev-parse", "--absolute-git-dir"], capture_output=True, text=True, env=env)
     if p.returncode != 0:
         return None
@@ -387,8 +431,26 @@ def _git_repo_above(path):
     return (top.stdout.strip() if top.returncode == 0 and top.stdout.strip() else p.stdout.strip()) or d
 
 
-def _secret_hits(root) -> list:
-    hits = []
+def _credential_kind(name, value) -> str:
+    """For a credential line's literal value: '' (no secret: a limit, a header name), 'dev default' or 'secret'."""
+    if re.match(r"^[0-9]+(?:\.[0-9]+)?[a-z]{0,2}$", value) and set(name.split("_")) & QUANTITY_PARTS:
+        return ""
+    if HEADER_NAME_RE.match(value) and not re.search(r"PASS|PWD", name):
+        return ""                                    # CSRF_TOKEN: X-CSRF-Token (a passphrase may look like one)
+    low = value.lower()
+    words = [w for w in re.split(r"[^a-z0-9]+", low) if w]
+    if low in DEV_DEFAULTS or any(w in DEV_PARTS for w in words) or \
+            low in {x.lower() for x in name.split("_") if len(x) >= 4}:
+        return "dev default"                         # POSTGRES_PASSWORD: postgres, runner-test
+    return "secret"
+
+
+def _secrets(root, mask_secrets=False) -> tuple:
+    """Scan the text files for private keys, cloud access keys, tokens and credential lines (not in code and docs).
+    Development defaults are masked in place; secrets refuse the snapshot, or with mask_secrets (the explicit
+    override) are masked too, and a file with a private key is dropped. Returns (refused [{path, rule}], masked
+    [{path, line, name, why}], dropped [{path, why}]): paths, line numbers and names, never a value."""
+    refused, masked, dropped, placeholder = [], [], [], {}
     for rel in _walk_files(root):
         p = os.path.join(root, *rel.split("/"))
         if os.path.islink(p) or os.path.getsize(p) > SCAN_MAX_BYTES:
@@ -397,20 +459,70 @@ def _secret_hits(root) -> list:
             raw = f.read()
         if b"\0" in raw[:8192]:
             continue
-        text = raw.decode("utf-8", errors="replace")
-        for label, rx in SECRET_RULES:
-            if rx is PASSWORD_LINE_RE and rel.lower().endswith(PASSWORD_SKIP_EXTS):
+        text = raw.decode("utf-8", errors="surrogateescape")       # written back byte for byte
+        if checks.PRIVATE_KEY_RE.search(text):
+            if mask_secrets:
+                _remove(root, rel)
+                dropped.append({"path": rel, "why": "private key (--mask-secrets)"})
                 continue
-            if rx.search(text):
-                hits.append({"path": rel, "rule": label})
-    return hits
+            refused.append({"path": rel, "rule": "private key"})
+        spans = []                                   # (start, end, name, why)
+        for label, rx, group in (("cloud access key", checks.CLOUD_KEY_RE, 0), ("token", checks.TOKEN_RE, 1)):
+            found = [m.span(group) for m in rx.finditer(text)]
+            if found and not mask_secrets:
+                refused.append({"path": rel, "rule": label})
+            spans += [(a, b, label, "%s (--mask-secrets)" % label) for a, b in found if mask_secrets]
+        if not rel.lower().endswith(PASSWORD_SKIP_EXTS):
+            refuse = False
+            for m in PASSWORD_LINE_RE.finditer(text):
+                g = next(k for k in ("u", "dq", "sq") if m.group(k) is not None)
+                kind = _credential_kind(m.group("name"), m.group(g))
+                if kind == "secret" and not mask_secrets:
+                    refuse = True
+                elif kind:
+                    spans.append(m.span(g) + (m.group("name"), kind if kind == "dev default"
+                                              else "secret (--mask-secrets)"))
+            if refuse:
+                refused.append({"path": rel, "rule": "password assignment"})
+        if not spans:
+            continue
+        out, pos = [], 0
+        for a, b, name, why in sorted(spans):
+            if a < pos:
+                continue
+            v = text[a:b]
+            placeholder.setdefault(v, MASK_FORMAT % (len(placeholder) + 1))
+            out += [text[pos:a], placeholder[v]]
+            pos = b
+            masked.append({"path": rel, "line": text.count("\n", 0, a) + 1, "name": name, "why": why})
+        out.append(text[pos:])
+        with open(p, "wb") as f:
+            f.write("".join(out).encode("utf-8", errors="surrogateescape"))
+    return refused, masked, dropped
 
 
-def snapshot(repo, base_sha, out_dir, variant="full", brain_dir="brain") -> dict:
+def _ceiling_note(out_dir):
+    """When GIT_CEILING_DIRECTORIES is what hides a repository above out_dir: {repo, GIT_CEILING_DIRECTORIES}."""
+    ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+    if not ceiling:
+        return None
+    d = os.path.dirname(os.path.realpath(out_dir))
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return {"repo": d, "GIT_CEILING_DIRECTORIES": ceiling}
+        if os.path.dirname(d) == d:
+            return None
+        d = os.path.dirname(d)
+
+
+def snapshot(repo, base_sha, out_dir, variant="full", brain_dir="brain", runs_dir="runs", mask_secrets=False) -> dict:
     """Extract base_sha into a NEW empty out_dir (no .git, no remotes, no credentials); for an ablation variant drop
     the Brain file, its archive and the proposal blocks and lines that carry its entries elsewhere (_scrub_ablated).
-    Returns the manifest (not written into the snapshot). Refused, with nothing left behind: an out_dir inside a git
-    repository (git would find that repository from the snapshot), a symlink that resolves outside, a key."""
+    Development defaults in credential lines are masked (manifest "masked"). Returns the manifest (not written into
+    the snapshot). Refused, with nothing left behind: an out_dir inside a git repository (git would find that
+    repository from the snapshot; GIT_CEILING_DIRECTORIES is honoured and then recorded as "git_ceiling"), a symlink
+    that resolves outside, a key or a secret-looking credential (with mask_secrets, the explicit override: masked,
+    a private-key file dropped, all listed, and the manifest says "override": "mask-secrets")."""
     if variant not in VARIANTS:
         raise BrainError("variant must be one of %s" % ", ".join(VARIANTS))
     p = git(repo, "rev-parse", "-q", "--verify", "%s^{commit}" % base_sha, check=False)
@@ -424,7 +536,9 @@ def snapshot(repo, base_sha, out_dir, variant="full", brain_dir="brain") -> dict
     if above:
         raise BrainError("%s is inside the git work tree (or repository) %s: from the snapshot, git would find that "
                          "repository, its history and remotes. Put snapshots in a directory outside any git "
-                         "repository." % (out_dir, above))
+                         "repository (or, when it has to be there, set GIT_CEILING_DIRECTORIES to a directory between "
+                         "the two, for this command and for the agent's run)." % (out_dir, above))
+    ceiling = _ceiling_note(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     try:
         with tempfile.TemporaryDirectory(prefix="brain-golden-") as tmp:
@@ -444,16 +558,20 @@ def snapshot(repo, base_sha, out_dir, variant="full", brain_dir="brain") -> dict
                 if os.path.lexists(os.path.join(out_dir, *rel.split("/"))):
                     _remove(out_dir, rel)
                     removed.append({"path": rel, "why": "ablation (%s)" % variant})
-            scrubbed = _scrub_ablated(out_dir, bd, f, ids)
+            scrubbed = _scrub_ablated(out_dir, bd, f, ids, runs_dir)
         _check_links(out_dir)                         # a removal can change what a link resolves through
-        hits = _secret_hits(out_dir)
-        if hits:
-            raise BrainError("snapshot of %s refused: %s. Pick another base_sha or clean the tree first; a snapshot "
-                             "that leaks a key must not exist." % (
-                                 sha[:12], ", ".join("%s (%s)" % (h["path"], h["rule"]) for h in hits)))
+        refused, masked, dropped = _secrets(out_dir, mask_secrets)
+        if refused:
+            raise BrainError("snapshot of %s refused: %s. A snapshot that leaks a key must not exist: pick another "
+                             "base_sha or clean the tree first; if these are test fixtures or throwaway values, "
+                             "`--mask-secrets` masks them (and drops private-key files), and the manifest records "
+                             "that override." % (sha[:12], ", ".join("%s (%s)" % (h["path"], h["rule"])
+                                                                    for h in refused)))
+        removed += dropped
         bpath = os.path.join(out_dir, *bd.split("/"))
         brain_files = sorted(os.listdir(bpath)) if os.path.isdir(bpath) else []
-        return {"base_sha": sha, "variant": variant, "removed": removed, "scrubbed": scrubbed,
+        return {"base_sha": sha, "variant": variant, "removed": removed, "scrubbed": scrubbed, "masked": masked,
+                "override": "mask-secrets" if mask_secrets else None, "git_ceiling": ceiling,
                 "submodules": _submodules(repo, sha), "files": len(_walk_files(out_dir)),
                 "brain_files": brain_files, "tree_sha256": tree_digest(out_dir)}
     except BaseException:

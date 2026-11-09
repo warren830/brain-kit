@@ -14,8 +14,13 @@ must stand on its own.
    - `### Open questions and blockers`: anything only the owner or product can decide.
    - `### Notes for the next session`: traps, decisions already taken (with `decisions.md` line refs).
 3. Claims need evidence: "tests pass" only with the command and the date you ran it. The runner re-runs everything.
-4. Commit the work (Lean's commit gate may ask for `lean verify` first).
-5. Tell the person to run `brain handoff`. Do not push or label the MR yourself.
+4. Run `brain mr-desc --write` and read `runs/<KEY>/MR.md`: the MR description reviewers read instead of the whole
+   diff (what changed, AC → test → verify result, decisions, assumptions, approvals, how to review). It is generated
+   from the records, never hand-written: when it reads wrong, fix the record (requirements.md, the plan's Tests
+   table, decisions.md, the Session notes) and run it again. If it refuses because `runs/` counts as code in
+   `aidlc-docs/lean.json`, tell the person; only they can change that file.
+5. Commit the work with MR.md (Lean's commit gate may ask for `lean verify` first).
+6. Tell the person to run `brain handoff`. Do not push or label the MR yourself.
 
 After the hand-over, stop editing this branch locally unless the runner hands it back (label removed and a comment
 on the MR). Two writers on one branch cause lost work.

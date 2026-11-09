@@ -329,8 +329,8 @@ def push_rules(repo, branch, user, env) -> list:
         return ["push-rules needs an MR pipeline (target branch and diff base)"]
     from . import pre_receive
     hook_cfg = dict(pre_receive.DEFAULT_CFG)
-    for k in ("branch_prefix", "default_branch", "bot_users", "bot_emails", "bot_forbidden_paths"):
-        hook_cfg[k] = cfg[k]
+    for k in ("branch_prefix", "default_branch", "bot_users", "bot_emails", "bot_forbidden_paths", "runs_dir"):
+        hook_cfg[k] = cfg.get(k, hook_cfg.get(k))
     # the hook compares with refs/heads/<default>; point it at the target branch inside this CI checkout
     git(repo, "update-ref", "refs/heads/" + hook_cfg["default_branch"], tgt.ref)
     head = git_out(repo, "rev-parse", "HEAD")
