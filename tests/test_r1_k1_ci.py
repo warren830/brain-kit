@@ -2,9 +2,12 @@
 
   R1-15  push-rules in a person's pipeline only judged commits the bot authored: a bot commit with the owner as
          author (committer: the bot) went green on the owner's Retry or next push.
+  R1-16  ci/brain-kit.gitlab-ci.yml ran brain-run-check and brain-push-rules only for MRs from ai/*: the bot's MR
+         from any other branch got no brain-kit check on GitLab Free.
 """
 import json
 import os
+import re
 import sys
 import unittest
 
@@ -12,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from brainkit import ci, sign  # noqa: E402
 from brainkit.common import write_json  # noqa: E402
-from tests.helpers import commit_file, git_repo, keypair, sh, tmpdir  # noqa: E402
+from tests.helpers import ROOT, commit_file, git_repo, keypair, sh, tmpdir  # noqa: E402
 
 BOT = "brain-bot@noreply.invalid"
 BOT_ENV = {"GIT_AUTHOR_NAME": "brain-bot", "GIT_AUTHOR_EMAIL": BOT, "GIT_COMMITTER_NAME": "brain-bot",
@@ -97,6 +100,58 @@ class BotCommitsWithAPersonsAuthorLine(unittest.TestCase):
         p = self.p
         commit_file(p.repo, "ci/x.yml", "job: {}\n", "PAY-1: tweak CI", env=FORGED_ENV)
         self.assertIn("may not change ci/x.yml", " ".join(p.rules("brain-bot")))
+
+
+# ---------- R1-16: brain-kit's CI jobs run in every MR pipeline ----------
+
+def template_jobs():
+    """{job: its text} of ci/brain-kit.gitlab-ci.yml (top-level keys)."""
+    with open(os.path.join(ROOT, "ci", "brain-kit.gitlab-ci.yml"), encoding="utf-8") as f:
+        text = f.read()
+    parts = re.split(r"(?m)^([A-Za-z][\w-]*):[ \t]*$", text)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+class EveryMergeRequestIsChecked(unittest.TestCase):
+    SRC = "fix/flaky-test"
+
+    def test_the_template_runs_all_three_jobs_in_every_mr_pipeline(self):
+        jobs = template_jobs()
+        self.assertEqual(sorted(jobs), ["brain-lint", "brain-push-rules", "brain-run-check"])
+        for name, body in jobs.items():
+            rules = re.findall(r"(?m)^\s+- if: '(.*)'$", body)
+            self.assertEqual(rules, ['$CI_PIPELINE_SOURCE == "merge_request_event"'], name)
+            self.assertNotIn("CI_MERGE_REQUEST_SOURCE_BRANCH_NAME", body, name)
+            self.assertNotIn("CI_COMMIT_BRANCH", body, name)
+
+    def setUp(self):
+        d = tmpdir(self)
+        r = self.repo = git_repo(os.path.join(d, "proj"))
+        commit_file(r, ".brain/kit.json", json.dumps({"version": 1, "req_prefix": "PAY"}), "kit")
+        commit_file(r, "gates/risk-paths", "src/pay/**\n", "risk paths")
+        origin = os.path.join(d, "origin.git")
+        sh("git", "clone", "-q", "--bare", r, origin)
+        sh("git", "-C", r, "remote", "add", "origin", origin)
+        sh("git", "-C", r, "fetch", "-q", "origin")
+        self.env = {"CI_MERGE_REQUEST_TARGET_BRANCH_NAME": "main",
+                    "CI_MERGE_REQUEST_DIFF_BASE_SHA": sh("git", "-C", r, "rev-parse", "main").stdout.strip()}
+        sh("git", "-C", r, "switch", "-q", "-c", self.SRC)
+
+    def rules(self, user):
+        return " ".join(ci.push_rules(self.repo, self.SRC, user, self.env))
+
+    def test_the_bots_mr_from_another_branch_is_refused_whoever_runs_the_pipeline(self):
+        commit_file(self.repo, "src/app.py", "x = 1\n", "fix flaky test", env=BOT_ENV)
+        self.assertIn("bot accounts may only push ai/* branches", self.rules("brain-bot"))
+        for user in ("alice", "tl"):                                   # Retry, or a push on top, by a person
+            self.assertIn("bot accounts push only ai/<owner>/<JIRA>-<slug> run branches", self.rules(user), user)
+        commit_file(self.repo, "notes.md", "x\n", "notes", env=OWNER_ENV)
+        self.assertIn("run branches", self.rules("alice"))
+        self.assertEqual(ci.check_run(self.repo, self.SRC, self.env), [])     # not a run branch: nothing to check
+
+    def test_a_persons_own_mr_from_any_branch_passes(self):
+        commit_file(self.repo, "src/app.py", "x = 1\n", "fix flaky test", env=OWNER_ENV)
+        self.assertEqual(self.rules("alice"), "")
 
 
 if __name__ == "__main__":

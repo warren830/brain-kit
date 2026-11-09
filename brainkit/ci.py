@@ -521,8 +521,9 @@ def bot_commit_rules(repo, branch, env, tgt, cfg, hook_cfg, head) -> list:
     """The bot's per-commit rules in a pipeline a person started (their push, GitLab's Rebase, "Run pipeline" or
     "Retry" on the bot's red head): whoever starts the pipeline, the commits the bot made in the MR (authored or
     committed as the bot: _bots_commits) follow the bot's path rules; the ones it committed are authored as the bot,
-    and the ones it authored are committed by the bot or the run's owner (as in bot_push_rules). Without them a
-    person's next push, or a re-run, would turn the bot's red pipeline green."""
+    and the ones it authored are committed by the bot or the run's owner (as in bot_push_rules); they are on a run
+    branch (the hook lets the bot push nothing else: an MR from any other branch with bot commits is refused). Without
+    them a person's next push, or a re-run, would turn the bot's red pipeline green."""
     from . import pre_receive
     bots = {e.lower() for e in hook_cfg.get("bot_emails") or []}
     commits = pre_receive.new_commits(tgt.base, head, hook_cfg["default_branch"], cwd=repo)
@@ -530,7 +531,12 @@ def bot_commit_rules(repo, branch, env, tgt, cfg, hook_cfg, head) -> list:
     mine = _bots_commits(commits, who, bots)
     if not mine:
         return []
+    b = parse_branch(branch, hook_cfg["branch_prefix"])
     probs = pre_receive.bot_path_problems(branch, mine, hook_cfg, cwd=repo)
+    if not b:
+        probs.append("%s: the bot made commits in this MR (%s), but bot accounts push only %s/<owner>/<JIRA>-<slug> "
+                     "run branches: the bot's work comes through its run branch's MR" % (
+                         branch, ", ".join(c[:12] for c in mine[:3]), hook_cfg["branch_prefix"]))
     forged = [c for c in mine if who[c][0] not in bots]
     if forged:
         probs.append("%s: bot commits are authored as the bot (%s): %s" % (
@@ -538,7 +544,6 @@ def bot_commit_rules(repo, branch, env, tgt, cfg, hook_cfg, head) -> list:
             "; ".join("%s authored by %s but committed by the bot" % (c[:12], who[c][0] or "-") for c in forged[:3])))
     odd = [c for c in mine if who[c][1] not in bots]
     if odd:
-        b = parse_branch(branch, hook_cfg["branch_prefix"])
         hand, signed, why = handover_commit(repo, branch, b["key"], env, tgt.base, cfg["runs_dir"]) if b else (
             None, None, "%s is not a run branch" % branch)
         owner = run_owner(repo, signed, bots) if hand else set()
