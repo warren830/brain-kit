@@ -309,6 +309,18 @@ def cmd_install(a):
     repo = os.path.abspath(a.repo)
     if not os.path.isdir(repo):
         raise BrainError("not a directory: %s" % repo)
+    kit_cfg = os.path.join(repo, config.KIT_CONFIG)
+    new_cfg = None
+    if not os.path.exists(kit_cfg):
+        # the kit.json this install writes, checked as every later command loads it, before anything is written
+        new_cfg = load_json(os.path.join(TEMPLATES, "kit.json"))
+        if a.team:
+            new_cfg["team"] = a.team
+        if a.prefix:
+            new_cfg["req_prefix"] = a.prefix.strip().upper()     # keys are PAY-1: `--prefix pay` means PAY
+        probs = config.validate(config.merged(config.DEFAULTS, new_cfg))
+        if probs:
+            raise BrainError("%s would not be valid (%s); nothing installed" % (config.KIT_CONFIG, "; ".join(probs)))
     lean_src = os.path.abspath(a.lean) if a.lean else (VENDORED_LEAN if os.path.exists(
         os.path.join(VENDORED_LEAN, "install.sh")) else None)
     if lean_src:
@@ -322,14 +334,8 @@ def cmd_install(a):
             dst = os.path.join(repo, os.path.relpath(src, KIT_SRC))
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copyfile(src, dst)
-    kit_cfg = os.path.join(repo, config.KIT_CONFIG)
-    if not os.path.exists(kit_cfg):
-        cfg = load_json(os.path.join(TEMPLATES, "kit.json"))
-        if a.team:
-            cfg["team"] = a.team
-        if a.prefix:
-            cfg["req_prefix"] = a.prefix
-        write_json(kit_cfg, cfg)
+    if new_cfg is not None:
+        write_json(kit_cfg, new_cfg)
         print("Wrote %s: check tracker/req_prefix, gitlab, bot_users and pins, then commit it." % config.KIT_CONFIG)
     _exclude_run_records(repo, config.merged(config.DEFAULTS, load_json(kit_cfg)))
     bd = os.path.join(repo, load_json(kit_cfg).get("brain_dir", "brain"))

@@ -243,5 +243,30 @@ class R1_24_GitignoreLastLine(unittest.TestCase):
             self.assertEqual(f.read().splitlines().count(".brain-materials/"), 1)
 
 
+@unittest.skipUnless(HAVE_LEAN, "AI-DLC Lean checkout not found")
+class R1_30_InstallPrefix(unittest.TestCase):
+    def setUp(self):
+        self.d = tmpdir(self)
+        env(self, HOME=self.d, BRAIN_USER="alice")
+        fake_tools(self)
+        self.repo = git_repo(os.path.join(self.d, "p"))
+        commit_file(self.repo, "a.py", "x\n", "init")
+
+    def test_r1_30_a_lowercase_prefix_is_taken_in_capitals(self):
+        rc, out = brain(self.repo, "install", self.repo, "--lean", LEAN_SRC, "--prefix", "pay")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(load_json(os.path.join(self.repo, ".brain", "kit.json"))["req_prefix"], "PAY")
+        rc, out = brain(self.repo, "doctor", "--offline")
+        self.assertIn("keys PAY-<n>", out)
+
+    def test_r1_30_a_prefix_kit_json_cannot_hold_is_refused_before_anything_is_installed(self):
+        rc, out = brain(self.repo, "install", self.repo, "--lean", LEAN_SRC, "--prefix", "pay-ments")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("req_prefix must be like OMS", out)
+        self.assertIn("nothing installed", out)
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".brain")))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".kiro")))
+
+
 if __name__ == "__main__":
     unittest.main()
