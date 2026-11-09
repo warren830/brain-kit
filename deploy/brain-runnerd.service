@@ -1,4 +1,8 @@
 # Runs as brainbot (the KiroCrew user). Outbound only: GitLab over SSH. Listens on nothing.
+# ProtectSystem=strict leaves only ReadWritePaths writable. They are the folders runnerd.json names that runnerd
+# writes: spool_dir (ready/, failed/), cache_dir (the project caches), runs_root (the workspaces) and intake_dir
+# (brainbot's brain-intake clone: pulled before material packages are copied). A path changed in runnerd.json is
+# changed here too. Each must exist before the unit starts (clone brain-intake as brainbot first).
 [Unit]
 Description=brain-kit runner workspace preparer
 After=network-online.target
@@ -11,7 +15,7 @@ ExecStart=/usr/bin/python3 -I /opt/brain-kit/bin/brain-runnerd --config /etc/bra
 Restart=on-failure
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/srv/brain-spool /home/brainbot/brain-cache /home/brainbot/runs
+ReadWritePaths=/srv/brain-spool /home/brainbot/brain-cache /home/brainbot/runs /home/brainbot/brain-intake
 PrivateTmp=yes
 
 [Install]
