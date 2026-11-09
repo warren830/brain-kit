@@ -106,5 +106,18 @@ class R1_22_PackagePath(Project):
         self.assertTrue(os.path.isfile(os.path.join(pkg, "manifest.json")))
 
 
+class R1_33_ClosedUnclaimed(Project):
+    def test_r1_33_start_on_a_closed_unclaimed_intent_says_it_is_closed(self):
+        rc, out = brain(self.repo, "intent", "add", "--source", "debt", "--title", "退款表加索引", "--body",
+                        "退款表按 order_id 查询很慢，加索引", "--unclaimed")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(brain(self.repo, "intent", "close", "PAY-1", "--reason", "不做了")[0], 0)
+        rc, out = brain(self.repo, "start", "idx", "--key", "PAY-1")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("PAY-1 is closed (不做了)", out)
+        self.assertNotIn("None", out)
+        self.assertEqual(branch(self.repo), "main")
+
+
 if __name__ == "__main__":
     unittest.main()

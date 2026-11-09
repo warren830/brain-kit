@@ -775,11 +775,11 @@ def cmd_start(a):
         take = False
         if key:
             doc = claims.read(repo, key)
-            take = claims.unowned(doc) and not doc.get("closed")    # filed for others: starting it claims it,
-            if doc and not take and doc.get("owner") != me:         # once every check below has passed
-                raise BrainError("%s is claimed by %s" % (key, doc.get("owner")))
-            if doc and doc.get("closed"):
+            if doc and doc.get("closed"):                           # closed first, as `brain claim` says it
                 raise BrainError("%s is closed (%s)" % (key, (doc["closed"] or {}).get("reason", "")))
+            take = claims.unowned(doc)                              # filed for others: starting it claims it,
+            if doc and not take and doc.get("owner") != me:         # once every check below has passed
+                raise BrainError("%s is claimed by %s" % (key, doc.get("owner") or "someone"))
             # a malformed claim is refused; content today's rules flag in text accepted when it was filed (it is
             # on the claim branch already) is shown, not refused
             bad = intents.doc_problems(doc, content=False) if intents.is_intent(doc) else []
