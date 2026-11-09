@@ -78,5 +78,37 @@ class SyncUnfinishedMerge(unittest.TestCase):
         self.assertEqual(self.head(), before)
 
 
+class NotesMerge(unittest.TestCase):
+    """R1-37: Session notes merged by ### subsection, Lean's template ending in "### Notes for the next session"."""
+
+    BASE = STATE.format(intent="261110-pay-1-big").replace("### Notes for the next session\n-\n",
+                                                           "### Notes for the next session\n- \n")
+    API = "### Next (team api)\nStatus: Construction api: done\n1. review and merge\n"
+    JOBS = "### Next (team jobs)\nStatus: Construction jobs: done\n1. review and merge\n"
+
+    def test_r1_37_a_subsection_only_one_side_changed_is_not_a_conflict(self):
+        base = self.BASE
+        self.assertTrue(base.endswith("### Notes for the next session\n- \n"))
+        edited = base.replace("### Notes for the next session\n- \n",
+                              "### Notes for the next session\n- api: the refund id is RF+9\n")
+        # ours edits the last subsection (the end of the file) and appends its own; theirs only appends its own
+        for ours, theirs in ((edited + self.API, base + self.JOBS), (base + self.JOBS, edited + self.API)):
+            text, conflicts = split.merge_state(base, ours, theirs)
+            self.assertEqual(conflicts, [], text)
+            self.assertNotIn("<<<<<<<", text)
+            self.assertEqual(text.count("### Notes for the next session"), 1, text)
+            self.assertIn("### Notes for the next session\n- api: the refund id is RF+9\n", text)
+            self.assertIn(self.API, text)
+            self.assertIn(self.JOBS, text)
+            self.assertTrue(text.endswith("1. review and merge\n"), text[-80:])
+        # one side only: its file as it is
+        self.assertEqual(split.merge_state(base, edited, base), (edited, []))
+        self.assertEqual(split.merge_state(base, base, edited + self.API), (edited + self.API, []))
+        # both sides changed that subsection differently: still a conflict, both kept
+        text, conflicts = split.merge_state(base, edited, base.replace("- \n", "- jobs: rerun at 03:00\n"))
+        self.assertEqual(conflicts, ["### Notes for the next session"])
+        self.assertIn("- api: the refund id is RF+9\n=======\n### Notes for the next session\n- jobs: rerun", text)
+
+
 if __name__ == "__main__":
     unittest.main()

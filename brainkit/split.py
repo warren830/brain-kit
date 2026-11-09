@@ -972,16 +972,30 @@ def _parent_rec(sp) -> dict:
 # ---------- brain sync: merge the parent's branch (or any ref) in, Lean's generated files resolved ----------
 
 def _blocks(text) -> list:
-    """[(heading line or '', text)] of Session notes split at ### headings, in order."""
+    """[(heading line or '', [lines])] of Session notes split at ### headings, in order. The newline that ends the
+    text is not a line of the last subsection: the same subsection reads the same at the end and in the middle."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
     out, head, buf = [], "", []
-    for line in text.split("\n"):
+    for line in lines:
         if line.startswith("### "):
-            out.append((head, "\n".join(buf)))
+            out.append((head, buf))
             head, buf = line.strip(), [line]
         else:
             buf.append(line)
-    out.append((head, "\n".join(buf)))
+    out.append((head, buf))
     return out
+
+
+def _bare(lines):
+    """A subsection's lines without its trailing blank lines (what is compared), or None."""
+    if lines is None:
+        return None
+    n = len(lines)
+    while n and not lines[n - 1].strip():
+        n -= 1
+    return tuple(lines[:n])
 
 
 def _keyed(blocks) -> dict:
@@ -1001,18 +1015,20 @@ def merge_notes(base, ours, theirs) -> tuple:
     out, conflicts = [], []
     for k in order:
         bo, oo, to = b.get(k), o.get(k), t.get(k)
-        if oo == to:
-            r = oo
-        elif oo == bo:
+        nb, no, nt = _bare(bo), _bare(oo), _bare(to)
+        if no == nt:
+            r = oo if oo is not None else to
+        elif no == nb:
             r = to
-        elif to == bo:
+        elif nt == nb:
             r = oo
         else:
             conflicts.append(k[0] or "(top)")
-            r = "<<<<<<< ours\n%s\n=======\n%s\n>>>>>>> theirs" % (oo or "", to or "")
+            r = ["<<<<<<< ours"] + list(oo or []) + ["======="] + list(to or []) + [">>>>>>> theirs"]
         if r is not None:
-            out.append(r)
-    return "\n".join(out), conflicts
+            out += r
+    end = "\n" if out and (ours.endswith("\n") or theirs.endswith("\n")) else ""
+    return "\n".join(out) + end, conflicts
 
 
 def _state_parts(text):
