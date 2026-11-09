@@ -468,22 +468,27 @@ def scan(text) -> list:
 
 
 def _dedupe(hits):
-    """Drop hits that overlap a stronger hit (secret > pii > business > review); links and instructions stay."""
+    """Drop hits that overlap a stronger hit (secret > pii > business > review); links and instructions stay.
+
+    One pass after the sort: the hits kept (but links and instructions) never overlap and come in order of start,
+    so only the last of them can overlap the next hit (a long CSV export has tens of thousands of hits)."""
     rank = {"secret": 0, "pii": 1, "business": 2, "review": 3, "link": 4, "instruction": 5}
     hits.sort(key=lambda h: (h.start, rank[h.cat], -(h.end - h.start)))
     kept = []
+    last = -1                                        # index in kept of the last hit that is no link or instruction
     for h in hits:
         if h.cat in ("link", "instruction"):
             kept.append(h)
             continue
-        clash = next((k for k in kept if k.cat not in ("link", "instruction") and h.start < k.end and k.start < h.end),
-                     None)
+        clash = kept[last] if last >= 0 and h.start < kept[last].end and kept[last].start < h.end else None
         if clash is None:
+            last = len(kept)
             kept.append(h)
         elif rank[h.cat] < rank[clash.cat]:
-            kept.remove(clash)
+            kept[last] = None                        # dropped; h goes to the end, as before
+            last = len(kept)
             kept.append(h)
-    return sorted(kept, key=lambda h: h.start)
+    return sorted((k for k in kept if k is not None), key=lambda h: h.start)
 
 
 # Values a detector finds by their own form (check digits, phone, card and address formats, key formats, amounts,

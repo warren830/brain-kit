@@ -3,7 +3,9 @@
 Key-shaped and token-shaped values are built at runtime, so the source holds none (the commit hook scans for them).
 """
 import os
+import random
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -271,6 +273,60 @@ class R1_55ClassificationMarks(Base):
         with self.assertRaises(BrainError) as cm:
             self.build([os.path.join(self.src, "m")])
         self.assertIn("allow_confidential", str(cm.exception))
+
+
+
+def _dedupe_reference(hits):
+    """The old quadratic _dedupe, to compare against."""
+    rank = {"secret": 0, "pii": 1, "business": 2, "review": 3, "link": 4, "instruction": 5}
+    hits.sort(key=lambda h: (h.start, rank[h.cat], -(h.end - h.start)))
+    kept = []
+    for h in hits:
+        if h.cat in ("link", "instruction"):
+            kept.append(h)
+            continue
+        clash = next((k for k in kept if k.cat not in ("link", "instruction") and h.start < k.end and k.start < h.end),
+                     None)
+        if clash is None:
+            kept.append(h)
+        elif rank[h.cat] < rank[clash.cat]:
+            kept.remove(clash)
+            kept.append(h)
+    return sorted(kept, key=lambda h: h.start)
+
+
+class R1_69LinearDedupe(Base):
+    """The checks took time quadratic in the number of hits (_dedupe compared every hit with every hit kept): one
+    dry run of a 1.1 MB refund CSV took minutes."""
+
+    def test_same_result_as_before(self):
+        rnd = random.Random(69)
+        cats = ("secret", "pii", "business", "review", "link", "instruction")
+        for _ in range(300):
+            hits = []
+            for _ in range(rnd.randint(0, 25)):
+                a = rnd.randint(0, 60)
+                hits.append(checks.Hit(rnd.choice(cats), "k", a, a + rnd.randint(1, 12), "v"))
+            key = lambda hs: [(h.cat, h.start, h.end) for h in hs]   # noqa: E731
+            self.assertEqual(key(checks._dedupe(list(hits))), key(_dedupe_reference(list(hits))))
+
+    def test_many_hits(self):
+        hits = [checks.Hit("business", "amount", 20 * i, 20 * i + 10, "HKD %d" % i) for i in range(50000)]
+        hits += [checks.Hit("pii", "phone", 20 * i + 5, 20 * i + 15, "p") for i in range(0, 50000, 7)]
+        t = time.time()
+        kept = checks._dedupe(hits)
+        self.assertLess(time.time() - t, 10)            # minutes before; well under a second now
+        self.assertEqual(len(kept), 50000)
+        self.assertEqual(sum(1 for h in kept if h.cat == "pii"), len(range(0, 50000, 7)))
+
+    def test_big_csv_dry_run(self):
+        rows = ["退款单号,订单号,退款金额,手续费,状态"]
+        rows += ["RF%09d,OD%09d,HKD %d.00,HKD %d.50,已退款" % (i, i, 100 + i % 900, i % 50) for i in range(6000)]
+        self.file("退款明细.csv", "\n".join(rows) + "\n")
+        t = time.time()
+        rep = self.build(dry_run=True)
+        self.assertLess(time.time() - t, 60)
+        self.assertIn("amount×12000", rep["findings"][0])
 
 
 if __name__ == "__main__":
