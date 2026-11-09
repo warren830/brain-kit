@@ -337,6 +337,7 @@ def cmd_install(a):
     if new_cfg is not None:
         write_json(kit_cfg, new_cfg)
         print("Wrote %s: check tracker/req_prefix, gitlab, bot_users and pins, then commit it." % config.KIT_CONFIG)
+    _agent_model_from_kit(repo, config.merged(config.DEFAULTS, load_json(kit_cfg)))
     _exclude_run_records(repo, config.merged(config.DEFAULTS, load_json(kit_cfg)))
     bd = os.path.join(repo, load_json(kit_cfg).get("brain_dir", "brain"))
     os.makedirs(bd, exist_ok=True)
@@ -358,6 +359,33 @@ def cmd_install(a):
             f.write(("\n" if text and not text.endswith("\n") else "") + "".join(line + "\n" for line in missing))
     print("brain-kit %s installed in %s. Next: `brain doctor`." % (__version__, repo))
     return 0
+
+
+BRAIN_DEV_MD = os.path.join(".kiro", "agents", "brain-dev.md")
+
+
+def _agent_model_from_kit(repo, cfg):
+    """The brain-dev agent the kit just copied names brain-kit's default model; the team's choice is kit.json's
+    `model` (what `brain doctor` holds it to): write that one into its front matter."""
+    model = cfg.get("model")
+    if not isinstance(model, str) or model not in (cfg.get("allowed_models") or []):
+        return                      # kit.json is wrong: every command says so (config.load)
+    p = os.path.join(repo, BRAIN_DEV_MD)
+    if not os.path.isfile(p) or _frontmatter(p).get("model") == model:
+        return
+    with open(p, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    if lines[0].strip() != "---":
+        return
+    for i, line in enumerate(lines[1:], 1):
+        if line.strip() == "---":
+            break
+        if line.split(":", 1)[0].strip() == "model":
+            lines[i] = "model: %s" % model
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+            print("%s: model %s, as %s says." % (BRAIN_DEV_MD, model, config.KIT_CONFIG))
+            return
 
 
 def _exclude_run_records(repo, cfg):

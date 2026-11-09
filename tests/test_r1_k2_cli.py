@@ -280,5 +280,27 @@ class R1_31_DoctorOffline(Project):
         self.assertIn("OK   Brain vs origin/main: same", out)
 
 
+class R1_32_InstallKeepsTheTeamsModel(Project):
+    def test_r1_32_install_writes_kit_json_model_into_brain_dev(self):
+        kp = os.path.join(self.repo, ".brain", "kit.json")
+        kit = load_json(kp)
+        other = [m for m in kit["allowed_models"] if m != kit["model"]][0]
+        kit["model"] = other
+        write_json(kp, kit)
+        rc, out = brain(self.repo, "doctor", "--offline")
+        self.assertIn("FAIL brain-dev model", out)                   # brain-dev.md still names the default
+        rc, out = brain(self.repo, "install", self.repo, "--lean", LEAN_SRC)      # the upgrade path
+        self.assertEqual(rc, 0, out)
+        rc, out = brain(self.repo, "doctor", "--offline")
+        self.assertIn("OK   brain-dev model: %s (want %s)" % (other, other), out)
+        md = os.path.join(self.repo, ".kiro", "agents", "brain-dev.md")
+        with open(md, encoding="utf-8") as f:
+            text = f.read()
+        self.assertEqual(text.count("model: "), 1, text[:300])
+        with open(os.path.join(cli.KIT_SRC, ".kiro", "agents", "brain-dev.md"), encoding="utf-8") as f:
+            ship = f.read()
+        self.assertEqual(text.splitlines()[4:], ship.splitlines()[4:])    # nothing else changed
+
+
 if __name__ == "__main__":
     unittest.main()
