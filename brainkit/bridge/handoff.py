@@ -123,6 +123,13 @@ def _event_order(ev):
     return n, t.timestamp() if t else float("-inf")
 
 
+def _users(authz) -> dict:
+    """brain-authz `users` by lowercased GitLab username: branch owners are lowercased, and GitLab usernames are
+    not case-sensitive (roles and bot_users are compared lowercased too)."""
+    users = authz.get("users") or {}
+    return {str(k).lower(): v for k, v in users.items()} if isinstance(users, dict) else {}
+
+
 class Bridge(DecisionLoop):
     def __init__(self, cfg, gitlab, jira, kirocrew=None, out=print, signer=None):
         """`signer`: any object with sign(voucher) -> signature; default the one bridge.json names (sign.py)."""
@@ -139,7 +146,7 @@ class Bridge(DecisionLoop):
             authz = load_json(cfg["identities"])
         except (OSError, ValueError) as e:
             raise BrainError("bridge config: identities %s cannot be read: %s" % (cfg["identities"], e))
-        self.ids = authz.get("users", {})
+        self.ids = _users(authz)
         self.roles = authz.get("roles", {})
         self._kit = {}
         self._kit_at = {}
@@ -202,7 +209,7 @@ class Bridge(DecisionLoop):
         except (OSError, ValueError) as e:
             self.out("identities %s not read again (the ones read before stay): %s" % (self.cfg["identities"], e))
             return
-        self.ids, self.roles, self._ids_mtime = authz.get("users", {}), authz.get("roles", {}), m
+        self.ids, self.roles, self._ids_mtime = _users(authz), authz.get("roles", {}), m
 
     # ---------- checks ----------
 

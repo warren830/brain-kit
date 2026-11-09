@@ -354,5 +354,33 @@ class SignedDesignOnTheDevMachine(_Flow):
         self.assertEqual(self.warnings(), [])
 
 
+class UsersKeyCase(unittest.TestCase):
+    """R1-09: brain-authz `users` was looked up case-sensitively with the lowercased branch owner; a username
+    written with GitLab's capitals (Alice) was "not in brain-authz identities"."""
+
+    def test_users_with_capitals(self):
+        import json
+        from tests import test_bridge as tb
+        t = bridge_fixture(self)
+        with open(t.cfg["identities"], "w", encoding="utf-8") as f:
+            json.dump({"users": {"Alice": {"jira": "alice"}, "Carol": {}, "Dave": {}},
+                       "roles": {"product": ["Carol"], "builder": ["Dave"]}}, f)
+        t.bridge = t.new_bridge()
+        self.assertEqual(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5]), "accepted")
+
+    def test_reloaded_identities_too(self):
+        import json
+        import time
+        from tests import test_bridge as tb
+        t = bridge_fixture(self)
+        time.sleep(0.01)
+        with open(t.cfg["identities"], "w", encoding="utf-8") as f:
+            json.dump({"users": {"ALICE": {"jira": "alice"}}, "roles": {}}, f)
+        os.utime(t.cfg["identities"], (time.time() + 5, time.time() + 5))
+        t.bridge._reload_identities()
+        self.assertIn("alice", t.bridge.ids)
+        self.assertEqual(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5]), "accepted")
+
+
 if __name__ == "__main__":
     unittest.main()
