@@ -393,6 +393,34 @@ class R1_57WhiteOnDarkFill(unittest.TestCase):
         self.assertNotIn("张伟", blob)                       # the 修订人 column keeps its header, so it is masked
         self.assertIn("person×1", rep["findings"][0])
 
+    def test_the_nearest_layer_counts(self):
+        """White over dark is white (a white cell in a dark table, a white run shading in a dark cell); a solid
+        pattern shows its pattern colour; the default paragraph style, the document defaults and the theme colour
+        count."""
+        white = '<w:color w:val="FFFFFF"/>'
+        dark = '<w:shd w:val="clear" w:fill="1F4E79"/>'
+        body = ('<w:tbl><w:tblPr>%s</w:tblPr><w:tr><w:tc><w:tcPr><w:shd w:val="clear" w:fill="FFFFFF"/></w:tcPr>%s</w:tc>'
+                '<w:tc><w:tcPr>%s</w:tcPr>%s</w:tc><w:tc>%s</w:tc></w:tr></w:tbl>'
+                % (dark, wp("H1", white), dark, wp("H2", white + '<w:shd w:val="clear" w:fill="FFFFFF"/>'),
+                   wp("表底深色可见", white)) +
+                wp("H3", white + '<w:shd w:val="solid" w:color="FFFFFF" w:fill="000000"/>') +
+                wp("H4", '<w:color w:val="000000" w:themeColor="background1"/>') +
+                wp("主题浅色加深可见", '<w:color w:val="BFBFBF" w:themeColor="background1" w:themeShade="BF"/>'))
+        for styles, text in (('<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:rPr><w:vanish/></w:rPr>'
+                              '</w:style>', "H5"),
+                             ('<w:docDefaults><w:rPrDefault><w:rPr>%s</w:rPr></w:rPrDefault></w:docDefaults>' % white,
+                              "H6")):
+            path = docx(os.path.join(tmpdir(self), "a.docx"), body + wp(text),
+                        [("word/styles.xml", '<?xml version="1.0"?><w:styles %s>%s</w:styles>' % (W, styles))])
+            doc = convert.convert(path)
+            hidden = "\n".join(t for _, t in doc.hidden)
+            for h in ("H1", "H2", "H3", "H4", text):
+                self.assertNotIn(h, doc.text, (styles, h))
+                self.assertIn(h, hidden)
+        doc = convert.convert(docx(os.path.join(tmpdir(self), "b.docx"), body))
+        for shown in ("表底深色可见", "主题浅色加深可见"):
+            self.assertIn(shown, doc.text)
+
 
 class R1_58Big5(unittest.TestCase):
     """A Big5 text (HK / TW exports) is read as Big5, not as GB18030 mojibake, so its names and phones are masked;
