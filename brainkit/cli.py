@@ -759,6 +759,20 @@ def cmd_start(a):
         raise BrainError("use --doc (take documents in now) or --package (an existing package), not both")
     if a.package and package_id_problem(a.package):
         raise BrainError(package_id_problem(a.package))
+    # what run.json must hold is checked by runrec.validate's rules now, before anything is claimed or written:
+    # status, handoff and the bridge refuse a run.json that breaks them
+    if a.package and runrec.package_key(a.package) != a.key:
+        pk = runrec.package_key(a.package)
+        raise BrainError("--package %s is %s's material package%s: a run takes only its own requirement's packages "
+                         "(`brain start %s --key %s --package %s`)" % (
+                             a.package, pk, ", not %s's" % a.key if a.key else " and this start names no --key",
+                             a.slug or "<slug>", pk, a.package))
+    paths = [p.strip() for p in (a.paths or "").split(",") if p.strip()]
+    bad = [w for w in (runrec.path_problem(p) for p in paths) if w]
+    if len(paths) > runrec.MAX_PATHS:
+        bad.append("%d paths, at most %d" % (len(paths), runrec.MAX_PATHS))
+    if bad:
+        raise BrainError("--paths: %s" % "; ".join(bad))
     if a.doc and (not a.consent or not a.classification):
         raise BrainError("--doc needs --consent and --classification (see `brain intake --help`)")
     from . import intents
@@ -818,9 +832,11 @@ def cmd_start(a):
         if a.package:
             materials.append(attach_package(repo, store, a.package))
         intent = lean.new_intent(repo, "%s-%s" % (key.lower(), slug), "%s %s" % (key, title))
-        paths = [p.strip() for p in (a.paths or "").split(",") if p.strip()]
         rec = runrec.new(key, me, br, intent, brain_commit, __version__, paths, iso(utcnow()), checked,
                          tracker=cfg["tracker"], materials=materials)
+        probs = runrec.validate(rec, branch=br, prefix=cfg["branch_prefix"])
+        if probs:                   # never write a run.json that status, handoff and the bridge refuse
+            raise BrainError("run.json would not be valid: %s" % "; ".join(probs))
         write_json(os.path.join(repo, rec_path), rec)
         intent_md = []    # the claim's text (an intent from debt, alert, schedule, eval or gap) for the run's agent
         if intents.is_intent(doc):

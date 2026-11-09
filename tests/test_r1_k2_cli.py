@@ -119,5 +119,33 @@ class R1_33_ClosedUnclaimed(Project):
         self.assertEqual(branch(self.repo), "main")
 
 
+class R1_25_StartChecksRunJson(Project):
+    def test_r1_25_paths_run_json_cannot_hold_are_refused_before_the_claim(self):
+        for p in ("packages/@acme/pay", "web/app/(shop)/refund", "web/pages/[id].tsx", "src/退款", "src/pay,docs/需求"):
+            rc, out = brain(self.repo, "start", "refund", "--paths", p)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("--paths: ", out)
+            self.assertIn("is not a path run.json can hold", out)
+            self.assertEqual(branch(self.repo), "main")
+            self.assertEqual(self.claim_refs(), [], out)
+        rc, out = brain(self.repo, "start", "refund", "--paths", "packages/*acme/pay,src/*")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(brain(self.repo, "status")[0], 0)
+
+    def test_r1_25_a_package_of_another_requirement_is_refused_before_the_claim(self):
+        store = self.intake("PAY-1")
+        rc, out = brain(self.repo, "start", "refund", "--package", "PKG-PAY-1-1", "--store", store)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("PKG-PAY-1-1 is PAY-1's material package", out)
+        self.assertIn("--key PAY-1 --package PKG-PAY-1-1", out)
+        rc, out = brain(self.repo, "start", "refund", "--key", "PAY-2", "--package", "PKG-PAY-1-1", "--store", store)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("not PAY-2's", out)
+        self.assertEqual((branch(self.repo), self.claim_refs()), ("main", []))
+        rc, out = brain(self.repo, "start", "refund", "--key", "PAY-1", "--package", "PKG-PAY-1-1", "--store", store)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(brain(self.repo, "status")[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
