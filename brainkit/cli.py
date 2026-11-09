@@ -273,8 +273,8 @@ def package_id_problem(pkg) -> str:
     return "--package %r is not a package id PKG-<KEY>-<n> (`brain intake` prints it)" % (pkg,)
 
 
-def attach_package(repo, store, pkg) -> dict:
-    """Copy a checked package read-only into the run's workspace; return its run.json entry."""
+def _checked_package(store, pkg) -> str:
+    """The store's folder of package `pkg` once it is an id, is there and is intact (else BrainError)."""
     why = package_id_problem(pkg)
     if why:
         raise BrainError(why)
@@ -284,6 +284,12 @@ def attach_package(repo, store, pkg) -> dict:
     probs = intake.verify_package(src)
     if probs:
         raise BrainError("package %s is damaged: %s" % (pkg, "; ".join(probs)))
+    return src
+
+
+def attach_package(repo, store, pkg) -> dict:
+    """Copy a checked package read-only into the run's workspace; return its run.json entry."""
+    src = _checked_package(store, pkg)
     _readonly_copy(src, os.path.join(repo, MATERIALS_DIR, pkg))
     return {"package": pkg, "manifest_sha256": intake.manifest_digest(src)}
 
@@ -728,6 +734,88 @@ def cmd_intake(a):
 
 # ---------- start ----------
 
+LEAN_ACTIVE = os.path.join(".aidlc-lean", "active.json")     # Lean's active intent on this clone (git-ignored)
+
+
+def _untracked(repo) -> set:
+    out = git(repo, "ls-files", "-z", "--others", "--exclude-standard", check=False).stdout
+    return {p for p in out.split("\0") if p}
+
+
+def _start_snapshot(repo, pkg) -> dict:
+    """What `brain start` needs to go back to where it began, taken right before it switches to the run branch."""
+    def read(rel):
+        try:
+            with open(os.path.join(repo, rel), "rb") as f:
+                return f.read()
+        except OSError:
+            return None
+    return {"head": git(repo, "symbolic-ref", "-q", "--short", "HEAD", check=False).stdout.strip(),
+            "sha": git_out(repo, "rev-parse", "HEAD"), "untracked": _untracked(repo), "active": read(LEAN_ACTIVE),
+            "materials": os.path.join(repo, MATERIALS_DIR, pkg) if pkg and not os.path.exists(
+                os.path.join(repo, MATERIALS_DIR, pkg)) else None}
+
+
+def _unclaim(repo, key, sha) -> bool:
+    """Delete claim/<KEY>, which this start made, while it is still commit `sha` (never one someone changed)."""
+    r = claims.ref(key)
+    if _has_origin(repo):
+        if git(repo, "push", "-q", "--force-with-lease=%s:%s" % (r, sha), "origin", ":" + r,
+               check=False).returncode != 0:
+            return False
+        git(repo, "update-ref", "-d", "refs/remotes/origin/claim/" + key, check=False)
+        git(repo, "update-ref", "-d", r, check=False)
+        return True
+    return git(repo, "update-ref", "-d", r, sha, check=False).returncode == 0
+
+
+def _undo_start(repo, cfg, key, me, br, switched, created, took):
+    """Put back what a `brain start` that did not get to its commit did, so that the next try begins where this one
+    did: the run branch it made, with the files it wrote there (the branch it began on is checked out again; the
+    tree was clean then, so every change to a tracked file is its own), Lean's active intent, and the claim it made
+    (deleted) or took (released). What cannot be put back is said, with the command that does it."""
+    if switched:
+        back = switched["head"] or switched["sha"]
+        try:
+            git(repo, "reset", "-q", "--hard")
+            mine = (lean.DOCS + "/", "%s/%s/" % (cfg["runs_dir"], key))
+            for rel in sorted(_untracked(repo) - switched["untracked"]):
+                if rel.startswith(mine):
+                    os.remove(os.path.join(repo, rel))
+                    d = os.path.dirname(os.path.join(repo, rel))
+                    while d != repo and os.path.isdir(d) and not os.listdir(d):
+                        os.rmdir(d)
+                        d = os.path.dirname(d)
+            active = os.path.join(repo, LEAN_ACTIVE)
+            if switched["active"] is not None:
+                with open(active, "wb") as f:
+                    f.write(switched["active"])
+            elif os.path.exists(active):
+                os.remove(active)
+            if switched["materials"] and os.path.isdir(switched["materials"]):
+                _make_writable(switched["materials"])
+                shutil.rmtree(switched["materials"])
+            git(repo, "switch", "-q", *([switched["head"]] if switched["head"] else ["--detach", switched["sha"]]))
+            git(repo, "branch", "-q", "-D", br)
+            print("Removed branch %s: the start did not finish (back on %s)." % (br, back))
+        except Exception as e:  # noqa: BLE001 - say what is left; the error that stopped the start is shown next
+            print("WARN: branch %s is still there (%s): `git switch %s` and `git branch -D %s` remove it."
+                  % (br, e, back, br))
+    keep = ("WARN: %s is still claimed by you (%%s): `brain start <slug> --key %s` uses it, `brain claim --release "
+            "%s` makes it 待认领 again." % (key, key, key))
+    if took:
+        try:
+            claims.release(repo, key, me)
+            print("Released %s again: the start did not finish." % key)
+        except Exception as e:  # noqa: BLE001
+            print(keep % e)
+    if created:
+        if _unclaim(repo, key, created):
+            print("Gave %s back (claim/%s deleted): the start did not finish." % (key, key))
+        else:
+            print(keep % ("claim/%s could not be deleted" % key))
+
+
 def cmd_start(a):
     repo = repo_root()
     cfg = config.load(repo)
@@ -773,6 +861,8 @@ def cmd_start(a):
         bad.append("%d paths, at most %d" % (len(paths), runrec.MAX_PATHS))
     if bad:
         raise BrainError("--paths: %s" % "; ".join(bad))
+    if a.package:
+        _checked_package(_store(repo, a.store), a.package)     # not there or damaged: refused before the claim
     if a.doc and (not a.consent or not a.classification):
         raise BrainError("--doc needs --consent and --classification (see `brain intake --help`)")
     from . import intents
@@ -803,32 +893,37 @@ def cmd_start(a):
                 if w not in bad:
                     print("WARN: claim/%s: %s (filed before this rule; check runs/%s/%s before you hand over)"
                           % (key, w, key, intents.INTENT_MD))
+    created = took = switched = None    # what a start that does not finish puts back (_undo_start)
+    if cfg["tracker"] == "none":
         if not take:
             key = _claim(repo, cfg, me, key, a.title or (doc or {}).get("title") or slug.replace("-", " "))
+            if doc is None:             # claimed just now (not one I had already)
+                created = git(repo, "rev-parse", "-q", "--verify", claims.ref(key), check=False).stdout.strip()
         checked = True
-    title = a.title or (doc or {}).get("title") or slug.replace("-", " ")
-    rec_path = runrec.path(cfg["runs_dir"], key)
-    base, brain_commit = _brain_base(repo, cfg)
-    if git(repo, "cat-file", "-e", "%s:%s" % (base, rec_path), check=False).returncode == 0:
-        raise BrainError("%s already exists on %s: this requirement already has a run" % (rec_path, base))
     br = branch_name(cfg["branch_prefix"], me, key, slug)
-    if git(repo, "rev-parse", "--verify", "-q", "refs/heads/" + br, check=False).returncode == 0:
-        raise BrainError("branch %s already exists" % br)
-    if _has_origin(repo) and git(repo, "ls-remote", "--exit-code", "--heads", "origin", br,
-                                 check=False).returncode == 0:
-        raise BrainError("branch %s already exists on origin" % br)
-    took = False
-    if cfg["tracker"] == "none" and a.key and take:
-        doc = claims.take(repo, key, me)
-        took = True
-        print("Claimed %s for %s." % (key, me))
     try:
+        title = a.title or (doc or {}).get("title") or slug.replace("-", " ")
+        rec_path = runrec.path(cfg["runs_dir"], key)
+        base, brain_commit = _brain_base(repo, cfg)
+        if git(repo, "cat-file", "-e", "%s:%s" % (base, rec_path), check=False).returncode == 0:
+            raise BrainError("%s already exists on %s: this requirement already has a run" % (rec_path, base))
+        if git(repo, "rev-parse", "--verify", "-q", "refs/heads/" + br, check=False).returncode == 0:
+            raise BrainError("branch %s already exists" % br)
+        if _has_origin(repo) and git(repo, "ls-remote", "--exit-code", "--heads", "origin", br,
+                                     check=False).returncode == 0:
+            raise BrainError("branch %s already exists on origin" % br)
+        if cfg["tracker"] == "none" and a.key and take:
+            doc = claims.take(repo, key, me)
+            took = True
+            print("Claimed %s for %s." % (key, me))
         materials = []
         store = _store(repo, a.store)
         if a.doc:
             rep = _intake(repo, cfg, a, key, me)
             a.package = rep["package"]
+        before = _start_snapshot(repo, a.package)
         git(repo, "switch", "-q", "-c", br, base)
+        switched = before
         if a.package:
             materials.append(attach_package(repo, store, a.package))
         intent = lean.new_intent(repo, "%s-%s" % (key.lower(), slug), "%s %s" % (key, title))
@@ -848,12 +943,7 @@ def cmd_start(a):
             git(repo, "add", "--", os.path.join(lean.DOCS, "audit"))
         git(repo, "commit", "-q", "-m", "%s: start run (brain %s)" % (key, brain_commit[:10]))
     except BaseException:
-        if took:                    # the start did not get to its commit: the claim taken here goes back
-            try:
-                claims.release(repo, key, me)
-                print("Released %s again: the start did not finish." % key)
-            except Exception:  # noqa: BLE001 - the error that stopped the start is the one to show
-                pass
+        _undo_start(repo, cfg, key, me, br, switched, created, took)    # the start did not get to its commit
         raise
     pushed = False
     if _has_origin(repo) and not a.no_push:

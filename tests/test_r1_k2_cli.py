@@ -147,5 +147,80 @@ class R1_25_StartChecksRunJson(Project):
         self.assertEqual(brain(self.repo, "status")[0], 0)
 
 
+class R1_23_UnfinishedStartPutsBack(Project):
+    def setUp(self):
+        super().setUp()
+        self.add_origin()
+
+    def origin_claims(self):
+        return sh("git", "-C", self.repo, "ls-remote", "origin", "refs/heads/claim/*").stdout.split()[1::2]
+
+    def test_r1_23_a_document_gate_failing_gives_the_new_claim_back(self):
+        docs = self.docs("# 退款\n\n单笔最多 5,000 元。\n")
+        rc, out = brain(self.repo, "start", "refund", "--doc", docs, "--classification", "internal", "--consent",
+                        "--store", os.path.join(self.d, "store"))          # forgot --business
+        self.assertEqual(rc, 2, out)
+        self.assertIn("Gave PAY-1 back (claim/PAY-1 deleted)", out)
+        self.assertEqual((self.origin_claims(), self.claim_refs(), branch(self.repo)), ([], [], "main"))
+        rc, out = brain(self.repo, "start", "refund", "--doc", docs, "--classification", "internal", "--consent",
+                        "--business", "mask", "--store", os.path.join(self.d, "store"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Started PAY-1 on ai/alice/PAY-1-refund", out)        # the same key, the same branch
+
+    def test_r1_23_a_missing_package_is_refused_before_the_claim(self):
+        rc, out = brain(self.repo, "start", "refund", "--package", "PKG-PAY-9-1", "--key", "PAY-9",
+                        "--store", os.path.join(self.d, "store"))
+        self.assertEqual(rc, 2, out)
+        self.assertIn("package PKG-PAY-9-1 not found", out)
+        self.assertEqual((self.origin_claims(), branch(self.repo)), ([], "main"))
+
+    def test_r1_23_a_failure_on_the_run_branch_removes_it_and_what_it_wrote(self):
+        store = self.intake("PAY-1")
+        lean_json = os.path.join(self.repo, "aidlc-docs", "lean.json")
+        with open(lean_json, encoding="utf-8") as f:
+            before = f.read()
+
+        def half_done(repo, slug, title):          # Lean wrote some of its files, then stopped
+            commit_dir = os.path.join(repo, "aidlc-docs", "261110-pay-1-refund")
+            os.makedirs(commit_dir)
+            with open(os.path.join(commit_dir, "aidlc-state.md"), "w") as f:
+                f.write("# half\n")
+            with open(lean_json, "a") as f:
+                f.write("\n")
+            raise cli.BrainError("Lean stopped")
+
+        from unittest import mock
+        with mock.patch.object(lean, "new_intent", side_effect=half_done):
+            rc, out = brain(self.repo, "start", "refund", "--key", "PAY-1", "--package", "PKG-PAY-1-1",
+                            "--store", store)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("Lean stopped", out)
+        self.assertIn("Removed branch ai/alice/PAY-1-refund", out)
+        self.assertEqual(branch(self.repo), "main")
+        self.assertEqual(sh("git", "-C", self.repo, "branch", "--list", "ai/*").stdout.strip(), "")
+        self.assertEqual(sh("git", "-C", self.repo, "status", "--porcelain").stdout, "")
+        self.assertFalse(os.path.exists(os.path.join(self.repo, "aidlc-docs", "261110-pay-1-refund")))
+        self.assertFalse(os.path.exists(os.path.join(self.repo, ".brain-materials", "PKG-PAY-1-1")))
+        with open(lean_json, encoding="utf-8") as f:
+            self.assertEqual(f.read(), before)
+        self.assertEqual(self.origin_claims(), [])
+        rc, out = brain(self.repo, "start", "refund", "--key", "PAY-1", "--package", "PKG-PAY-1-1", "--store", store)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(brain(self.repo, "status")[0], 0)
+
+    def test_r1_23_a_claim_that_was_mine_already_stays(self):
+        self.assertEqual(brain(self.repo, "claim", "--key", "PAY-3", "--title", "fees")[0], 0)
+        rc, out = brain(self.repo, "start", "fees", "--key", "PAY-3", "--package", "PKG-PAY-3-1",
+                        "--store", os.path.join(self.d, "store"))
+        self.assertEqual(rc, 2, out)
+        from unittest import mock
+        with mock.patch.object(lean, "new_intent", side_effect=cli.BrainError("Lean stopped")):
+            rc, out = brain(self.repo, "start", "fees", "--key", "PAY-3")
+        self.assertEqual(rc, 2, out)
+        self.assertNotIn("Gave PAY-3 back", out)
+        self.assertEqual(self.origin_claims(), ["refs/heads/claim/PAY-3"])
+        self.assertEqual(branch(self.repo), "main")
+
+
 if __name__ == "__main__":
     unittest.main()
