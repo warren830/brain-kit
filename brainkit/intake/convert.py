@@ -9,12 +9,15 @@ from __future__ import annotations
 import colorsys
 import csv
 import io
+import lzma
 import os
 import posixpath
 import re
 import shutil
+import struct
 import subprocess
 import zipfile
+import zlib
 from html.parser import HTMLParser
 from xml.etree import ElementTree as ET
 from xml.parsers import expat
@@ -1096,7 +1099,7 @@ def convert(path, name=None) -> Doc:
     except Refused:
         raise
     except (ET.ParseError, ValueError, KeyError, IndexError, zipfile.BadZipFile, UnicodeDecodeError, OSError,
-            RuntimeError, EOFError) as e:
+            RuntimeError, EOFError, zlib.error, lzma.LZMAError, struct.error) as e:   # a damaged zip member
         raise Refused("文件内容损坏或格式不对：%s" % (str(e)[:200] or type(e).__name__))
 
 

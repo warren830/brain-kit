@@ -54,6 +54,13 @@ def sha256_file(path) -> str:
     return h.hexdigest()
 
 
+def _size(path) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def collect(paths) -> list:
     """[(abs_path, display_name)] for files and folders (folders recursively, sorted, junk skipped)."""
     out = []
@@ -165,7 +172,7 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
         raise BrainError("没有可收的文件")
     max_file = kit_intake.get("max_file_mb", 50) * 1024 * 1024
     max_total = kit_intake.get("max_total_mb", 200) * 1024 * 1024
-    total = sum(os.path.getsize(p) for p, _ in files)
+    total = sum(_size(p) for p, _ in files)
     if total > max_total:
         raise BrainError("总大小 %.1f MB 超过上限 %d MB" % (total / 1048576, kit_intake.get("max_total_mb", 200)))
     masker = checks.Masker()
@@ -173,7 +180,12 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
     converted = []
     for i, (path, name) in enumerate(files, 1):
         sid = "D%02d" % i
-        info = {"id": sid, "name": name, "sha256": sha256_file(path), "bytes": os.path.getsize(path)}
+        try:
+            info = {"id": sid, "name": name, "sha256": sha256_file(path), "bytes": os.path.getsize(path)}
+        except OSError as e:                         # no read permission, a broken link, gone meanwhile: that file
+            refused.append({"id": sid, "name": name, "sha256": None, "bytes": _size(path),
+                            "reason": "读不了这个文件（%s）" % (e.strerror or type(e).__name__)})
+            continue
         if info["bytes"] > max_file:
             refused.append(dict(info, reason="单个文件超过 %d MB" % kit_intake.get("max_file_mb", 50)))
             continue

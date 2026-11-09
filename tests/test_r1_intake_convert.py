@@ -410,5 +410,39 @@ class R1_61MarkingsOnEverySheet(unittest.TestCase):
         self.assertEqual(self.gate2(e)["classification"], "internal")
 
 
+class R1_63OneBadFile(unittest.TestCase):
+    """A damaged docx (zlib.error in a member) or a file that cannot be read is refused with a reason; the other
+    files are taken in as usual."""
+
+    def test_damaged_and_unreadable_files_are_refused_alone(self):
+        d = tmpdir(self)
+        src = os.path.join(d, "src")
+        write(os.path.join(src, "ok.md"), "# 退款\n\n14 天内可退。\n")
+        bad = os.path.join(src, "坏.docx")
+        with zipfile.ZipFile(bad, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("word/document.xml", '<w:document %s><w:body>%s</w:body></w:document>'
+                       % (W, wp("第一条：退款规则说明，十四天内可以退款。") * 200))
+        with zipfile.ZipFile(bad) as z:
+            info = z.getinfo("word/document.xml")
+        data = bytearray(open(bad, "rb").read())
+        start = info.header_offset + 30 + len(info.filename.encode()) + len(info.extra)
+        for k in range(start + 10, start + 40):              # flip bytes inside the compressed member
+            data[k] ^= 0x5A
+        write(bad, bytes(data), "wb")
+        locked = write(os.path.join(src, "附件", "旧版.md"), "# 旧版\n")
+        os.chmod(locked, 0)
+        self.addCleanup(os.chmod, locked, 0o644)
+        os.symlink(os.path.join(d, "gone.md"), os.path.join(src, "断链.md"))
+        if os.access(locked, os.R_OK):
+            self.skipTest("running as a user who can read a mode-000 file")
+        rep, store = build(src)
+        self.assertEqual(rep["sources"], 1)
+        reasons = {r["name"]: r["reason"] for r in rep["refused"]}
+        self.assertIn("文件内容损坏或格式不对", reasons["src/坏.docx"])
+        self.assertIn("读不了这个文件", reasons["src/附件/旧版.md"])
+        self.assertIn("读不了这个文件", reasons["src/断链.md"])
+        self.assertIn("14 天内可退", "\n".join(package_text(store, rep).values()))
+
+
 if __name__ == "__main__":
     unittest.main()
