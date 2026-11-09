@@ -357,5 +357,28 @@ class R1_57WhiteOnDarkFill(unittest.TestCase):
         self.assertIn("person×1", rep["findings"][0])
 
 
+class R1_58Big5(unittest.TestCase):
+    """A Big5 text (HK / TW exports) is read as Big5, not as GB18030 mojibake, so its names and phones are masked;
+    GB text stays GB."""
+    TRAD = "退款需求\r\n負責人：陳大文\r\n電話：9123 4567\r\n退款須在十四日內完成，唔該跟進。\r\n"
+    SIMP = "退款需求\n负责人：张伟\n退款须在十四日内完成。\n"
+
+    def test_big5_and_gb_texts(self):
+        d = tmpdir(self)
+        src = os.path.join(d, "src")
+        write(os.path.join(src, "big5.txt"), self.TRAD.encode("big5hkscs"), "wb")
+        write(os.path.join(src, "cp950.md"), ("# 價格\n\n上限 €100，負責人：張偉\n").encode("cp950"), "wb")
+        write(os.path.join(src, "gb.txt"), self.SIMP.encode("gb18030"), "wb")
+        write(os.path.join(src, "gb-trad.txt"), self.TRAD.encode("gb18030"), "wb")   # traditional text saved as GBK
+        for name, want in (("big5.txt", "負責人：陳大文"), ("cp950.md", "上限 €100"), ("gb.txt", "负责人：张伟"),
+                           ("gb-trad.txt", "負責人：陳大文")):
+            self.assertIn(want, convert.convert(os.path.join(src, name)).text, name)
+        rep, store = build(src)
+        blob = "\n".join(package_text(store, rep).values())
+        for raw in ("陳大文", "張偉", "张伟", "9123 4567"):
+            self.assertNotIn(raw, blob)
+        self.assertIn("phone×1", [f for f in rep["findings"] if "big5.txt" in f][0])
+
+
 if __name__ == "__main__":
     unittest.main()

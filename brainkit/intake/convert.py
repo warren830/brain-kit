@@ -227,12 +227,44 @@ def decode_text(data: bytes) -> str:
             return data.decode(enc)
         except UnicodeDecodeError:
             pass
-    for enc in ("gb18030", "big5"):
+    read = []
+    for enc in ("gb18030", "big5hkscs", "cp950"):
         try:
-            return data.decode(enc)
+            read.append(data.decode(enc))
         except UnicodeDecodeError:
             pass
-    raise Refused("文本编码无法识别（不是 UTF-8 / GB18030 / Big5）")
+    if not read:
+        raise Refused("文本编码无法识别（不是 UTF-8 / GB18030 / Big5）")
+    # GB18030 takes almost any byte pairs, Big5 too: the reading with more common characters is the right one (on
+    # a tie, GB18030)
+    return max(read, key=_cjk_plausible)
+
+
+def _cjk_plausible(text, sample=20000) -> float:
+    """The share of the Chinese characters (and private-use ones) in the first `sample` of them that are common: in
+    GB2312 level 1 or Big5's frequent set. Big5 read as GB18030, or GB read as Big5, gives many rare and
+    private-use characters (Big5 punctuation becomes private use in GB18030)."""
+    good = seen = 0
+    for c in text:
+        o = ord(c)
+        if not (0x4E00 <= o <= 0x9FFF or 0xE000 <= o <= 0xF8FF or 0x3400 <= o <= 0x4DBF or o >= 0x20000):
+            continue
+        seen += 1
+        good += _common_hanzi(c)
+        if seen >= sample:
+            break
+    return good / seen if seen else 0.0
+
+
+def _common_hanzi(c) -> bool:
+    for enc, lo, hi in (("gb2312", 0xB0A1, 0xD7FE), ("big5", 0xA440, 0xC67E)):
+        try:
+            b = c.encode(enc)
+        except UnicodeEncodeError:
+            continue
+        if len(b) == 2 and lo <= (b[0] << 8 | b[1]) <= hi:
+            return True
+    return False
 
 
 def sniff(path) -> str:
