@@ -23,14 +23,14 @@ def write(path, data, mode="w"):
 
 
 def xlsx(path, sheets, files=()):
-    """sheets: [(name, state or None, [[cell text, ...], ...], extra worksheet XML after sheetData)]."""
+    """sheets: [(name, state or None, [[cell text, ...], ...] or the sheetData XML, worksheet XML after sheetData)]."""
     wb = '<?xml version="1.0"?><workbook %s %s><sheets>' % (S, R)
     rels = '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
     parts = list(files)
     for i, (name, state, rows, tail) in enumerate(sheets, 1):
         wb += '<sheet name="%s" sheetId="%d"%s r:id="rId%d"/>' % (name, i, ' state="%s"' % state if state else "", i)
         rels += '<Relationship Id="rId%d" Target="worksheets/sheet%d.xml"/>' % (i, i)
-        data = "".join('<row r="%d">%s</row>' % (r, "".join(
+        data = rows if isinstance(rows, str) else "".join('<row r="%d">%s</row>' % (r, "".join(
             '<c r="%s%d" t="inlineStr"><is><t>%s</t></is></c>' % (chr(65 + c), r, v) for c, v in enumerate(row) if v))
             for r, row in enumerate(rows, 1))
         parts.append(("xl/worksheets/sheet%d.xml" % i, '<?xml version="1.0"?><worksheet %s><sheetData>%s</sheetData>%s'
@@ -141,6 +141,77 @@ class R1_51SheetHeaderFooter(unittest.TestCase):
             build(src)
         self.assertIn("规则.xlsx=confidential", str(cm.exception))
         self.assertEqual(build(src, kit_intake=dict(KIT, allow_confidential=True))[0]["classification"], "confidential")
+
+
+class R1_53InvisibleContent(unittest.TestCase):
+    """White and tiny text in html (as in md), white text in an xlsx cell without a fill, a hidden pptx group and a
+    slide hidden with show="false" go to the hidden area; white text on a coloured background stays."""
+
+    def test_html_and_md_white_and_tiny_text(self):
+        d = tmpdir(self)
+        snip = ('<p>可见。</p><p style="color:#ffffff">WHITE-P</p><span style="color: white; font-size: 1px">TINY-S</span>'
+                '<span style="font-size:0.1em">TINY-EM</span><font color="#FFF">WHITE-FONT</font>'
+                '<table><tr style="background-color:#1F4E79"><th style="color:#fff">表头白字</th></tr></table>'
+                '<p style="background:#333;color:white">深底白字</p><span style="background-color:#fff">白底</span>'
+                '<span aria-hidden="true">读屏不读</span><div style="overflow:hidden">溢出隐藏</div>')
+        for name, text in (("a.html", "<html><body>%s</body></html>" % snip), ("a.md", "# 需求\n\n%s\n" % snip)):
+            doc = convert.convert(write(os.path.join(d, name), text))
+            hidden = "\n".join(t for _, t in doc.hidden)
+            for h in ("WHITE-P", "TINY-S", "TINY-EM", "WHITE-FONT"):
+                self.assertNotIn(h, doc.text, name)
+                self.assertIn(h, hidden, name)
+            for shown in ("可见", "表头白字", "深底白字", "白底", "读屏不读", "溢出隐藏"):
+                self.assertIn(shown, doc.text, name)
+
+    def test_xlsx_white_font_without_fill(self):
+        styles = ('<?xml version="1.0"?><styleSheet %s><fonts><font><sz val="11"/></font>'
+                  '<font><color rgb="FFFFFFFF"/><sz val="11"/></font><font><color theme="0"/></font>'
+                  '<font><color theme="0" tint="-0.5"/></font><font><sz val="1"/></font></fonts>'
+                  '<fills><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
+                  '<fill><patternFill patternType="solid"><fgColor rgb="FF1F4E79"/></patternFill></fill></fills>'
+                  '<cellXfs><xf fontId="0" fillId="0"/><xf fontId="1" fillId="0"/><xf fontId="2" fillId="0"/>'
+                  '<xf fontId="3" fillId="0"/><xf fontId="1" fillId="2"/><xf fontId="4" fillId="0"/></cellXfs>'
+                  '</styleSheet>') % S
+        cells = [("A1", "0", "普通"), ("B1", "1", "WHITE-RGB"), ("C1", "2", "WHITE-THEME"), ("D1", "3", "深灰可见"),
+                 ("E1", "4", "深底白字"), ("F1", "5", "TINY-FONT")]
+        row = '<row r="1">%s</row>' % "".join('<c r="%s" s="%s" t="inlineStr"><is><t>%s</t></is></c>' % c for c in cells)
+        p = xlsx(os.path.join(tmpdir(self), "a.xlsx"), [("表", None, row, "")], [("xl/styles.xml", styles)])
+        doc = convert.convert(p)
+        hidden = "\n".join(t for _, t in doc.hidden)
+        for h in ("WHITE-RGB", "WHITE-THEME", "TINY-FONT"):
+            self.assertNotIn(h, doc.text)
+            self.assertIn(h, hidden)
+        for shown in ("普通", "深灰可见", "深底白字"):
+            self.assertIn(shown, doc.text)
+
+    def test_pptx_hidden_group_and_slide(self):
+        P = ('xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+             'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"')
+
+        def sp(text, hidden=""):
+            return ('<p:sp><p:nvSpPr><p:cNvPr id="2" name="t"%s/></p:nvSpPr><p:txBody><a:p><a:r><a:t>%s</a:t></a:r>'
+                    '</a:p></p:txBody></p:sp>' % (hidden, text))
+
+        def grp(inner, hidden=""):
+            return ('<p:grpSp><p:nvGrpSpPr><p:cNvPr id="5" name="g"%s/></p:nvGrpSpPr><p:grpSpPr/>%s</p:grpSp>'
+                    % (hidden, inner))
+
+        def slide(inner, attrs=""):
+            return '<?xml version="1.0"?><p:sld %s%s><p:cSld><p:spTree>%s</p:spTree></p:cSld></p:sld>' % (P, attrs, inner)
+
+        path = os.path.join(tmpdir(self), "a.pptx")
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("ppt/slides/slide1.xml", slide(sp("VISIBLE") + grp(sp("IN-GROUP")) +
+                                                      grp(sp("HIDDEN-GROUP") + grp(sp("HIDDEN-NESTED")), ' hidden="1"')))
+            z.writestr("ppt/slides/slide2.xml", slide(sp("HIDDEN-SLIDE-FALSE"), ' show="false"'))
+            z.writestr("ppt/slides/slide3.xml", slide(sp("HIDDEN-SLIDE-0"), ' show="0"'))
+        doc = convert.convert(path)
+        hidden = "\n".join(t for _, t in doc.hidden)
+        self.assertIn("VISIBLE", doc.text)
+        self.assertIn("IN-GROUP", doc.text)
+        for h in ("HIDDEN-GROUP", "HIDDEN-NESTED", "HIDDEN-SLIDE-FALSE", "HIDDEN-SLIDE-0"):
+            self.assertNotIn(h, doc.text)
+            self.assertIn(h, hidden)
 
 
 if __name__ == "__main__":

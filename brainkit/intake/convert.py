@@ -1,10 +1,12 @@
 """File -> Markdown text, with hidden content moved aside. Stdlib only (zip + XML for Office files).
 
-Each converter returns a Doc. Hidden content (HTML comments, display:none, Word hidden/white/tiny text,
-hidden sheets/rows/columns, ';;;' cells, hidden slides) goes to Doc.hidden, never into Doc.text.
+Each converter returns a Doc. Hidden content (HTML comments, display:none, white text with no background and text
+under 4pt in Word, HTML and xlsx, hidden sheets/rows/columns, ';;;' cells, hidden slides, shapes and groups) goes to
+Doc.hidden, never into Doc.text.
 """
 from __future__ import annotations
 
+import colorsys
 import csv
 import io
 import os
@@ -19,8 +21,88 @@ from xml.parsers import expat
 ZW_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069]")
 HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.S)
 TAG_RE = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9]*)\b([^>]*)>")
-HIDDEN_ATTR_RE = re.compile(r"display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?![.0-9]*[1-9])"
-                            r"|opacity\s*:\s*0(?![.0-9]*[1-9])|color\s*:\s*(?:#fff\b|#ffffff\b|white\b)|\bhidden\b", re.I)
+ATTR_RE = re.compile(r"""([^\s=/>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+)))?""")
+HIDING_CLASSES = {"hidden", "hide", "d-none", "invisible", "sr-only", "visually-hidden"}
+CSS_NAMED = {"white": "ffffff", "snow": "fffafa", "ivory": "fffff0", "ghostwhite": "f8f8ff", "whitesmoke": "f5f5f5",
+             "floralwhite": "fffaf0", "mintcream": "f5fffa", "azure": "f0ffff", "seashell": "fff5ee"}
+
+
+def tag_attrs(s) -> dict:
+    """{name: value} of the attributes in a tag's text (names lower case; a bare attribute is '')."""
+    return {m.group(1).lower(): next((v for v in m.groups()[1:] if v is not None), "") for m in ATTR_RE.finditer(s)}
+
+
+def _css(style) -> dict:
+    out = {}
+    for decl in (style or "").split(";"):
+        k, sep, v = decl.partition(":")
+        if sep:
+            out[k.strip().lower()] = v.replace("!important", "").strip().lower()
+    return out
+
+
+def _css_rgba(v):
+    """(r, g, b, alpha) of a CSS colour (#rgb, #rrggbb(aa), rgb() / rgba(), a few named whites), else None."""
+    v = (v or "").strip().lower()
+    if v == "transparent":
+        return 0, 0, 0, 0.0
+    v = CSS_NAMED.get(v, v)
+    m = re.fullmatch(r"#?([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})", v)
+    if m and (v.startswith("#") or v in CSS_NAMED.values()):
+        h = m.group(1)
+        h = "".join(c * 2 for c in h) if len(h) <= 4 else h
+        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), (int(h[6:8], 16) / 255 if len(h) == 8 else 1.0)
+    m = re.fullmatch(r"rgba?\(\s*([0-9.]+%?)[\s,]+([0-9.]+%?)[\s,]+([0-9.]+%?)(?:[\s,/]+([0-9.]+%?))?\s*\)", v)
+    if m:
+        def num(x, top):
+            return float(x[:-1]) * top / 100 if x.endswith("%") else float(x)
+        return (num(m.group(1), 255), num(m.group(2), 255), num(m.group(3), 255),
+                num(m.group(4), 1) if m.group(4) else 1.0)
+    return None
+
+
+def _css_unseen(v) -> bool:
+    """A text colour that does not show on a white page: white, near white, transparent."""
+    c = _css_rgba(v)
+    return c is not None and (c[3] < 0.1 or min(c[:3]) >= 240)
+
+
+def _font_tiny(v) -> bool:
+    """A font size under 4pt (the line Word's check uses): 0, 1px, 0.2em ..."""
+    m = re.match(r"\s*([0-9]*\.?[0-9]+)\s*(px|pt|em|rem|%)?", v or "")
+    if not m:
+        return False
+    pt = float(m.group(1)) * {"px": 0.75, "pt": 1, "em": 12, "rem": 12, "%": 0.12}.get(m.group(2) or "px")
+    return pt < 4
+
+
+def has_background(attrs) -> bool:
+    """The element paints a background of its own (a colour that is not white, or an image): white text on it shows."""
+    bg = attrs.get("bgcolor")
+    css = _css(attrs.get("style"))
+    for v in [bg] + [css.get(k) for k in ("background-color", "background")]:
+        if not v or v in ("none", "inherit", "initial", "unset"):
+            continue
+        if "url(" in v or not _css_unseen(v.split()[0] if not v.startswith("rgb") else v):
+            return True
+    return False
+
+
+def element_hides(tag, attrs, on_background=False) -> bool:
+    """An element renders its content invisibly: the hidden attribute, a hidden input, a hiding class, display:none,
+    visibility:hidden, opacity near 0, a font under 4pt, or white (or transparent) text with no background colour on
+    it or on an element around it (on_background)."""
+    css = _css(attrs.get("style"))
+    try:
+        faint = float(css.get("opacity", "1").rstrip("%")) / (100 if css.get("opacity", "").endswith("%") else 1) < 0.1
+    except ValueError:
+        faint = False
+    colour = css.get("color") or (attrs.get("color") if tag == "font" else None)
+    return ("hidden" in attrs or (tag == "input" and attrs.get("type", "").lower() == "hidden")
+            or bool(HIDING_CLASSES & set(attrs.get("class", "").lower().split()))
+            or css.get("display") == "none" or css.get("visibility") in ("hidden", "collapse") or faint
+            or _font_tiny(css.get("font-size")) or (tag == "font" and attrs.get("size", "").strip() == "0")
+            or (colour is not None and _css_unseen(colour) and not on_background and not has_background(attrs)))
 
 
 def strip_hidden_html(text):
@@ -28,12 +110,19 @@ def strip_hidden_html(text):
     out, hidden = [], []
     pos = 0
     tokens = list(TAG_RE.finditer(text))
+    around = []                                      # (tag, paints a background) of the open elements
     i = 0
     while i < len(tokens):
         t = tokens[i]
-        if t.group(1) == "" and HIDDEN_ATTR_RE.search(t.group(3) or "") and not t.group(3).rstrip().endswith("/"):
-            name = t.group(2).lower()
-            if name in VOID:                         # <input type="hidden" value=...>: no content, no end tag
+        name = t.group(2).lower()
+        attrs = tag_attrs(t.group(3) or "")
+        bare = name in VOID or (t.group(3) or "").rstrip().endswith("/")
+        if t.group(1) == "/":
+            k = max((k for k, (n, _) in enumerate(around) if n == name), default=None)
+            if k is not None:
+                del around[k:]
+        elif element_hides(name, attrs, any(b for _, b in around)):
+            if bare:                                 # <input type="hidden" value=...>: no content, no end tag
                 out.append(text[pos:t.start()])
                 hidden.append(t.group(0))
                 pos = t.end()
@@ -52,6 +141,8 @@ def strip_hidden_html(text):
             pos = end
             i = j
             continue
+        elif not bare:
+            around.append((name, has_background(attrs)))
         i += 1
     out.append(text[pos:])
     return "".join(out), hidden
@@ -225,8 +316,6 @@ def convert_text(path, name) -> Doc:
 
 # ---------- HTML ----------
 
-HIDDEN_STYLE_RE = re.compile(r"display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px|pt|em)?\s*(?:;|$)"
-                             r"|opacity\s*:\s*0(?:\.0+)?\s*(?:;|$)", re.I)
 VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"}
 BLOCK = {"p", "div", "section", "article", "header", "footer", "main", "nav", "aside", "ul", "ol", "dl", "dt", "dd",
          "form", "fieldset", "blockquote", "pre", "figure", "figcaption", "label", "button"}
@@ -237,7 +326,7 @@ class _HTML(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.doc = doc
         self.out = []
-        self.stack = []          # (tag, hidden?)
+        self.stack = []          # (tag, hidden?, paints a background?)
         self.hidden_buf = []
         self.skip_depth = 0      # inside script/style/template
         self.row = None
@@ -246,25 +335,29 @@ class _HTML(HTMLParser):
 
     @property
     def hidden(self):
-        return any(h for _, h in self.stack)
+        return any(h for _, h, _ in self.stack)
 
     def handle_starttag(self, tag, attrs):
-        a = dict(attrs)
+        a = {k.lower(): v or "" for k, v in attrs}
         if tag in ("script", "style", "noscript", "template"):
             self.skip_depth += 1
             self.scripts += tag == "script"
             return
+        on_bg = any(bg for _, _, bg in self.stack)
         if tag == "img":
             self.doc.images += 1
-            if not self.hidden and a.get("alt"):
-                self.out.append(" [图片: %s] " % a.get("alt"))
+            if a.get("alt") and not self.skip_depth:
+                if self.hidden or element_hides(tag, a, on_bg):
+                    self.doc.hide("HTML 隐藏图片的说明文字", a["alt"])
+                else:
+                    self.out.append(" [图片: %s] " % a["alt"])
             return
         if tag in VOID:
             if tag == "br" and not self.skip_depth:
                 (self.hidden_buf if self.hidden else self.out).append("\n")
             return
-        hid = "hidden" in a or bool(HIDDEN_STYLE_RE.search(a.get("style") or "")) or a.get("type") == "hidden"
-        self.stack.append((tag, hid))
+        hid = element_hides(tag, a, on_bg)
+        self.stack.append((tag, hid, has_background(a)))
         if self.skip_depth or self.hidden:
             return
         if re.match(r"^h[1-6]$", tag):
@@ -285,13 +378,13 @@ class _HTML(HTMLParser):
         if tag in VOID:
             return
         # pop to the matching tag (tolerate bad nesting)
-        idx = max((i for i, (t, _) in enumerate(self.stack) if t == tag), default=None)
+        idx = max((i for i, (t, _, _) in enumerate(self.stack) if t == tag), default=None)
         if idx is None:
             return
         was_hidden = self.hidden
         closing = self.stack[idx:]
         del self.stack[idx:]
-        if was_hidden and not self.hidden and any(h for _, h in closing):
+        if was_hidden and not self.hidden and any(h for _, h, _ in closing):
             self.doc.hide("HTML 隐藏元素 <%s>" % tag, "".join(self.hidden_buf))
             self.hidden_buf = []
             return
@@ -396,6 +489,7 @@ NS = {
     "p": "http://schemas.openxmlformats.org/presentationml/2006/main",
     "cp": "http://schemas.openxmlformats.org/officeDocument/2006/custom-properties",
     "vt": "http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes",
+    "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
 }
 
 
@@ -423,6 +517,86 @@ def _col_index(ref):
     return n
 
 
+# the default indexed colours that matter here (a workbook's own <indexedColors> replaces them): black and white
+XL_PALETTE = {0: "000000", 1: "FFFFFF", 8: "000000", 9: "FFFFFF", 64: "000000", 65: "FFFFFF"}
+
+
+def _int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _xl_list(st, group, item):
+    g = st.find(_q("s", group))
+    return g.findall(_q("s", item)) if g is not None else []
+
+
+def _xl_theme(z):
+    """The theme colours ('RRGGBB') in the order <color theme="n"> counts them: lt1, dk1, lt2, dk2, accents ..."""
+    root = _xml(z, "xl/theme/theme1.xml")
+    scheme = root.find(".//" + _q("a", "clrScheme")) if root is not None else None
+    if scheme is None:
+        return ["FFFFFF", "000000", "E7E6E6", "44546A"]
+    vals = []
+    for el in scheme:                                # dk1 lt1 dk2 lt2 accent1..6 hlink folHlink
+        c, sysc = el.find(_q("a", "srgbClr")), el.find(_q("a", "sysClr"))
+        vals.append(c.get("val") if c is not None else sysc.get("lastClr") if sysc is not None else None)
+    return [vals[k] if k < len(vals) else None for k in [1, 0, 3, 2] + list(range(4, len(vals)))]
+
+
+def _xl_rgb(color, theme, palette):
+    """'RRGGBB' of a SpreadsheetML <color> (rgb, theme or indexed, with its tint), or None (auto, unknown)."""
+    if color is None:
+        return None
+    v = None
+    if color.get("rgb"):
+        v = color.get("rgb")[-6:]
+    elif _int(color.get("theme")) is not None:
+        k = _int(color.get("theme"))
+        v = theme[k] if 0 <= k < len(theme) else None
+    elif _int(color.get("indexed")) is not None:
+        v = palette.get(_int(color.get("indexed")))
+    if not v or not re.fullmatch(r"[0-9A-Fa-f]{6}", v):
+        return None
+    try:
+        tint = float(color.get("tint") or 0)
+    except ValueError:
+        tint = 0.0
+    if tint:
+        h, l, sat = colorsys.rgb_to_hls(*(int(v[k:k + 2], 16) / 255 for k in (0, 2, 4)))
+        l = l * (1 + tint) if tint < 0 else l * (1 - tint) + tint
+        v = "".join("%02X" % round(x * 255) for x in colorsys.hls_to_rgb(h, l, sat))
+    return v
+
+
+def _near_white(rgb) -> bool:
+    return bool(rgb) and min(int(rgb[k:k + 2], 16) for k in (0, 2, 4)) >= 0xF0
+
+
+def _xl_font_unseen(font, theme, palette):
+    """(white text, a font under 4pt) of a <font>."""
+    sz = font.find(_q("s", "sz"))
+    try:
+        tiny = sz is not None and float(sz.get("val", "11")) < 4
+    except ValueError:
+        tiny = False
+    return _near_white(_xl_rgb(font.find(_q("s", "color")), theme, palette)), tiny
+
+
+def _xl_fill_paints(fill, theme, palette) -> bool:
+    """The <fill> paints the cell in a colour that is not white (white text on it shows)."""
+    pf = fill.find(_q("s", "patternFill"))
+    if pf is None:
+        return fill.find(_q("s", "gradientFill")) is not None
+    kind = pf.get("patternType") or "none"
+    if kind == "none":
+        return False
+    rgb = _xl_rgb(pf.find(_q("s", "fgColor")), theme, palette)
+    return not _near_white(rgb) if rgb else kind == "solid"     # solid without a colour: automatic (black)
+
+
 # codes in a sheet's header / footer text: &L &C &R sections, &P page, &D date, &"font,style", &12 size, &K color
 XL_HF_CODE_RE = re.compile(r'&(?:&|"[^"]*"|K(?:[0-9A-Fa-f]{6}|[0-9]{2}[+-][0-9]{3})|[0-9]+|[A-Za-z+-])')
 
@@ -444,16 +618,27 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
     for si in (ss.findall(_q("s", "si")) if ss is not None else []):
         shared.append("".join(t.text or "" for t in si.iter(_q("s", "t"))))
     hidden_fmt = set()
+    faint = set()                                    # cell styles with white text and no fill, or a font under 4pt
     st = _xml(z, "xl/styles.xml")
     if st is not None:
         fmts = {}
         nf = st.find(_q("s", "numFmts"))
         for f in (nf.findall(_q("s", "numFmt")) if nf is not None else []):
             fmts[f.get("numFmtId")] = f.get("formatCode", "")
-        xfs = st.find(_q("s", "cellXfs"))
-        for i, xf in enumerate(xfs.findall(_q("s", "xf")) if xfs is not None else []):
+        theme = _xl_theme(z)
+        palette = dict(XL_PALETTE)
+        ix = st.find("%s/%s" % (_q("s", "colors"), _q("s", "indexedColors")))
+        if ix is not None:
+            palette = {k: (c.get("rgb") or "")[-6:] for k, c in enumerate(ix.findall(_q("s", "rgbColor")))}
+        fonts = [_xl_font_unseen(f, theme, palette) for f in _xl_list(st, "fonts", "font")]
+        fills = [_xl_fill_paints(f, theme, palette) for f in _xl_list(st, "fills", "fill")]
+        for i, xf in enumerate(_xl_list(st, "cellXfs", "xf")):
             if re.fullmatch(r";;;?", fmts.get(xf.get("numFmtId"), "").strip()):
                 hidden_fmt.add(str(i))
+            font, fill = _int(xf.get("fontId")), _int(xf.get("fillId"))
+            white, tiny = fonts[font] if font is not None and font < len(fonts) else (False, False)
+            if tiny or (white and not (fill is not None and fill < len(fills) and fills[fill])):
+                faint.add(str(i))
     parts = []
     cells = 0
     sheets = wb.find(_q("s", "sheets"))
@@ -503,8 +688,10 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
                     d.hide("隐藏工作表 %s" % where, val)
                 elif row_hidden or ci in hidden_cols:
                     d.hide("隐藏行/列 %s" % where, val)
-                elif c.get("s") in hidden_fmt:
+                elif c.get("s", "0") in hidden_fmt:
                     d.hide("';;;' 格式隐藏 %s" % where, val)
+                elif c.get("s", "0") in faint:
+                    d.hide("白字或极小的字 %s" % where, val)
                 else:
                     grid[(rnum, ci)] = val
                     maxc = max(maxc, ci)
@@ -626,6 +813,23 @@ def convert_docx(path, name) -> Doc:
     return d
 
 
+def _p_shapes(tree, hidden=False):
+    """(hidden, shape) for each shape of a slide's shape tree, in order, groups opened: what is in a hidden group is
+    hidden. Of an mc:AlternateContent, the first choice is read."""
+    for el in (list(tree) if tree is not None else []):
+        if el.tag == _q("mc", "AlternateContent"):
+            pick = el.find(_q("mc", "Choice"))
+            yield from _p_shapes(pick if pick is not None else el.find(_q("mc", "Fallback")), hidden)
+            continue
+        nv = next((x for x in el if x.tag.startswith("{%s}nv" % NS["p"])), None)
+        cnv = nv.find(_q("p", "cNvPr")) if nv is not None else None
+        h = hidden or (cnv is not None and cnv.get("hidden") in ("1", "true"))
+        if el.tag == _q("p", "grpSp"):
+            yield from _p_shapes(el, h)
+        elif el.tag == _q("p", "sp"):
+            yield h, el
+
+
 def convert_pptx(path, name) -> Doc:
     d = Doc(name, "pptx")
     z = _open_zip(path)
@@ -638,15 +842,14 @@ def convert_pptx(path, name) -> Doc:
         num = re.search(r"(\d+)", n.rsplit("/", 1)[1]).group(1)
         d.images += len(list(root.iter(_q("p", "pic"))))
         visible = []
-        for sp in root.iter(_q("p", "sp")):
-            nv = sp.find("%s/%s" % (_q("p", "nvSpPr"), _q("p", "cNvPr")))
+        for hidden, sp in _p_shapes(root.find("%s/%s" % (_q("p", "cSld"), _q("p", "spTree")))):
             t = "\n".join(x.text for x in sp.iter(_q("a", "t")) if x.text and x.text.strip())
-            if nv is not None and nv.get("hidden") in ("1", "true"):
+            if hidden:
                 d.hide("隐藏形状（幻灯片 %s）" % num, t)
             elif t:
                 visible.append(t)
         text = "\n".join(visible)
-        if root.get("show") == "0":
+        if root.get("show") in ("0", "false"):
             d.hide("隐藏幻灯片 %s" % num, text)
             continue
         out.append("## 幻灯片 %s\n\n%s" % (num, text or "（无文字）"))
