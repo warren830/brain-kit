@@ -104,13 +104,10 @@ WAITING_DECISION_STATES = ("open", "posting", "asking")
 
 
 def _paths_meet(path, pattern) -> bool:
-    """Does a run's expected path (a file or a folder) meet a risk-path pattern (ci.glob_match's rules)?"""
-    from ..ci import glob_match
-    pat = pattern.strip()
-    if glob_match(path, pat) or glob_match(path + "/x", pat):
-        return True
-    lit = re.split(r"[*?\[]", pat, 1)[0]
-    return bool(lit) and lit.startswith(path + "/")
+    """Does a run's expected path (a file, a folder or a glob such as services/api/**, naming everything below it)
+    meet a risk-path pattern: could a file it names be under it (riskpaths.meets: brain-ci check-run's rules)?"""
+    from ..riskpaths import meets
+    return meets(path, pattern)
 
 
 def _event_order(ev):

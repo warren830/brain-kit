@@ -948,11 +948,12 @@ def runner_kit_problems(repo) -> list:
 
 
 def _risk_matches(path, pats, prefix=False) -> bool:
-    """Does `path` fall under a risk-paths pattern? prefix=True: `path` is a folder or glob from run.json
-    expected_paths ("src/pay"), which names everything below it too."""
-    from . import ci
-    cands = [path] + ([path.rstrip("/") + "/"] if prefix else [])
-    return any(ci.glob_match(c, x) for c in cands for x in pats)
+    """Does `path` fall under a risk-paths pattern (riskpaths: the rules brain-ci check-run uses)? prefix=True:
+    `path` is a file, folder or glob from run.json expected_paths ("src", "src/**"), which names everything below it
+    too: could a file it names be under one (riskpaths.meets)?"""
+    from . import riskpaths
+    test = riskpaths.meets if prefix else riskpaths.matches
+    return any(test(path, x) for x in pats)
 
 
 def allowed_signers_file() -> str:

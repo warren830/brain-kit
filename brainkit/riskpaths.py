@@ -1,5 +1,6 @@
 """Risk-path patterns (gates/risk-paths): one set of rules, the way .gitignore reads a pattern, for brain-ci
-check-run, the MR description, `brain handoff` and the bridge's hand-over hint.
+check-run, the MR description, `brain handoff` and the bridge's hand-over hint. matches() is for a file git names;
+meets() for a run's expected path (a file, a folder or a glob that names everything below it).
 
 One pattern per line (the kit cuts a line at '#'):
   src/pay      the file or folder src/pay and everything below it. A '/' at the start or in the middle anchors a
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-from .common import BrainError
+from .common import BrainError, path_base
 
 STAR = "**"                     # an item of a pattern: zero or more whole names (folders)
 _ANY = re.compile(r"[^/]+")     # an item: one name, whatever it is
@@ -134,3 +135,35 @@ def problem(text) -> str:
 def matches(path, pattern) -> bool:
     """Is the file `path` (as git names it) under the risk-path `pattern`? BrainError for a pattern not supported."""
     return parse(pattern).matches(path)
+
+
+def _meet(names, items, below) -> bool:
+    """Is there a path that the items cover and that is `names` (below: `names` or something under them)?"""
+    seen = {}
+
+    def go(i, j):
+        if (i, j) not in seen:
+            if j == len(items):
+                r = i == len(names)
+            elif i == len(names):
+                r = below or all(x is STAR for x in items[j:])
+            elif items[j] is STAR:
+                r = go(i, j + 1) or go(i + 1, j)
+            else:
+                r = items[j].fullmatch(names[i]) is not None and go(i + 1, j + 1)
+            seen[(i, j)] = r
+        return seen[(i, j)]
+    return go(0, 0)
+
+
+def meets(path, pattern) -> bool:
+    """Could a file that `path` names be under the risk-path `pattern`? `path` is a run's expected path (run.json
+    expected_paths, a split unit's Paths): a file or a folder, which names everything below it too, so a parent
+    folder of a risk path (src for src/pay/**) meets it. A glob counts as its folder (common.path_base: Lean reads
+    Paths as fnmatch globs, where * also matches '/'); one at the top level (*.py, **) meets every pattern. Errs on
+    the side of yes: it feeds warnings. BrainError for a pattern these rules do not support."""
+    p = parse(pattern)
+    if not str(path or "").strip():
+        return False
+    base = path_base(path)
+    return not base or _meet(base.split("/"), p.items, True)

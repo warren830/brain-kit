@@ -9,6 +9,8 @@
   R1-18  check-run looked for Brain changes case-sensitively: a run branch adding Agents.md (or Brain/...) passed,
          and a clone on a case-insensitive disk (macOS) then reads the bot's file as AGENTS.md.
   R1-08  the server hook never read kit.json's bot_emails: a bot set up as the docs say had every push refused.
+  R1-21  `brain handoff` and the bridge gave no risk-path hint when expected_paths was a parent folder or a glob of a
+         risk path (src, src/**, services/api/**).
 """
 import json
 import os
@@ -19,7 +21,8 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from brainkit import ci, pre_receive, riskpaths, sign  # noqa: E402
+from brainkit import ci, cli, config, pre_receive, riskpaths, sign  # noqa: E402
+from brainkit.bridge.handoff import _paths_meet  # noqa: E402
 from brainkit.common import BrainError, write_json  # noqa: E402
 from tests.helpers import ROOT, commit_file, git_repo, keypair, sh, tmpdir  # noqa: E402
 
@@ -338,6 +341,65 @@ class HookReadsTheKitsBotEmails(unittest.TestCase):
         rc, out = self.hook(origin, line, cfg)
         self.assertEqual(rc, 1, out)
         self.assertIn("authored and committed as runner@corp.example", out)
+
+
+# ---------- R1-21: an expected path names everything below it ----------
+
+class ExpectedPathsMeetRiskPaths(unittest.TestCase):
+    RISK = "services/api/payments/**"
+
+    def meet(self, expected, pattern):
+        """The bridge's hint and `brain handoff`'s warning, which must agree."""
+        a, b = _paths_meet(expected.rstrip("/"), pattern), cli._risk_matches(expected, [pattern], prefix=True)
+        self.assertEqual(a, b, "%r vs %r" % (expected, pattern))
+        return a
+
+    def test_a_parent_folder_or_a_glob_of_it(self):
+        for ep in ("services/api", "services/api/", "services/api/**", "services/**", "services", "services/*",
+                   "./services/api", "services/api/payments", "services/api/payments/refund.py", "**", "*.py"):
+            self.assertTrue(self.meet(ep, self.RISK), ep)
+        for ep in ("services/web", "services/apiv2/**", "docs", "services/api/payment", "src/**", "", "  "):
+            self.assertFalse(self.meet(ep, self.RISK), ep)
+        for ep in ("src", "src/**", "src/pay"):                               # B2 m05: src/pay/** in gates/risk-paths
+            self.assertTrue(self.meet(ep, "src/pay/**"), ep)
+        self.assertFalse(self.meet("src/payments", "src/pay/**"))
+
+    def test_gitignore_forms_too(self):
+        self.assertTrue(self.meet("src", "/src/pay/"))
+        self.assertTrue(self.meet("lib", "pay"))                     # lib/pay/... could be one
+        self.assertTrue(self.meet("db", "*.sql"))
+        self.assertTrue(self.meet("src/pay/schema.sql", "*.sql"))
+        self.assertFalse(self.meet("src/pay", "/db/*.sql"))
+        self.assertFalse(self.meet("src/pay/a.py", "src/pay/*.sql"))
+        with self.assertRaises(BrainError):
+            self.meet("src", "src/**.sql")
+
+    def test_a_file_meets_what_covers_it(self):
+        for pat in PATTERNS:
+            items = riskpaths.parse(pat).items
+            for path in PATHS:
+                m = riskpaths.matches(path, pat)
+                self.assertEqual(riskpaths._meet(path.split("/"), items, False), m, "%r vs %r" % (pat, path))
+                if m:
+                    self.assertTrue(riskpaths.meets(path, pat), "%r vs %r" % (pat, path))
+
+    def test_brain_handoff_warns(self):
+        d = tmpdir(self)
+        r = git_repo(os.path.join(d, "proj"))
+        commit_file(r, "gates/risk-paths", "services/api/payments/**\n", "risk paths")
+        bc = commit_file(r, "brain/TECH.md", "# TECH\n", "brain")
+        sh("git", "-C", r, "switch", "-q", "-c", BR)
+        cfg = config.merged(config.DEFAULTS, {"version": 1, "req_prefix": "PAY"})
+        old = os.environ.get("BRAIN_INTAKE_DIR")
+        os.environ["BRAIN_INTAKE_DIR"] = os.path.join(d, "no-intake")
+        self.addCleanup(lambda: os.environ.__setitem__("BRAIN_INTAKE_DIR", old) if old is not None
+                        else os.environ.pop("BRAIN_INTAKE_DIR", None))
+        for ep in ("services", "services/**", "services/api/**"):
+            rec = dict(run_record(bc), expected_paths=[ep])
+            w = cli.handoff_risk_warnings(r, cfg, rec)
+            self.assertTrue(w and w[0].startswith("this run plans to change (run.json expected_paths) risk paths "
+                                                  "(%s; gates/risk-paths)" % ep), (ep, w))
+        self.assertEqual(cli.handoff_risk_warnings(r, cfg, dict(run_record(bc), expected_paths=["docs"])), [])
 
 
 if __name__ == "__main__":
