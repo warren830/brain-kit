@@ -414,8 +414,9 @@ class Bridge(DecisionLoop):
 
     def poll(self):
         """Check the labelled MRs of every project. A project whose kit.json or MR list cannot be read does not hold
-        up the others (as in dispatch, watch and collect): its error is raised at the end, after the rest."""
-        errors = []
+        up the others (as in dispatch, watch and collect): its error is raised at the end, after the rest. First,
+        the comments earlier rounds could not post (tell_mr_due)."""
+        errors = self.notes_due_round()
         for proj in self.cfg["projects"]:
             project = proj["project"] if isinstance(proj, dict) else proj
             try:
@@ -445,6 +446,12 @@ class Bridge(DecisionLoop):
         # A check left 'checking' by a bridge that stopped mid-way is taken over once it is stale.
         key = "%s#%s" % (sha, event)
         if not self.ledger.claim_handoff(project, iid, key, stale_after=self.reservation_ttl):
+            for row in self.ledger.notes_due():   # checked before, but its comment may still be owed
+                if row["project"] == project and int(row["iid"]) == iid:
+                    try:
+                        self._post_due(row)
+                    except Exception as e:  # noqa: BLE001 - kept for the next round
+                        self.out("%s!%s: comment not posted yet: %s" % (project, iid, one_line(e, 200)))
             return "seen"
         try:
             return self._process(project, kit, mr, iid, sha, key, adder, label_event=ev)
@@ -468,10 +475,49 @@ class Bridge(DecisionLoop):
         self.out("rejected %s!%d @%s: %s" % (project, iid, sha[:12], "; ".join(probs)))
         if not self._label_event_is_current(project, iid, kit, key):
             return "rejected"
-        self.gl.comment(project, iid, "AI 接手被拒（%s）：\n" % sha[:12] + "\n".join("- " + x for x in probs) +
-                        "\n\n" + self.retry_advice(kit))
-        self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
+        self.tell_mr_due("rejected:%s!%d:%s" % (project, iid, key), project, iid,
+                         "AI 接手被拒（%s）：\n" % sha[:12] + "\n".join("- " + x for x in probs) + "\n\n" +
+                         self.retry_advice(kit), add=["rejected_label"], remove=["handoff_label"], check_key=key)
         return "rejected"
+
+    # ---------- MR comments owed after a verdict ----------
+
+    def tell_mr_due(self, key, project, iid, body, add=(), remove=(), run_id=None, check_key=None) -> bool:
+        """Post `body` on the MR once for `key` and change its labels (kit label keys: rejected_label, ...), after
+        the verdict was recorded. It is written down first (mr_notes_due): when GitLab fails (a 502, a timeout) it
+        is posted on a later round (notes_due_round), not lost behind the recorded verdict. check_key: the sha#event
+        of the hand-over check it is about. -> True when done now."""
+        row = self.ledger.note_due(key, project, iid, body, {"add": list(add), "remove": list(remove)},
+                                   run_id=run_id, check_key=check_key)
+        try:
+            self._post_due(row)
+            return True
+        except Exception as e:  # noqa: BLE001 - kept; posted next round
+            self.out("%s!%s: comment not posted yet (next round): %s" % (project, iid, one_line(e, 200)))
+            return False
+
+    def notes_due_round(self):
+        """Post what an earlier round could not (tell_mr_due). Errors stay for the next round."""
+        errors = []
+        for row in self.ledger.notes_due():
+            try:
+                self._post_due(row)
+            except Exception as e:  # noqa: BLE001
+                errors.append("%s!%s: %s" % (row["project"], row["iid"], one_line(e, 200)))
+        return errors
+
+    def _post_due(self, row):
+        project, iid, key = row["project"], int(row["iid"]), row["key"]
+        kit = self.kit(project)
+        if row["check_key"] and not self._label_event_is_current(project, iid, kit, row["check_key"]):
+            self.ledger.note_done(key)      # a newer label event is checked on its own: this verdict is moot
+            return
+        self.tell_mr_once(key, project, iid, row["body"], run_id=row["run_id"])   # once, also when labels failed
+        labels = json.loads(row["labels"] or "{}")
+        add, remove = [kit[k] for k in labels.get("add", [])], [kit[k] for k in labels.get("remove", [])]
+        if add or remove:
+            self.gl.edit_labels(project, iid, add=add, remove=remove)
+        self.ledger.note_done(key)
 
     @staticmethod
     def retry_advice(kit) -> str:
@@ -521,10 +567,10 @@ class Bridge(DecisionLoop):
             self.ledger.set_handoff(project, iid, key, "checking", "rejected", reason=("signer: " + why)[:2000])
             self.out("signer refused %s!%d @%s: %s" % (project, iid, sha[:12], why))
             if self._label_event_is_current(project, iid, kit, key):
-                self.gl.comment(project, iid, "AI 接手被拒（%s）：交接的检查都过了，但签名服务没有签这份合同：\n%s\n\n"
-                                "请负责人看一下签名服务的记录。%s"
-                                % (sha[:12], "\n".join("- " + x for x in e.reasons), self.retry_advice(kit)))
-                self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
+                self.tell_mr_due("rejected:%s!%d:%s" % (project, iid, key), project, iid,
+                                 "AI 接手被拒（%s）：交接的检查都过了，但签名服务没有签这份合同：\n%s\n\n请负责人看一下签名服务的"
+                                 "记录。%s" % (sha[:12], "\n".join("- " + x for x in e.reasons), self.retry_advice(kit)),
+                                 add=["rejected_label"], remove=["handoff_label"], check_key=key)
             return "rejected"
         except BaseException:
             self.ledger.release_run(run_id)
@@ -627,7 +673,7 @@ class Bridge(DecisionLoop):
         """Send ready runs into KiroCrew (admission limits apply). First, what a stop, a crash or a KiroCrew error
         left half-sent is settled (recover_runs). A run runnerd could not prepare is asked for again or told on the
         MR (spool/failed). One run that fails does not hold up the others: the errors are raised at the end."""
-        errors, sent = [], 0
+        errors, sent = self.notes_due_round(), 0
         try:
             self.recover_runs()
         except Exception as e:  # noqa: BLE001
@@ -888,13 +934,9 @@ class Bridge(DecisionLoop):
         rid = row["run_id"]
         if not self.ledger.set_run(rid, frm, "failed"):
             return
-        self.tell_mr_once("failed:" + rid, row["project"], row["iid"], "%s 没能开始：%s。处理好以后在分支上重新运行 "
-                          "`brain handoff`（它提交交接、推送并打标签），桥会重新接手。" % (rid, why), run_id=rid)
-        try:
-            kit = self.kit(row["project"])
-            self.gl.edit_labels(row["project"], row["iid"], add=[kit["rejected_label"]], remove=[kit["running_label"]])
-        except BrainError as e:
-            self.out("%s: labels not changed: %s" % (rid, e))
+        self.tell_mr_due("failed:" + rid, row["project"], row["iid"], "%s 没能开始：%s。处理好以后在分支上重新运行 "
+                         "`brain handoff`（它提交交接、推送并打标签），桥会重新接手。" % (rid, why),
+                         add=["rejected_label"], remove=["running_label"], run_id=rid)
 
     # ---------- reconcile ----------
 

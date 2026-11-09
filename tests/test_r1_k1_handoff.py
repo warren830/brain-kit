@@ -208,5 +208,82 @@ class PollOneBrokenProject(unittest.TestCase):
         self.check()
 
 
+class CommentLostOnce(unittest.TestCase):
+    """R1-06: the verdict (rejected, failed) was recorded before the MR comment; one failed comment (a 502) and the
+    MR was never told and kept its labels."""
+
+    def setUp(self):
+        import re
+        from tests import test_bridge as tb
+        t = self.t = bridge_fixture(self)
+        self.tb = tb
+        self.flaky = {"left": 1}
+
+        def flaky_note(m, qy, b):
+            if self.flaky["left"]:
+                self.flaky["left"] -= 1
+                return 502, b"Bad Gateway"
+            return t.add_note(m, qy, b)
+        t.fake.routes.insert(0, ("POST", re.compile(r"^%s/merge_requests/(\d+)/notes$" % tb.GL), flaky_note))
+
+    def test_rejection_is_told_next_round(self):
+        t, tb = self.t, self.tb
+        t.issue["assignee"] = {"name": "bob"}            # Jira not alice's: rejected
+        self.assertEqual(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5]), "rejected")
+        self.assertEqual(t.notes_db.get(5, []), [])        # the 502
+        self.assertEqual(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5]), "seen")
+        bodies = [n["body"] for n in t.notes_db.get(5, [])]
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn("AI 接手被拒", bodies[0])
+        self.assertIn("ai-handoff-rejected", str(t.labels()))
+        t.bridge.poll()
+        t.bridge.poll()
+        self.assertEqual(len(t.notes_db.get(5, [])), 1)    # told once
+        self.assertEqual(t.bridge.ledger.notes_due(), [])
+
+    def test_rejection_is_told_by_the_next_poll(self):
+        t = self.t
+        t.issue["assignee"] = {"name": "bob"}
+        t.bridge.poll()
+        self.assertEqual(t.notes_db.get(5, []), [])
+        t.bridge.poll()
+        self.assertEqual(len(t.notes_db.get(5, [])), 1)
+        self.assertIn("AI 接手被拒", t.notes_db[5][0]["body"])
+
+    def test_failed_run_is_told_next_round(self):
+        from brainkit.common import write_json
+        t, tb = self.t, self.tb
+        self.flaky["left"] = 0
+        self.assertEqual(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5]), "accepted")
+        write_json(os.path.join(t.cfg["spool_dir"], "failed", "RUN-PAY-1-1.json"),
+                   {"run_id": "RUN-PAY-1-1", "error": "contract sha is not on the branch", "transient": False,
+                    "tries": 1, "attempt": 0, "final": True, "at": "2026-11-10T00:00:00Z"})
+        before = len(t.notes_db.get(5, []))
+        self.flaky["left"] = 1
+        t.bridge.dispatch()
+        self.assertEqual(t.bridge.ledger.run("RUN-PAY-1-1")["state"], "failed")
+        self.assertEqual(len(t.notes_db.get(5, [])), before)
+        t.bridge.dispatch()
+        new = [n["body"] for n in t.notes_db.get(5, [])[before:]]
+        self.assertEqual(len(new), 1, new)
+        self.assertIn("没能开始", new[0])
+        self.assertIn("ai-handoff-rejected", str(t.labels()[1:]))
+        t.bridge.dispatch()
+        self.assertEqual(len(t.notes_db.get(5, [])[before:]), 1)
+
+    def test_a_newer_label_event_drops_the_old_verdict(self):
+        t, tb = self.t, self.tb
+        t.issue["assignee"] = {"name": "bob"}
+        self.flaky["left"] = 10
+        self.assertEqual(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5]), "rejected")
+        t.events[5].append(t.ev("alice", "add"))         # the owner labelled again: checked on its own
+        self.flaky["left"] = 0
+        t.issue["assignee"] = {"name": "alice"}
+        t.bridge.poll()
+        bodies = [n["body"] for n in t.notes_db.get(5, [])]
+        self.assertFalse(any("AI 接手被拒" in b for b in bodies), bodies)
+        self.assertTrue(any("AI 已接手" in b for b in bodies), bodies)
+
+
 if __name__ == "__main__":
     unittest.main()
