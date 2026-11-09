@@ -106,5 +106,25 @@ class R1_47NameColumnsInSheets(unittest.TestCase):
         self.assertTrue(any("读不成表格" in n for n in d.notes))
 
 
+class R1_49HtmlInMarkdownCode(unittest.TestCase):
+    """HTML shown in Markdown code (a fenced block, an inline span) is an example, not a hidden element or a comment;
+    a hidden void element (<input type="hidden">) outside code hides only itself."""
+
+    def test_code_is_not_hidden_and_void_tags_do_not_swallow_the_rest(self):
+        md = ("# 登录页\n\n表单：\n\n```html\n<form><input type=\"hidden\" name=\"csrf\"><!-- 示例注释 --></form>\n```\n\n"
+              "写法 `<span hidden>行内示例</span>` 照原样。\n\n~~~\n<div style=\"display:none\">波浪线围栏</div>\n~~~\n\n"
+              "## 验收标准\n1. 错 5 次锁定\n<input type=\"hidden\" value=\"VOID-HIDDEN\">\n2. 返回 423\n"
+              "<span style=\"display:none\">SPAN-HIDDEN `x`</span><!-- COMMENT-HIDDEN -->\n")
+        d = convert.convert(write(os.path.join(tmpdir(self), "a.md"), md))
+        for shown in ('<input type="hidden" name="csrf">', "<!-- 示例注释 -->", "<span hidden>行内示例</span>",
+                      '<div style="display:none">波浪线围栏</div>', "## 验收标准", "1. 错 5 次锁定", "2. 返回 423"):
+            self.assertIn(shown, d.text)
+        hidden = "\n".join(t for _, t in d.hidden)
+        for h in ("VOID-HIDDEN", "SPAN-HIDDEN `x`", "COMMENT-HIDDEN"):
+            self.assertNotIn(h, d.text)
+            self.assertIn(h, hidden)
+        self.assertEqual(len(d.hidden), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

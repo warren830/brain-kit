@@ -33,6 +33,12 @@ def strip_hidden_html(text):
         t = tokens[i]
         if t.group(1) == "" and HIDDEN_ATTR_RE.search(t.group(3) or "") and not t.group(3).rstrip().endswith("/"):
             name = t.group(2).lower()
+            if name in VOID:                         # <input type="hidden" value=...>: no content, no end tag
+                out.append(text[pos:t.start()])
+                hidden.append(t.group(0))
+                pos = t.end()
+                i += 1
+                continue
             depth = 1
             j = i + 1
             while j < len(tokens) and depth:
@@ -49,6 +55,50 @@ def strip_hidden_html(text):
         i += 1
     out.append(text[pos:])
     return "".join(out), hidden
+
+
+MD_FENCE_RE = re.compile(r"(?m)^[ \t]*(?:(`{3,})[^`\n]*|(~{3,})[^\n]*)$")
+
+
+def protect_md_code(text):
+    """Markdown code (fenced blocks, inline `code`) is shown as written: HTML in it is an example, not a hidden
+    element or a comment. Returns (text with each code part swapped for a mark, restore(s) putting them back)."""
+    spans = []
+
+    def inline(a, b):                                # code spans: a run of n backticks up to the next run of n
+        runs = [m.span() for m in re.finditer(r"`+", text[a:b])]
+        i = 0
+        while i < len(runs):
+            n = runs[i][1] - runs[i][0]
+            j = next((k for k in range(i + 1, len(runs)) if runs[k][1] - runs[k][0] == n), None)
+            if j is None or re.search(r"\n[ \t]*\n", text[a + runs[i][1]:a + runs[j][0]]):
+                i += 1                               # no end in the same paragraph: plain backticks
+                continue
+            spans.append((a + runs[i][0], a + runs[j][1]))
+            i = j + 1
+
+    pos = 0
+    while True:
+        m = MD_FENCE_RE.search(text, pos)
+        inline(pos, m.start() if m else len(text))
+        if not m:
+            break
+        fence = m.group(1) or m.group(2)
+        close = re.compile(r"(?m)^[ \t]*%s{%d,}[ \t]*$" % (re.escape(fence[0]), len(fence))).search(text, m.end())
+        end = close.end() if close else len(text)    # an unclosed fence runs to the end
+        spans.append((m.start(), end))
+        pos = end
+    mark = next(chr(c) for c in range(0xE000, 0xF900) if chr(c) not in text)    # a private-use character
+    parts, kept, last = [], [], 0
+    for a, b in spans:
+        parts.append(text[last:a] + "%s%d%s" % (mark, len(kept), mark))
+        kept.append(text[a:b])
+        last = b
+    parts.append(text[last:])
+    back = re.compile("%s([0-9]+)%s" % (mark, mark))
+    return "".join(parts), lambda s: back.sub(lambda m: kept[int(m.group(1))], s)
+
+
 MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 TEXT_EXT = {".md", ".markdown", ".txt", ".csv", ".tsv", ".log", ".json", ".yaml", ".yml"}
 HTML_EXT = {".html", ".htm"}
@@ -143,12 +193,14 @@ def convert_text(path, name) -> Doc:
     with open(path, "rb") as f:
         text = decode_text(f.read()).replace("\r\n", "\n").replace("\r", "\n")
     d = Doc(name, "markdown" if ext in (".md", ".markdown") else "csv" if ext in (".csv", ".tsv") else "text")
+    text, restore = protect_md_code(text) if d.kind == "markdown" else (text, lambda s: s)
     for m in HTML_COMMENT_RE.finditer(text):
-        d.hide("HTML 注释", m.group(1))
+        d.hide("HTML 注释", restore(m.group(1)))
     text = HTML_COMMENT_RE.sub("", text)
     text, hid = strip_hidden_html(text)
     for h in hid:
-        d.hide("隐藏样式的文字", h)
+        d.hide("隐藏样式的文字", restore(h))
+    text = restore(text)
     if ZW_RE.search(text):
         d.notes.append("去掉了零宽或方向控制字符 %d 个" % len(ZW_RE.findall(text)))
         text = ZW_RE.sub("", text)
