@@ -337,22 +337,57 @@ def started(repo, cfg) -> set:
     return branches | merged
 
 
-def run_keys(repo, cfg) -> tuple:
-    """(keys with a run branch here or on origin, keys whose runs/<KEY>/run.json is on the default branch: merged)."""
-    prefix, main = cfg["branch_prefix"], cfg["default_branch"]
-    names = git_out(repo, "for-each-ref", "--format=%(refname)", "refs/heads/%s/" % prefix).split()
-    tree = main
+def run_branches(repo, cfg) -> dict:
+    """{key: {run branch name: tip sha}} of the run branches here and on origin (origin's tip when both have one)."""
+    prefix, out = cfg["branch_prefix"], {}
+    p = git(repo, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/%s/" % prefix, check=False)
+    rows = [l.split(" ", 1) for l in p.stdout.splitlines() if " " in l]
     if claims._has_origin(repo):
         p = git(repo, "ls-remote", "origin", "refs/heads/%s/*" % prefix, check=False)
-        names += [l.split("\t", 1)[1] for l in p.stdout.splitlines() if "\t" in l]
-        git(repo, "fetch", "-q", "origin", main, check=False)
-        tree = "origin/" + main
-    keys = set()
-    for n in names:
-        b = parse_branch(n[len("refs/heads/"):] if n.startswith("refs/heads/") else n, prefix)
+        rows += [l.split("\t", 1) for l in p.stdout.splitlines() if "\t" in l]
+    for sha, ref in rows:
+        name = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+        b = parse_branch(name, prefix)
         if b:
-            keys.add(b["key"])
-    return keys, runs_on(repo, cfg, tree)
+            out.setdefault(b["key"], {})[name] = sha.strip()
+    return out
+
+
+def main_tree(repo, cfg) -> str:
+    """The default branch as origin has it (fetched first), else the local one."""
+    if claims._has_origin(repo):
+        git(repo, "fetch", "-q", "origin", cfg["default_branch"], check=False)
+        return "origin/" + cfg["default_branch"]
+    return cfg["default_branch"]
+
+
+def run_keys(repo, cfg, tips=None) -> tuple:
+    """(keys with a run branch here or on origin, keys whose runs/<KEY>/run.json is on the default branch: merged)."""
+    tips = run_branches(repo, cfg) if tips is None else tips
+    return set(tips), runs_on(repo, cfg, main_tree(repo, cfg))
+
+
+def child_merged(repo, cfg, doc, ref, tips) -> bool:
+    """Has the split child `doc` merged into `ref` (its parent's run branch, or the default branch)? Its run.json
+    there carries the hand-off `brain handoff` records ("mr"), and its owner's run branch, while one is still here or
+    on origin, has its tip in ref. Its run.json alone proves nothing: a sibling that started from its branch, or
+    merged it in, carries that too."""
+    key = doc.get("key")
+    p = git(repo, "show", "%s:%s/%s/run.json" % (ref, cfg["runs_dir"], key), check=False)
+    try:
+        rec = json.loads(p.stdout) if p.returncode == 0 else None
+    except ValueError:
+        rec = None
+    if not isinstance(rec, dict) or not isinstance(rec.get("mr"), dict) or rec.get("parent") != doc.get("parent"):
+        return False
+    for name, sha in (tips.get(key) or {}).items():
+        b = parse_branch(name, cfg["branch_prefix"])
+        if not b or b["owner"] != doc.get("owner"):
+            continue                                       # only its owner's run counts
+        if git(repo, "cat-file", "-e", sha + "^{commit}", check=False).returncode != 0 or \
+                git(repo, "merge-base", "--is-ancestor", sha, ref, check=False).returncode != 0:
+            return False                                   # a tip that is not even here cannot be in ref
+    return True
 
 
 def runs_on(repo, cfg, tree) -> set:
@@ -399,23 +434,31 @@ def state(doc, branch_keys, merged_keys) -> str:
 
 def listing(repo, cfg) -> tuple:
     """(all claims with a "status" (open | started | closed), a "state" (STATES) and "source", warning), in key
-    order."""
+    order. A split child is in progress while its owner has a run branch, and merged once child_merged() says so for
+    its parent's run branch (where its MR goes) or the default branch."""
     docs, warn = scan(repo)
-    branches, merged = run_keys(repo, cfg)
-    # a split child has merged once its run.json is on its parent's run branch (its MR goes there), even after its
-    # own branch is gone and before the parent reaches the default branch
-    on_parent = {}
+    tips = run_branches(repo, cfg)
+    branches, merged = run_keys(repo, cfg, tips)
+    main = main_tree(repo, cfg)
+    refs = {}
     for d in docs:
         sp = d.get("split") if isinstance(d.get("split"), dict) else {}
         if d.get("parent") and isinstance(sp.get("branch"), str) and BRANCH_RE.match(sp["branch"]) and \
-                sp["branch"] not in on_parent:
-            ref = branch_ref(repo, sp["branch"])
-            on_parent[sp["branch"]] = runs_on(repo, cfg, ref) if ref else set()
+                sp["branch"] not in refs:
+            refs[sp["branch"]] = branch_ref(repo, sp["branch"])
     out = []
     for d in docs:
-        sp = d.get("split") if isinstance(d.get("split"), dict) else {}
-        m = merged | on_parent.get(sp.get("branch"), set()) if d.get("parent") else merged
-        out.append(dict(d, status=status(d, branches | m), state=state(d, branches, m),
+        key = d.get("key")
+        if d.get("parent"):
+            sp = d.get("split") if isinstance(d.get("split"), dict) else {}
+            mine = {key} if any((parse_branch(n, cfg["branch_prefix"]) or {}).get("owner") == d.get("owner")
+                                for n in tips.get(key) or {}) else set()
+            done = {key} if any(child_merged(repo, cfg, d, r, tips) for r in (refs.get(sp.get("branch")), main)
+                                if r) else set()
+            out.append(dict(d, status=status(d, mine | done), state=state(d, mine, done), source="split"
+                            if d.get("source") == "split" else d.get("source", "product")))
+            continue
+        out.append(dict(d, status=status(d, branches | merged), state=state(d, branches, merged),
                         source=d.get("source", "product")))
     return sorted(out, key=lambda d: _order(d)[1:]), warn
 
@@ -505,12 +548,15 @@ def managers(repo, doc) -> list:
     return [x for x in out if x]
 
 
-def close(repo, key, reason, by=None, duplicate_of=None) -> dict:
+def close(repo, key, reason, by=None, duplicate_of=None, unowned_only=False) -> dict:
     """Close an intent (it stays, so its hash still dedupes). Only its owner may (pre-receive); one filed for others
-    and not taken yet: whoever filed it, or the owner of its parent."""
-    doc = claims.read(repo, key)
+    and not taken yet: whoever filed it, or the owner of its parent. The claim is written only if it is still the one
+    read here (claims.update expect). unowned_only: refuse when someone has taken it meanwhile."""
+    tip, doc = claims._tip_doc(repo, key)
     if not doc:
         raise BrainError("%s is not claimed" % key)
+    if unowned_only and not claims.unowned(doc) and not doc.get("closed"):
+        raise BrainError("%s was claimed by %s meanwhile: not closed" % (key, doc.get("owner")))
     if doc.get("closed"):
         return doc
     if by and by not in managers(repo, doc):
@@ -528,7 +574,7 @@ def close(repo, key, reason, by=None, duplicate_of=None) -> dict:
     if duplicate_of:
         closed["duplicate_of"] = duplicate_of
     new = dict(doc, closed=closed)
-    claims.update(repo, key, new)
+    claims.update(repo, key, new, what="close", expect=tip)
     return new
 
 

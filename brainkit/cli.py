@@ -685,12 +685,11 @@ def cmd_start(a):
         checked = not a.no_jira
     else:
         key = a.key
+        take = False
         if key:
             doc = claims.read(repo, key)
-            if claims.unowned(doc) and not doc.get("closed"):
-                doc = claims.take(repo, key, me)          # filed for others: starting it claims it
-                print("Claimed %s for %s." % (key, me))
-            if doc and doc.get("owner") != me:
+            take = claims.unowned(doc) and not doc.get("closed")    # filed for others: starting it claims it,
+            if doc and not take and doc.get("owner") != me:         # once every check below has passed
                 raise BrainError("%s is claimed by %s" % (key, doc.get("owner")))
             if doc and doc.get("closed"):
                 raise BrainError("%s is closed (%s)" % (key, (doc["closed"] or {}).get("reason", "")))
@@ -703,7 +702,8 @@ def cmd_start(a):
                 if w not in bad:
                     print("WARN: claim/%s: %s (filed before this rule; check runs/%s/%s before you hand over)"
                           % (key, w, key, intents.INTENT_MD))
-        key = _claim(repo, cfg, me, key, a.title or (doc or {}).get("title") or slug.replace("-", " "))
+        if not take:
+            key = _claim(repo, cfg, me, key, a.title or (doc or {}).get("title") or slug.replace("-", " "))
         checked = True
     title = a.title or (doc or {}).get("title") or slug.replace("-", " ")
     rec_path = runrec.path(cfg["runs_dir"], key)
@@ -716,28 +716,42 @@ def cmd_start(a):
     if _has_origin(repo) and git(repo, "ls-remote", "--exit-code", "--heads", "origin", br,
                                  check=False).returncode == 0:
         raise BrainError("branch %s already exists on origin" % br)
-    materials = []
-    store = _store(repo, a.store)
-    if a.doc:
-        rep = _intake(repo, cfg, a, key, me)
-        a.package = rep["package"]
-    git(repo, "switch", "-q", "-c", br, base)
-    if a.package:
-        materials.append(attach_package(repo, store, a.package))
-    intent = lean.new_intent(repo, "%s-%s" % (key.lower(), slug), "%s %s" % (key, title))
-    paths = [p.strip() for p in (a.paths or "").split(",") if p.strip()]
-    rec = runrec.new(key, me, br, intent, brain_commit, __version__, paths, iso(utcnow()), checked,
-                     tracker=cfg["tracker"], materials=materials)
-    write_json(os.path.join(repo, rec_path), rec)
-    intent_md = []    # the claim's text (an intent from debt, alert, schedule, eval or gap) for the run's agent
-    if intents.is_intent(doc):
-        intent_md.append(os.path.join(cfg["runs_dir"], key, intents.INTENT_MD))
-        with open(os.path.join(repo, intent_md[0]), "w", encoding="utf-8") as f:
-            f.write(intents.render_md(doc))
-    git(repo, "add", "--", rec_path, os.path.join(lean.DOCS, intent), *intent_md)
-    if os.path.isdir(os.path.join(repo, lean.DOCS, "audit")):
-        git(repo, "add", "--", os.path.join(lean.DOCS, "audit"))
-    git(repo, "commit", "-q", "-m", "%s: start run (brain %s)" % (key, brain_commit[:10]))
+    took = False
+    if cfg["tracker"] == "none" and a.key and take:
+        doc = claims.take(repo, key, me)
+        took = True
+        print("Claimed %s for %s." % (key, me))
+    try:
+        materials = []
+        store = _store(repo, a.store)
+        if a.doc:
+            rep = _intake(repo, cfg, a, key, me)
+            a.package = rep["package"]
+        git(repo, "switch", "-q", "-c", br, base)
+        if a.package:
+            materials.append(attach_package(repo, store, a.package))
+        intent = lean.new_intent(repo, "%s-%s" % (key.lower(), slug), "%s %s" % (key, title))
+        paths = [p.strip() for p in (a.paths or "").split(",") if p.strip()]
+        rec = runrec.new(key, me, br, intent, brain_commit, __version__, paths, iso(utcnow()), checked,
+                         tracker=cfg["tracker"], materials=materials)
+        write_json(os.path.join(repo, rec_path), rec)
+        intent_md = []    # the claim's text (an intent from debt, alert, schedule, eval or gap) for the run's agent
+        if intents.is_intent(doc):
+            intent_md.append(os.path.join(cfg["runs_dir"], key, intents.INTENT_MD))
+            with open(os.path.join(repo, intent_md[0]), "w", encoding="utf-8") as f:
+                f.write(intents.render_md(doc))
+        git(repo, "add", "--", rec_path, os.path.join(lean.DOCS, intent), *intent_md)
+        if os.path.isdir(os.path.join(repo, lean.DOCS, "audit")):
+            git(repo, "add", "--", os.path.join(lean.DOCS, "audit"))
+        git(repo, "commit", "-q", "-m", "%s: start run (brain %s)" % (key, brain_commit[:10]))
+    except BaseException:
+        if took:                    # the start did not get to its commit: the claim taken here goes back
+            try:
+                claims.release(repo, key, me)
+                print("Released %s again: the start did not finish." % key)
+            except Exception:  # noqa: BLE001 - the error that stopped the start is the one to show
+                pass
+        raise
     pushed = False
     if _has_origin(repo) and not a.no_push:
         git(repo, "push", "-q", "-u", "origin", br)
@@ -1039,18 +1053,25 @@ def cmd_handoff(a):
 
 def _child_mr(repo, cfg, a, br, b, rec, me):
     """`brain handoff` on a split child (phase 1): its work goes to the parent's owner, not to the team runner. The
-    note is checked (its own `### Next (team <unit>)`), MR.md is written and committed, the branch is pushed and
-    the MR into the parent's run branch is opened or updated with that description. No hand-over record and no
-    label: the bridge takes hand-overs into the default branch only (handing children to the runner is phase 2)."""
+    note is checked (its own `### Next (team <unit>)`), run.json records the request to merge ("mr": the child
+    counts as merged once this commit is on the parent's branch), MR.md is written, both are committed, the branch is
+    pushed and the MR into the parent's run branch is opened or updated with that description. No hand-over record
+    and no label: the bridge takes hand-overs into the default branch only (handing children to the runner is
+    phase 2)."""
     target = rec["target_branch"]
     probs = lean.handover_problems(repo, rec["intent"], rec.get("lean_team"))
     if probs:
         raise BrainError("hand-over note not ready (%s/%s/aidlc-state.md): %s"
                          % (lean.DOCS, rec["intent"], "; ".join(probs)))
     md = mrdesc.md_path(cfg, rec["key"])
-    dirty = _dirty(repo, ignore=(md,))
+    rp = os.path.join(repo, runrec.path(cfg["runs_dir"], rec["key"]))
+    rel = os.path.relpath(rp, repo)
+    dirty = _dirty(repo, ignore=(md, rel))
     if dirty:
         raise BrainError("commit your work first:\n  " + "\n  ".join(dirty))
+    rec["mr"] = {"requested_at": iso(utcnow()), "by": me, "local_head": git_out(repo, "rev-parse", "HEAD")}
+    write_json(rp, rec)
+    git(repo, "add", "--", rel)
     try:
         warnings = handoff_risk_warnings(repo, cfg, rec)
     except (BrainError, OSError, ValueError) as e:
@@ -1064,12 +1085,11 @@ def _child_mr(repo, cfg, a, br, b, rec, me):
                                           allowed_signers=os.environ.get("BRAIN_ALLOWED_SIGNERS") or None))
         mrdesc.write(repo, cfg, rec["key"], desc)
         git(repo, "add", "--", md)
-        if git(repo, "diff", "--cached", "--quiet", "--", md, check=False).returncode != 0:
-            git(repo, "commit", "-q", "-m", "%s: MR description (unit %s of %s)" % (rec["key"], rec.get("unit"),
-                                                                                    rec["parent"]))
     except Exception as e:  # noqa: BLE001  the description helps the reviewer; it does not hold up the MR
         git(repo, "reset", "-q", "--", md, check=False)
         print("WARN: %s not written (%s)." % (md, str(e).replace(repo, ".")))
+    git(repo, "commit", "-q", "-m", "%s: ready to merge into %s (unit %s of %s)" % (rec["key"], target,
+                                                                                   rec.get("unit"), rec["parent"]))
     who = "%s's owner" % rec["parent"]
     if a.no_push or not _has_origin(repo):
         print("Ready for %s: push %s and open its MR into %s (not pushed). A child is merged by its parent's owner; "

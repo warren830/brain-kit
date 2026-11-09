@@ -264,6 +264,17 @@ class Family(unittest.TestCase):
         commit_all(wt, "%s: unit %s" % (os.path.basename(wt), unit))
         sh("git", "-C", wt, "push", "-q", "origin", "HEAD")
 
+    def hand_over(self, who, wt, unit):
+        """A child's `brain handoff`: its own `### Next (team <unit>)` note, then the MR into the parent's branch (no
+        GitLab here: it pushes and says to open the MR by hand). Its run.json records the request ("mr")."""
+        with open(os.path.join(wt, "aidlc-docs", self.intent, "aidlc-state.md"), "a", encoding="utf-8") as f:
+            f.write("### Next (team %s)\nStatus: Construction %s: done\n1. review and merge\n" % (
+                split.lean_team(unit), unit))
+        commit_all(wt, "%s: notes" % unit)
+        out = self.ok(who, wt, "handoff")
+        self.assertIn("open its MR into ai/alice/PAY-1-big by hand, for PAY-1's owner to review and merge", out)
+        return out
+
     def merge_into_parent(self, branch):
         """The parent's owner merges a child's MR into the parent's run branch (as GitLab would, no conflicts)."""
         a = self.alice
@@ -371,6 +382,9 @@ class Family(unittest.TestCase):
         self.assertEqual([x["id"] for x in d["acceptance"]], ["AC-1", "AC-2"])
         self.assertNotIn("RELEASE", [m["kind"] for m in d["approvals"]["missing"]])
         self.assertIn("这是 PAY-1 拆出来的小需求：只做单元 `api`", mrdesc.render(d))
+        # pushed but not handed off, it has not merged even if the parent's branch held its commits
+        self.assertEqual(self.family()["PAY-2"]["state"], "in_progress")
+        self.hand_over("alice", wt_api, "api")
         self.merge_into_parent("ai/alice/PAY-2-api")
         fam = self.family()
         self.assertEqual(fam["PAY-2"]["state"], "merged")
@@ -394,14 +408,18 @@ class Family(unittest.TestCase):
         self.assertNotIn("<<<<<<<", state)
         self.assertIn("Code Generation (api) — done", state)       # Lean wrote its progress from the merged ledger
         self.assertIn("Code Generation (jobs) — done", state)
-        sh("git", "-C", wt_jobs, "push", "-q", "origin", "HEAD")
+        self.hand_over("bob", wt_jobs, "jobs")
         self.merge_into_parent("ai/bob/PAY-4-jobs")
         self.assertEqual(self.family()["PAY-1"]["progress"]["merged"], 2)
 
         self.build_unit(wt_web, "web", "AC-3", {"web/refund.js": "export const x = 1;\n"})
         self.ok("bob", wt_web, "sync")
-        sh("git", "-C", wt_web, "push", "-q", "origin", "HEAD")
+        self.hand_over("bob", wt_web, "web")
         self.merge_into_parent("ai/bob/PAY-3-web")
+        with open(os.path.join(self.alice, "aidlc-docs", self.intent, "aidlc-state.md"), encoding="utf-8") as f:
+            notes = f.read()
+        for team in ("api", "jobs", "web"):                         # every child's own hand-over note survived
+            self.assertIn("### Next (team %s)" % team, notes)
         fam = self.family("bob", self.bob)
         self.assertEqual(fam["PAY-1"]["progress"], {"merged": 3, "total": 3, "unclaimed": 0, "claimed": 0,
                                                     "in_progress": 0, "closed": 0, "text": "3/3 merged"})
@@ -441,7 +459,7 @@ class Family(unittest.TestCase):
         lean(self.alice, "stage", "done", "units", "--note", "two units now")
         commit_all(self.alice, "record units")
         out = self.refused("alice", self.alice, "split", "PAY-1")
-        self.assertIn("was recorded after the DESIGN approval", out)
+        self.assertIn("is not the one recorded last before the DESIGN approval", out)
         approve(self.alice, "DESIGN")                              # the same design, approved again: now it covers
         commit_all(self.alice, "design again")
         self.ok("alice", self.alice, "split", "PAY-1")
@@ -500,6 +518,7 @@ class Family(unittest.TestCase):
         self.ok("alice", self.alice, "claim", "PAY-2")
         self.ok("alice", self.alice, "start", "--key", "PAY-2")
         self.build_unit(self.wt("alice", "PAY-2"), "api", "AC-1", {"services/api/a.py": "x = 1\n"})
+        self.hand_over("alice", self.wt("alice", "PAY-2"), "api")
         self.merge_into_parent("ai/alice/PAY-2-api")
         out = self.ok("bob", self.bob, "start", "--key", "PAY-5")
         self.assertIn("PAY-5 now follows PAY-1's current unit split (expected_paths admin/** -> admin/**, "
@@ -530,9 +549,16 @@ class Family(unittest.TestCase):
         out = self.ok("bob", wt, "handoff", "--no-push")
         self.assertIn("started from PAY-2's branch, which has not merged", out)
         self.assertIn("Ready for PAY-1's owner: push ai/bob/PAY-3-web and open its MR into ai/alice/PAY-1-big", out)
-        self.assertIsNone(load_json(os.path.join(wt, "runs", "PAY-3", "run.json"))["handoff"])
+        rec = load_json(os.path.join(wt, "runs", "PAY-3", "run.json"))
+        self.assertEqual((rec["handoff"], rec["mr"]["by"]), (None, "bob"))   # a merge request, not a runner hand-over
         self.assertIn("runs/PAY-3/MR.md", sh("git", "-C", wt, "show", "--name-only", "HEAD").stdout)
         self.assertEqual(cli._dirty(wt), [])
+        # web merges first, with api's start commit inside: api has not merged for that (review #2)
+        sh("git", "-C", wt, "push", "-q", "origin", "HEAD")
+        self.merge_into_parent("ai/bob/PAY-3-web")
+        fam = self.family()
+        self.assertEqual((fam["PAY-3"]["state"], fam["PAY-2"]["state"]), ("merged", "in_progress"))
+        self.assertEqual(fam["PAY-1"]["progress"]["merged"], 1)
 
     def test_bots_and_strangers(self):
         self.inception()
@@ -550,6 +576,92 @@ class Family(unittest.TestCase):
         # a parent cannot be split from a child's branch
         self.ok("bob", self.bob, "start", "--key", "PAY-2")
         self.assertIn("is itself a child of PAY-1", self.refused("bob", self.wt("bob", "PAY-2"), "split", "PAY-2"))
+
+
+@unittest.skipUnless(HAVE_LEAN, "AI-DLC Lean checkout not found")
+class ReviewFixes(Family):
+    """Regressions for the defects an independent review found in the first version (numbers as it gave them)."""
+
+    test_split_claim_build_release = test_split_needs_the_design_approval_to_cover_the_units = None
+    test_resplit_after_a_new_design = test_build_on_a_dependency_branch = test_bots_and_strangers = None
+
+    def test_3_the_split_recorded_last_before_the_approval_counts(self):
+        self.inception(approve_design=False)
+        docs = "aidlc-docs/%s/inception/application-design/unit-of-work.md" % self.intent
+        write(self.alice, docs, UNITS.format(rows="\n".join(ROWS[:2])))
+        lean(self.alice, "stage", "done", "units", "--note", "two units")
+        approve(self.alice, "DESIGN")                             # the person saw two units
+        write(self.alice, docs, UNITS.format(rows="\n".join(ROWS)))
+        lean(self.alice, "stage", "done", "units", "--note", "three again")   # recorded once before, too
+        commit_all(self.alice, "units again")
+        self.assertIn("is not the one recorded last before the DESIGN approval",
+                      self.refused("alice", self.alice, "split", "PAY-1"))
+        self.assertIsNone(self.claim("PAY-2"))
+
+    def test_12_units_and_approval_in_two_clones_are_refused(self):
+        self.inception(approve_design=False)
+        other = os.path.join(self.p.d, "alice-second")
+        sh("git", "-C", self.alice, "worktree", "add", "-q", "--detach", other, "HEAD")
+        approve(other, "DESIGN")                                  # another Lean clone: its own ledger file
+        commit_all(other, "DESIGN approved in another clone")
+        sh("git", "-C", self.alice, "merge", "-q", "--ff-only", sh("git", "-C", other, "rev-parse", "HEAD")
+           .stdout.strip())
+        self.assertIn("recorded in another Lean clone than the DESIGN approval",
+                      self.refused("alice", self.alice, "split", "PAY-1"))
+
+    def test_5_someone_elses_branch_neither_blocks_nor_serves_as_a_dependency(self):
+        self.inception()
+        self.ok("alice", self.alice, "split", "PAY-1")
+        self.ok("alice", self.alice, "claim", "PAY-2")
+        sh("git", "-C", self.bob, "fetch", "-q", "origin")
+        tip = sh("git", "-C", self.bob, "rev-parse", "origin/ai/alice/PAY-1-big").stdout.strip()
+        for squat in ("ai/aaron/PAY-4-x", "ai/aaron/PAY-2-x"):     # anyone may push ai/<themselves>/<any key>-x
+            sh("git", "-C", self.bob, "push", "-q", "origin", "%s:refs/heads/%s" % (tip, squat))
+        self.ok("bob", self.bob, "start", "--key", "PAY-4")       # aaron's branch is not PAY-4's run
+        self.assertIn("--on PAY-2: it has no run branch of its owner (alice) yet",
+                      self.refused("bob", self.bob, "start", "--key", "PAY-3", "--on", "PAY-2"))
+        self.assertIsNone(self.claim("PAY-3")["owner"])
+
+    def test_6_a_claim_taken_while_the_split_is_applied_is_left_alone(self):
+        self.inception()
+        self.ok("alice", self.alice, "split", "PAY-1")
+        docs = "aidlc-docs/%s" % self.intent
+        rows = [ROWS[0].replace("services/api/**", "services/api/**, services/shared/**")] + ROWS[1:]
+        write(self.alice, docs + "/inception/application-design/unit-of-work.md", UNITS.format(rows="\n".join(rows)))
+        lean(self.alice, "stage", "done", "units", "--note", "api owns shared")
+        approve(self.alice, "DESIGN")
+        commit_all(self.alice, "new split")
+        with login("alice"):
+            from brainkit import config as C
+            cfg = C.load(self.alice)
+            p = split.plan(self.alice, cfg, "alice", "PAY-1")
+            self.assertEqual([a["kind"] for a in p["actions"] if a["unit"] == "api"], ["update"])
+            claims.take(self.bob, "PAY-2", "bob")                  # bob claims it in between
+            split.apply(self.alice, cfg, "alice", p)
+        api = self.claim("PAY-2")
+        self.assertEqual((api["owner"], api["expected_paths"]), ("bob", ["services/api/**",
+                                                                          "aidlc-docs/contracts/api/**"]))
+        self.assertIn("claimed by bob meanwhile", " ".join(next(a for a in p["actions"] if a["unit"] == "api")["why"]))
+
+    def test_7_a_start_that_fails_gives_the_claim_back(self):
+        self.inception()
+        self.ok("alice", self.alice, "split", "PAY-1")
+        blocker = os.path.join(self.p.d, "a-file")
+        write(self.p.d, "a-file", "x\n")
+        out = self.refused("bob", self.bob, "start", "--key", "PAY-4", "--worktree", os.path.join(blocker, "wt"))
+        self.assertIn("Released PAY-4 again", out)
+        self.assertIsNone(self.claim("PAY-4")["owner"])
+
+    def test_14_a_second_open_child_of_one_unit_is_closed(self):
+        self.inception()
+        self.ok("alice", self.alice, "split", "PAY-1")
+        api = self.claim("PAY-2")
+        extra = {k: v for k, v in api.items() if k not in ("key", "owner", "created_at", "schema")}
+        dup = claims.claim(self.alice, "PAY", None, api["title"], extra=extra)        # as a parallel split would
+        out = self.ok("alice", self.alice, "split", "PAY-1")
+        self.assertIn("重复，关掉", out)
+        self.assertIn("duplicate child of PAY-1 for unit api", self.claim(dup["key"])["closed"]["reason"])
+        self.assertFalse(self.claim("PAY-2").get("closed"))
 
 
 @unittest.skipUnless(HAVE_LEAN, "AI-DLC Lean checkout not found")
@@ -584,8 +696,16 @@ class MultiTeam(Family):
 
     def test_lean_guides_each_child_and_contracts_go_through_crs(self):
         self.inception(rows=self.ROWS)
-        out = self.ok("alice", self.alice, "split", "PAY-1")
+        out = self.ok("alice", self.alice, "split", "PAY-1", "--dry-run")
         self.assertNotIn("is not multi-team", out)
+        self.assertNotIn("this clone's Lean team", out)            # the parent's clone is team lead, no unit
+        lean(self.alice, "init", "--team", "api")
+        commit_all(self.alice, "ledger")
+        self.assertIn("this clone's Lean team is api, a unit's", self.ok("alice", self.alice, "split", "PAY-1",
+                                                                          "--dry-run"))
+        lean(self.alice, "init", "--team", "lead")
+        commit_all(self.alice, "ledger")
+        self.ok("alice", self.alice, "split", "PAY-1")
         self.assertIn("wait for unit api (team api), web (team web)", lean(self.alice, "status").stdout)
         self.ok("alice", self.alice, "start", "--key", "PAY-2")
         self.ok("bob", self.bob, "start", "--key", "PAY-3")
@@ -679,8 +799,8 @@ class ClaimRules(unittest.TestCase):
     def test_filed_unowned_by_the_parent_owner_only(self):
         tip, r = self.push(ZERO_SHA, self.child(), "alice")
         self.assertEqual(r, [])
-        self.assertIn("filed by PAY-1's owner (alice), not bob", self.push(ZERO_SHA, self.child(filed_by="bob"),
-                                                                          "bob")[1][0])
+        self.assertIn("filed by PAY-1's owner (alice), not by bob",
+                      self.push(ZERO_SHA, self.child(filed_by="bob"), "bob")[1][0])
         self.assertIn("must name owner bob, or no owner and filed_by bob",
                       self.push(ZERO_SHA, self.child(), "bob")[1][0])
         self.assertIn("bot accounts may not claim", self.push(ZERO_SHA, self.child(), "brain-bot")[1][0])
@@ -724,11 +844,37 @@ class ClaimRules(unittest.TestCase):
                       self.push(tip, closed, "bob")[1][0])
         self.assertIn("parent, unit never change", self.push(tip, self.child(parent="PAY-9", unit="web"),
                                                              "alice")[1][0])
-        self.assertIn("may delete it", self.push(tip, None, "bob")[1][0])
+        self.assertIn("never deleted", self.push(tip, None, "bob")[1][0])     # a child is closed, not deleted
         # the parent's new owner manages the children it left unowned
         p2 = claims._commit(self.repo, claims.claim_doc("PAY-1", "carol", "big"), parent=self.parent)
         sh("git", "-C", self.repo, "update-ref", "refs/heads/claim/PAY-1", p2)
         self.assertEqual(self.push(tip, closed, "carol")[1], [])
+
+    def test_a_child_is_filed_unowned_by_the_parents_owner_only(self):
+        """Review #1: an owned child (owner mallory, parent PAY-1) was accepted; now no one files an owned child, and
+        only PAY-1's owner files its children."""
+        self.assertIn("filed by PAY-1's owner (alice), not by mallory",
+                      self.push(ZERO_SHA, self.child(owner="mallory", filed_by="mallory"), "mallory")[1][0])
+        self.assertIn("a child of a split is filed unowned", self.push(ZERO_SHA, self.child(owner="alice"),
+                                                                       "alice")[1][0])
+        self.assertIn("filed by PAY-1's owner", self.push(ZERO_SHA, {k: v for k, v in self.child(owner="mallory")
+                                                                     .items() if k != "filed_by"}, "mallory")[1][0])
+        # filed_by names the pusher on any new claim, so a released claim cannot pretend someone else filed it
+        plain = dict(claims.claim_doc("PAY-8", "mallory", "t"), filed_by="alice")
+        self.assertIn("filed_by mallory", pre_receive.decide([(ZERO_SHA, claims._commit(self.repo, plain),
+                                                               "refs/heads/claim/PAY-8")], "mallory",
+                                                             pre_receive.DEFAULT_CFG, cwd=self.repo)[0])
+
+    def test_a_child_is_never_deleted_and_its_split_stays_while_owned(self):
+        """Review #1 (delete and re-create) and #4 (an owner rewriting split.branch)."""
+        tip, _ = self.push(ZERO_SHA, self.child(), "alice")
+        self.assertIn("never deleted", self.push(tip, None, "alice")[1][0])
+        bobs, _ = self.push(tip, self.child(owner="bob"), "bob")
+        self.assertIn("never deleted", self.push(bobs, None, "bob")[1][0])
+        moved = self.child(owner="bob", split=dict(self.child()["split"], branch="ai/bob/PAY-2-api"))
+        self.assertIn("split never changes while someone owns the claim", self.push(bobs, moved, "bob")[1][0])
+        self.assertEqual(self.push(bobs, self.child(owner="bob", expected_paths=["services/api/**", "x/**"]),
+                                   "bob")[1], [])                  # its owner takes a newer split's paths
 
     def test_old_claims_and_rules_unchanged(self):
         plain = claims.claim_doc("PAY-7", "alice", "t")
@@ -795,6 +941,65 @@ class Pieces(unittest.TestCase):
         write(repo, "runs/PAY-1/MR.md", "b\n")
         self.assertEqual(cli._dirty(repo, ignore=("runs/PAY-1/MR.md",)), [])
         self.assertEqual(cli._dirty(repo), [" M runs/PAY-1/MR.md"])
+
+    def test_8_sync_merges_the_header_three_ways(self):
+        base = "# S\nIntent: x\nOwner team: lead\n%s\nregion\n%s\n## Session notes\n" % (split.BEGIN_MARK,
+                                                                                         split.END_MARK)
+        theirs = base.replace("Owner team: lead", "Owner team: payments")
+        text, conflicts = split.merge_state(base, base, theirs)
+        self.assertEqual(conflicts, [])
+        self.assertIn("Owner team: payments", text)               # their edit is kept, not silently ours
+        text, conflicts = split.merge_state(base, base.replace("lead", "ops"), theirs)
+        self.assertEqual(conflicts, ["(header)"])
+
+    def test_9_team_names_as_lean_compares_them(self):
+        from brainkit import lean as L
+        notes = "## Session notes\n### Next (team web-ui)\nStatus: x\n1. step\n### Other\n"
+        self.assertEqual(L.team_next_steps(notes, split.lean_team("web-ui")), ["Status: x", "step"])
+        _, probs = split.parse_units(UNITS.format(rows="| a-b | - | a/ | - | - | - | - |\n"
+                                                     "| a_b | - | b/ | - | - | - | - |"))
+        self.assertTrue(any("would be one Lean team (a_b)" in p for p in probs), probs)
+
+    def test_11_released_without_its_release_md(self):
+        repo = git_repo(os.path.join(tmpdir(self), "r"))
+        intent = "261109-pay-1-big"
+        ev = {"seq": 1, "ts": "2026-11-09T08:00:00.000Z", "event": "APPROVED", "intent": intent,
+              "data": {"kind": "RELEASE", "path": "aidlc-docs/%s/operations/release.md" % intent, "sha256": "a" * 64}}
+        write(repo, "aidlc-docs/audit/host-abcdef.jsonl", json.dumps(ev) + "\n")
+        self.assertTrue(split.released(mrdesc._Tree(repo, None), intent))
+
+    def test_13_ci_lends_the_parents_design_only_to_a_claimed_child(self):
+        repo = git_repo(os.path.join(tmpdir(self), "r"))
+        commit_file(repo, "README", "x\n")
+        body = "Unit api of PAY-1."
+        sp = {"intent": "261109-pay-1-big", "branch": "ai/alice/PAY-1-big", "commit": "a" * 40,
+              "design_sha256": "b" * 64, "units_sha256": "c" * 64}
+        claims.claim(repo, "PAY", None, "api · x", key="PAY-2", extra={
+            "source": "split", "body": body, "acs": [], "refs": [], "hash": intents.digest("split", "api · x", body),
+            "filed_by": "alice", "parent": "PAY-1", "unit": "api", "expected_paths": ["a/**"], "depends_on": [],
+            "contracts": [], "split": sp})
+        self.assertTrue(ci._claimed_child(repo, {"key": "PAY-2", "parent": "PAY-1", "unit": "api"}))
+        self.assertFalse(ci._claimed_child(repo, {"key": "PAY-2", "parent": "PAY-9", "unit": "api"}))
+        self.assertFalse(ci._claimed_child(repo, {"key": "PAY-3", "parent": "PAY-1", "unit": "api"}))
+
+    def test_15_a_refusing_server_is_not_a_taken_key(self):
+        d = tmpdir(self)
+        seed = git_repo(os.path.join(d, "seed"))
+        commit_file(seed, "README", "x\n")
+        origin = os.path.join(d, "origin.git")
+        sh("git", "clone", "-q", "--bare", seed, origin)
+        hook = os.path.join(origin, "hooks", "pre-receive")
+        write(origin, "hooks/pre-receive", "#!/bin/sh\necho 'GL-HOOK-ERR: no claims today' >&2\nexit 1\n")
+        os.chmod(hook, 0o755)
+        sh("git", "-C", origin, "config", "core.hooksPath", os.path.join(origin, "hooks"))
+        c = os.path.join(d, "c")
+        sh("git", "clone", "-q", origin, c)
+        with open(os.path.join(c, ".git", "config"), "a", encoding="utf-8") as f:
+            f.write("[user]\n\tname = t\n\temail = t@example.com\n" + no_hooks_config(c))
+        with self.assertRaises(BrainError) as e:
+            claims.claim(c, "PAY", "alice", "t")
+        self.assertIn("could not push claim PAY-1", str(e.exception))
+        self.assertIn("no claims today", str(e.exception))
 
     def test_paths_overlap(self):
         self.assertTrue(paths_overlap("services/api/**", "services/api/handlers.py"))

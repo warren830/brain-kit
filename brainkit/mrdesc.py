@@ -207,6 +207,7 @@ def _events(tree, intent, clone=None) -> list:
             except ValueError:
                 continue
             if isinstance(rec, dict) and rec.get("intent") == intent and isinstance(rec.get("event"), str):
+                rec["_file"] = path                 # which clone recorded it: seq orders records within one file
                 out.append(rec)
     out.sort(key=lambda e: str(e.get("ts") or ""))
     return out

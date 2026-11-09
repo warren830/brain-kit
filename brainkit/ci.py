@@ -338,6 +338,13 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
     return []
 
 
+def _claimed_child(repo, rec) -> bool:
+    """Does claim/<KEY> (origin's, fetched) say this run is the child of rec["parent"] for rec["unit"]?"""
+    from . import claims
+    doc = claims.read(repo, rec.get("key"))
+    return isinstance(doc, dict) and doc.get("parent") == rec.get("parent") and doc.get("unit") == rec.get("unit")
+
+
 def check_run(repo, branch, env) -> list:
     tgt = Target(repo, env)
     cfg = tgt.cfg()
@@ -376,9 +383,10 @@ def check_run(repo, branch, env) -> list:
     vouchers, bad = signed_vouchers(vdir, signers, b["key"], repo, upstream=base, runs_dir=cfg["runs_dir"])
     probs += bad
     design = list(vouchers)
-    if rec.get("parent"):
+    if rec.get("parent") and _claimed_child(repo, rec):
         # a split child builds one unit of its parent's Lean intent: the design it follows is the parent's, so the
-        # parent's signed DESIGN answers count for its risk paths (hand-over vouchers stay per branch, below)
+        # parent's signed DESIGN answers count for its risk paths (hand-over vouchers stay per branch, below). Only
+        # when claim/<KEY> says it is that parent's child: run.json alone is whatever the branch says.
         pv, pbad = signed_vouchers(vdir, signers, rec["parent"], repo, upstream=base, runs_dir=cfg["runs_dir"])
         design += [v for v in pv if v.get("kind") == "answer"]
         probs += pbad

@@ -86,8 +86,10 @@ person.
 2. `lean verify` on the merged code, update your `### Next (team <lean_team>)` subsection, `brain mr-desc --write`
    (it lists this unit's ACs only), commit.
 3. The person runs `brain handoff`: for a child it checks your `### Next (team <lean_team>)` note, writes and
-   commits `runs/<KEY>/MR.md`, pushes, and opens or updates the MR into the parent's branch, not main. No runner
-   hand-over and no label: the parent's owner reviews and merges it (only they may push their branch).
+   commits `runs/<KEY>/MR.md` together with a merge request in run.json (`mr`), pushes, and opens or updates the MR
+   into the parent's branch, not main. No runner hand-over and no label: the parent's owner reviews and merges it
+   (only they may push their branch). The child counts as merged once that commit, and every later one on its
+   branch, is in the parent's branch.
 
 ## 6. Parent run: review and release
 - `brain intent show <KEY>` until every child has merged ("都合并了，等大需求评审和发布"). `brain handoff` refuses the

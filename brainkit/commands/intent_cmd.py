@@ -107,7 +107,8 @@ def cmd_list(a):
         f = fam.get(d["key"])
         if f:
             pr = f["progress"]
-            line += "  · 大需求：已合并 %d/%d，%s" % (pr["merged"], pr["total"], FAMILY_TEXT.get(f["state"], f["state"]))
+            line += "  · 大需求：已合并 %d/%d，%s" % (pr["merged"], pr["total"], FAMILY_TEXT.get(f["state"], f["state"])
+                                                     if pr["total"] or not pr["closed"] else "小需求都关了")
         print(line)
         if not f:
             continue

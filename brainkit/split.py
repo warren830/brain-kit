@@ -152,6 +152,12 @@ def parse_units(text) -> tuple:
                 problems.append("unit %s depends on itself" % d)
             elif d not in names:
                 problems.append("unit %s depends on %s, which is not a unit in the table" % (u["name"], d))
+    teams = {}
+    for u in units:
+        teams.setdefault(lean_team(u["name"]), []).append(u["name"])
+    for t, same in sorted(teams.items()):
+        if len(same) > 1:
+            problems.append("units %s would be one Lean team (%s): name them apart" % (", ".join(same), t))
     cycle = _cycle(units)
     if cycle:
         problems.append("units depend on each other in a circle: %s" % " -> ".join(cycle))
@@ -228,11 +234,19 @@ def _stage_events(events, stage):
             and not M._d(e).get("unit")]
 
 
+def _seq(e) -> int:
+    return e.get("seq") if isinstance(e.get("seq"), int) else -1
+
+
 def released(tree, intent) -> bool:
-    """RELEASE approved for the intent (also if release.md changed afterwards), as Lean's Project.released()."""
+    """RELEASE approved for the intent, as Lean's Project.released(): the last approval or rejection that covers
+    operations/release.md is an approval (whatever the file says now, or if it is gone)."""
     path = "%s/%s/%s" % (lean.DOCS, intent, M.RELEASE_DOC)
-    st = M._doc_state(M._events(tree, intent), tree, path)
-    return bool(st["event"]) and st["event"].get("event") == "APPROVED"
+    last = None
+    for e in M._events(tree, intent):
+        if e.get("event") in ("APPROVED", "REJECTED") and M._covers(M._d(e), path):
+            last = e
+    return bool(last) and last.get("event") == "APPROVED"
 
 
 def approved_split(tree, intent) -> dict:
@@ -280,13 +294,21 @@ def approved_split(tree, intent) -> dict:
             probs.append("unit-of-work.md changed after `lean stage done units` recorded it (sha %s now): record it "
                          "again and ask for the DESIGN approval again" % units_sha[:8])
         elif des["state"] == "approved" and des["event"] is not None:
-            at = events.index(des["event"])
-            if not any(events.index(e) < at and e.get("event") == "STAGE_COMPLETED"
-                       and (M._d(e).get("outputs") or {}).get(paths["units"]) == units_sha for e in ev):
-                probs.append("the unit split (unit-of-work.md sha %s) was recorded after the DESIGN approval of %s, so "
-                             "the approval does not cover it (Lean's DESIGN hash covers application-design.md only). "
-                             "Ask for DESIGN again: `lean request DESIGN`; approving the unchanged design again is "
-                             "fine" % (units_sha[:8], str(des["event"].get("ts") or "")[:10]))
+            # What the person saw when they approved: the last Units Generation record before the approval. Only
+            # within one clone's ledger is "before" certain (its seq); another clone's clock may be off.
+            d_ev = des["event"]
+            mine = [e for e in ev if e.get("_file") == d_ev.get("_file")]
+            prior = [e for e in mine if _seq(e) < _seq(d_ev)]
+            if not mine:
+                probs.append("Units Generation was recorded in another Lean clone than the DESIGN approval, so which "
+                             "came first is not certain: record the units (`lean stage done units`) and approve DESIGN "
+                             "again in the same clone")
+            elif not prior or prior[-1].get("event") != "STAGE_COMPLETED" or \
+                    (M._d(prior[-1]).get("outputs") or {}).get(paths["units"]) != units_sha:
+                probs.append("the unit split (unit-of-work.md sha %s) is not the one recorded last before the DESIGN "
+                             "approval of %s, so the approval does not cover it (Lean's DESIGN hash covers "
+                             "application-design.md only). Ask for DESIGN again: `lean request DESIGN`; approving the "
+                             "unchanged design again is fine" % (units_sha[:8], str(d_ev.get("ts") or "")[:10]))
         text = raw.decode("utf-8", "replace")
         units, uprobs = parse_units(text)
         probs += uprobs
@@ -449,6 +471,16 @@ def _current_parent(repo, cfg, me, key=None):
     return br, rec, doc
 
 
+def _clone_team(repo):
+    """The Lean team of this clone (`lean init --team`: .aidlc-lean/local.json), or None."""
+    try:
+        with open(os.path.join(repo, ".aidlc-lean", "local.json"), encoding="utf-8") as f:
+            team = json.load(f).get("team")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return team if isinstance(team, str) and team else None
+
+
 def children_of(docs, parent_key) -> list:
     return sorted((d for d in docs if d.get("parent") == parent_key), key=lambda d: intents._order(d)[1:])
 
@@ -483,6 +515,11 @@ def plan(repo, cfg, me, key=None, docs=None) -> dict:
     warnings = list(info["warnings"])
     lcfg = M._lean_cfg(M._Tree(repo, "HEAD"))
     if lcfg.get("multi_team"):
+        mine = os.environ.get("AIDLC_LEAN_TEAM") or _clone_team(repo)
+        if mine and mine in {lean_team(u["name"]) for u in info["units"]}:
+            warnings.append("multi-team: this clone's Lean team is %s, a unit's: Lean would send the parent's run to "
+                            "build that unit. The parent's clone needs a team that is no unit (`lean init --team "
+                            "lead`)" % mine)
         for u in info["units"]:
             if u["owner"] and u["owner"] not in ("-", lean_team(u["name"])):
                 warnings.append("multi-team: unit %s has Owner team %s, but its child runs Lean as team %s: Lean's "
@@ -545,22 +582,37 @@ def apply(repo, cfg, me, p) -> dict:
             if a["kind"] == "new":
                 doc = claims.claim(repo, cfg["req_prefix"], None, fields["title"], extra=dict(fields, filed_by=me))
                 a["key"] = keys[a["unit"]] = doc["key"]
-            else:
-                new = dict({k: v for k, v in a["doc"].items() if k in intents.KNOWN_FIELDS}, **fields)
-                claims.update(repo, a["key"], new, what="update")
+                a["fields"], a["done"] = fields, True
+                continue
+            # the plan saw it unowned; write only if it still is, on the very tip read now
+            tip, cur = claims._tip_doc(repo, a["key"])
+            if not claims.unowned(cur) or cur.get("closed"):
+                a.update(kind="changed", done=False, why=["claimed by %s meanwhile: not changed" % (
+                    (cur or {}).get("owner") or "someone")] + (a.get("why") or []))
+                continue
+            new = dict({k: v for k, v in cur.items() if k in intents.KNOWN_FIELDS}, **fields)
+            claims.update(repo, a["key"], new, what="update", expect=tip)
             a["fields"], a["done"] = fields, True
         elif a["kind"] in ("close", "close_duplicate"):
             reason = reason_gone % a["unit"] if a["kind"] == "close" else \
                 "duplicate child of %s for unit %s" % (pkey, a["unit"])
-            intents.close(repo, a["key"], reason, by=me)
-            a["done"] = True
-    # someone split the same parent at the same time: the earliest child of each unit stays (as intents.add)
+            try:
+                intents.close(repo, a["key"], reason, by=me, unowned_only=True)
+                a["done"] = True
+            except BrainError as e:                       # taken meanwhile: its owner decides now
+                a.update(kind="removed" if a["kind"] == "close" else "duplicate", done=False, why=[str(e)])
+    # someone split the same parent at the same time: the earliest child of each unit stays (as intents.add); the
+    # later ones I filed and nobody took are closed, whichever run filed them
     docs = intents.listing(repo, cfg)[0]
     by_unit, dupes = open_by_unit(children_of(docs, pkey))
     for d in dupes:
-        if d["key"] in keys.values() and d.get("filed_by") == me and d["state"] == "unclaimed":
+        if d.get("filed_by") == me and d["state"] == "unclaimed":
             first = by_unit[d.get("unit")]["key"]
-            intents.close(repo, d["key"], "duplicate of %s (split at the same time)" % first, by=me)
+            try:
+                intents.close(repo, d["key"], "duplicate of %s (split at the same time)" % first, by=me,
+                              unowned_only=True)
+            except BrainError:
+                continue
             p["actions"].append({"unit": d.get("unit"), "kind": "raced", "key": d["key"], "fields": None, "doc": d,
                                  "done": True, "why": ["duplicate of %s" % first]})
     return p
@@ -667,7 +719,8 @@ def handoff_warnings(repo, cfg, rec) -> list:
     if not on or not rec.get("target_branch"):
         return []
     ref = parent_ref(repo, rec["target_branch"])
-    if ref and on in intents.runs_on(repo, cfg, ref):
+    dep = claims.read(repo, on)
+    if ref and isinstance(dep, dict) and intents.child_merged(repo, cfg, dep, ref, intents.run_branches(repo, cfg)):
         return []
     return ["%s started from %s's branch, which has not merged into %s yet: this MR carries its commits until it "
             "does (`brain sync` once it has)" % (rec["key"], on, rec["target_branch"])]
@@ -757,7 +810,9 @@ def start_child(repo, cfg, a, doc, me, version) -> int:
         dep_keys.append(keys[d])
     mref = main_ref(repo, cfg)
     pbase = base                                  # the parent's branch: where the child's MR goes
-    merged = intents.runs_on(repo, cfg, base) | (intents.runs_on(repo, cfg, mref) if mref else set())
+    tips = intents.run_branches(repo, cfg)
+    # a dependency counts once it has merged into the parent's branch (the branch this child starts from)
+    merged = {k for k in dep_keys if k in by_key and intents.child_merged(repo, cfg, by_key[k], pbase, tips)}
     on, built_on = getattr(a, "on", None), None
     waiting = [k for k in dep_keys if k not in merged]
     if on:
@@ -766,10 +821,19 @@ def start_child(repo, cfg, a, doc, me, version) -> int:
                 on, key, ", ".join(dep_keys) or "none"))
         if on in merged:
             raise BrainError("--on %s: it has merged into %s already; start without --on" % (on, sp["branch"]))
-        branches = _run_branches_for(repo, cfg, on)
-        if not branches:
-            raise BrainError("--on %s: it has no run branch yet (here or on origin)" % on)
-        base, built_on = branches[0][1], on
+        dep = by_key[on]
+        theirs = [(n, r) for n, r in _run_branches_for(repo, cfg, on)
+                  if (parse_branch(n, cfg["branch_prefix"]) or {}).get("owner") == dep.get("owner")]
+        if not dep.get("owner") or not theirs:
+            raise BrainError("--on %s: it has no run branch of its owner (%s) yet, here or on origin" % (
+                on, dep.get("owner") or "nobody has claimed it"))
+        ref = theirs[0][1]
+        drec = _run_rec(repo, cfg, on, ref)
+        if git(repo, "merge-base", "--is-ancestor", sp["commit"], ref, check=False).returncode != 0 or \
+                not drec or drec.get("parent") != pkey or drec.get("unit") != dep.get("unit"):
+            raise BrainError("--on %s: %s is not its run of unit %s started from %s's split" % (
+                on, theirs[0][0], dep.get("unit"), pkey))
+        base, built_on = ref, on
         waiting.remove(on)
     if waiting:
         who = ["%s (unit %s, %s)" % (k, (by_key.get(k) or {}).get("unit"), _who(by_key.get(k))) for k in waiting]
@@ -781,9 +845,10 @@ def start_child(repo, cfg, a, doc, me, version) -> int:
     for ref in (pbase, base, mref):
         if ref and git(repo, "cat-file", "-e", "%s:%s" % (ref, rp), check=False).returncode == 0:
             raise BrainError("%s already exists on %s: this requirement already has a run" % (rp, ref))
-    others = [n for n, _ in _run_branches_for(repo, cfg, key)]
-    if others:
-        raise BrainError("%s already has a run: %s" % (key, ", ".join(others)))
+    mine = [n for n, _ in _run_branches_for(repo, cfg, key)
+            if (parse_branch(n, cfg["branch_prefix"]) or {}).get("owner") == me]   # others' branches are not its run
+    if mine:
+        raise BrainError("%s already has your run: %s" % (key, ", ".join(mine)))
     slug = (a.slug or slugify(unit)).lower()
     if not SLUG_RE.match(slug):
         raise BrainError("slug must be lowercase letters, digits and '-' (max 40)")
@@ -796,21 +861,55 @@ def start_child(repo, cfg, a, doc, me, version) -> int:
     bad = field_problems(key, fields)
     if bad:
         raise BrainError("claim/%s would not pass the checks with the current split: %s" % (key, "; ".join(bad)))
-    # ---- writes from here on: the claim, then the branch and its worktree
-    if claims.unowned(doc):
-        doc = claims.take(repo, key, me)
-        print("Claimed %s for %s." % (key, me))
-    if not same_fields(doc, fields):
-        why = changes(doc, fields)
-        new = dict({k: v for k, v in doc.items() if k in intents.KNOWN_FIELDS}, **fields)
-        claims.update(repo, key, new, what="update")
-        print("%s now follows %s's current unit split (%s)." % (key, pkey, "; ".join(why)))
-        doc = new
+    # ---- writes from here on: the claim, then the branch and its worktree; a claim taken here is given back
+    # when the start does not get as far as its first commit
+    took = False
+    try:
+        if claims.unowned(doc):
+            doc = claims.take(repo, key, me)
+            took = True
+            print("Claimed %s for %s." % (key, me))
+        if not same_fields(doc, fields):
+            why = changes(doc, fields)
+            # the owner takes the current split's unit; `split` (where it came from) stays as filed
+            new = dict({k: v for k, v in doc.items() if k in intents.KNOWN_FIELDS},
+                       **{k: v for k, v in fields.items() if k != "split"})
+            claims.update(repo, key, new, what="update")
+            print("%s now follows %s's current unit split (%s)." % (key, pkey, "; ".join(why)))
+            doc = new
+        _start_worktree(repo, cfg, a, doc, fields, me, version, key, pkey, unit, team, sp, base, mref, br, wt, rp,
+                        built_on, by_key, warns)
+    except BaseException:
+        if took:
+            try:
+                claims.release(repo, key, me)
+                print("Released %s again: the start did not finish." % key)
+            except Exception:  # noqa: BLE001 - the error that stopped the start is the one to show
+                pass
+        raise
+    return 0
+
+
+def _run_rec(repo, cfg, key, ref):
+    p = git(repo, "show", "%s:%s" % (ref, runrec.path(cfg["runs_dir"], key).replace(os.sep, "/")), check=False)
+    try:
+        rec = json.loads(p.stdout) if p.returncode == 0 else None
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _start_worktree(repo, cfg, a, doc, fields, me, version, key, pkey, unit, team, sp, base, mref, br, wt, rp,
+                    built_on, by_key, warns):
+    """The child's branch and worktree, its Lean clone (team, intent), run.json and intent.md, one commit, a push."""
     for w in warns:
         print("WARN: " + w)
     mb = git(repo, "merge-base", mref, base, check=False).stdout.strip() if mref else ""
     brain_commit = mb or git_out(repo, "rev-parse", base + "^{commit}")
-    os.makedirs(os.path.dirname(wt), exist_ok=True)
+    try:
+        os.makedirs(os.path.dirname(wt), exist_ok=True)
+    except OSError as e:
+        raise BrainError("cannot make the worktree's folder %s: %s" % (os.path.dirname(wt), e))
     git(repo, "worktree", "add", "-q", "--no-track", "-b", br, wt, base)
     try:
         lean.call(wt, "init", "--team", team)
@@ -841,8 +940,11 @@ def start_child(repo, cfg, a, doc, me, version) -> int:
         raise
     pushed = False
     if claims._has_origin(repo) and not a.no_push:
-        git(wt, "push", "-q", "-u", "origin", br)
-        pushed = True
+        p = git(wt, "push", "-q", "-u", "origin", br, check=False)   # the run is made: a failed push does not undo it
+        pushed = p.returncode == 0
+        if not pushed:
+            print("WARN: not pushed (%s): push it with `git -C %s push -u origin %s`" % (
+                (p.stderr or p.stdout).strip()[:300], wt, br))
     print("Started %s (unit %s of %s) on %s from %s (Lean intent %s, team %s, Brain %s)%s." % (
         key, unit, pkey, br, built_on and "%s's branch" % built_on or sp["branch"], sp["intent"], team,
         brain_commit[:10], ", pushed" if pushed else ""))
@@ -853,7 +955,6 @@ def start_child(repo, cfg, a, doc, me, version) -> int:
               "in %s once it has." % (built_on, sp["branch"]))
     print("Next: build unit %s only (`lean stage ... --unit %s`); `brain sync` merges %s in; `brain handoff` opens the "
           "MR into %s." % (unit, unit, sp["branch"], sp["branch"]))
-    return 0
 
 
 def _who(doc) -> str:
@@ -914,19 +1015,34 @@ def merge_notes(base, ours, theirs) -> tuple:
     return "\n".join(out), conflicts
 
 
+def _state_parts(text):
+    """(header, generated region, Session notes) of an aidlc-state.md, or None without Lean's markers."""
+    if not text or BEGIN_MARK not in text or END_MARK not in text:
+        return None
+    header, _, rest = text.partition(BEGIN_MARK)
+    region, _, notes = rest.partition(END_MARK)
+    return header, region, notes
+
+
 def merge_state(base, ours, theirs) -> tuple:
-    """(aidlc-state.md, conflicts) for a conflicted merge of one: header and the generated region from ours (Lean
-    writes the region again from the merged ledger right after), Session notes merged by subsection. (None, [why])
-    when ours or theirs has no generated region to split at."""
-    parts = []
-    for text in (ours, theirs):
-        if END_MARK not in text or BEGIN_MARK not in text:
-            return None, ["no Lean progress markers"]
-        head, _, notes = text.partition(END_MARK)
-        parts.append((head, notes))
-    base_notes = (base or "").partition(END_MARK)[2] if END_MARK in (base or "") else ""
-    notes, conflicts = merge_notes(base_notes, parts[0][1], parts[1][1])
-    return parts[0][0] + END_MARK + notes, conflicts
+    """(aidlc-state.md, conflicts) for a conflicted merge of one. The generated region is ours (Lean writes it again
+    from the merged ledger right after); the header (title, Intent, Owner team) and the Session notes are merged
+    three ways, the notes by ### subsection; what both sides changed differently keeps both between conflict markers
+    and counts as a conflict. (None, [why]) when ours or theirs has no generated region to split at."""
+    o, t = _state_parts(ours), _state_parts(theirs)
+    if not o or not t:
+        return None, ["no Lean progress markers"]
+    b = _state_parts(base) or ("", "", "")
+    conflicts = []
+    if o[0] == t[0] or t[0] == b[0]:
+        header = o[0]
+    elif o[0] == b[0]:
+        header = t[0]
+    else:
+        header = "<<<<<<< ours\n%s=======\n%s>>>>>>> theirs\n" % (o[0], t[0])
+        conflicts.append("(header)")
+    notes, more = merge_notes(b[2], o[2], t[2])
+    return header + BEGIN_MARK + o[1] + END_MARK + notes, conflicts + more
 
 
 def _stage(repo, n, path):

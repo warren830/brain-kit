@@ -82,6 +82,8 @@ def _try_create(repo, key, sha) -> bool:
             git(repo, "update-ref", ref(key), sha)
             return True
         msg = (p.stderr + p.stdout).lower()
+        if "remote rejected" in msg or "hook declined" in msg:      # the server refused this claim: not "taken"
+            raise BrainError("could not push claim %s: %s" % (key, (p.stderr or p.stdout).strip()))
         if "rejected" in msg or "already exists" in msg or "non-fast-forward" in msg or "fetch first" in msg:
             return False
         raise BrainError("could not push claim %s: %s" % (key, (p.stderr or p.stdout).strip()))
@@ -140,13 +142,17 @@ def read(repo, key):
         return None
 
 
-def update(repo, key, doc, what=None) -> str:
+def update(repo, key, doc, what=None, expect=None) -> str:
     """Replace claim.json on claim/<KEY> with a fast-forward commit. The pre-receive hook lets only the owner (an
-    unowned claim: the person who filed it, or the owner of its parent)."""
+    unowned claim: the person who filed it, or the owner of its parent). `expect`: the tip `doc` was made from
+    (_tip_doc); when the claim moved since, nothing is written (someone else changed it: read it again)."""
     src = _tip(repo, key)
     old = git(repo, "rev-parse", "--verify", "-q", src + "^{commit}", check=False).stdout.strip() if src else ""
     if not old:
         raise BrainError("claim/%s not found" % key)
+    if expect and old != expect:
+        raise BrainError("claim/%s changed since it was read (someone else pushed it): nothing written; try again"
+                         % key)
     sha = _commit(repo, doc, parent=old, what=what)
     ok, why = _push_update(repo, key, old, sha)
     if not ok:

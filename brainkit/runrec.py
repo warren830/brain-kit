@@ -10,6 +10,8 @@ A split child's run (split.start_child) continues its parent's Lean intent and a
   lean_team      Lean's team in its worktree (the unit)     lean_clone  the random part of that Lean clone's id
                  (its ledger file is aidlc-docs/audit/<host>-<lean_clone>.jsonl)
   built_on       a dependency whose branch it started from, before that one merged (`brain start --on`)
+  mr             {requested_at, by, local_head}: `brain handoff` asked to merge it into target_branch. The child
+                 counts as merged once this record and its branch tip are on the parent's branch (intents.child_merged)
 """
 from __future__ import annotations
 
@@ -102,7 +104,7 @@ def validate(rec, branch=None, prefix="ai") -> list:
 def child_problems(rec) -> list:
     """The split-child fields of a run record (none of them: not a child, nothing to check)."""
     p = []
-    keys = ("parent", "unit", "target_branch", "lean_team", "lean_clone", "built_on")
+    keys = ("parent", "unit", "target_branch", "lean_team", "lean_clone", "built_on", "mr")
     if not any(k in rec for k in keys):
         return p
     if not JIRA_RE.match(str(rec.get("parent", ""))) or rec.get("parent") == rec.get("key"):
@@ -119,4 +121,8 @@ def child_problems(rec) -> list:
     if "built_on" in rec and (not JIRA_RE.match(str(rec["built_on"])) or rec["built_on"] in (rec.get("key"),
                                                                                             rec.get("parent"))):
         p.append("built_on must be a sibling's requirement key")
+    m = rec.get("mr")
+    if m is not None and (not isinstance(m, dict) or not isinstance(m.get("requested_at"), str)
+                          or m.get("by") != rec.get("owner")):
+        p.append("mr must have requested_at and by == owner")
     return p

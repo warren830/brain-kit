@@ -112,13 +112,20 @@ def next_steps(text: str) -> list:
     return items
 
 
+def team_key(name) -> str:
+    """A team name as Lean compares it (aidlc_lean.py team_key): letters, digits and _, the rest as _."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(name or "").strip("`* \t"))
+
+
 def team_next_steps(text: str, team: str) -> list:
-    """Items under '### Next (team <team>)' in the Session notes (Lean's per-team subsection)."""
-    m = re.search(r"^#{2,4}[ \t]*Next[ \t]*\([ \t]*team[ \t:]+`?%s`?[ \t]*\)[ \t]*$(.*?)(?=^#{1,6} |\Z)"
-                  % re.escape(team), text, re.M | re.S | re.I)
-    if not m:
-        return []
-    return [s for s in (re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", l).strip() for l in m.group(1).splitlines()) if s]
+    """Items under '### Next (team <team>)' in the Session notes (Lean's per-team subsection; the team named the way
+    Lean compares team names, so `web-ui` and `web_ui` are one team)."""
+    for m in re.finditer(r"^#{2,4}[ \t]*Next[ \t]*\([ \t]*team[ \t:]+`?([A-Za-z0-9_.-]+)`?[ \t]*\)[ \t]*$"
+                         r"(.*?)(?=^#{1,6} |\Z)", text, re.M | re.S | re.I):
+        if team_key(m.group(1)) == team_key(team):
+            return [s for s in (re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", l).strip() for l in m.group(2).splitlines())
+                    if s]
+    return []
 
 
 def handover_problems(repo, intent, team=None) -> list:

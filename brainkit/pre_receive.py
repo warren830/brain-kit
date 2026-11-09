@@ -3,10 +3,11 @@
 Claim branches (claim/<KEY>): only the person claim.json names may create, change or delete one; an intent's
 text fields (intents.py: source, body, acs, refs, closed) must pass the Brain's content checks - all of them when the
 claim is created, the ones a push changes after that (closing a claim filed under older rules still works).
-Filed for others (待认领, "owner": null): created by the person filed_by names (a split child: only by the owner of
-its parent); its owner may go from none to the person who pushes only (claiming changes nothing else); an owner may
-release it back to none; nobody may take a claimed one. While nobody owns it, whoever filed it or the parent's owner
-may change, close or delete it. key, parent, unit, source and filed_by never change. Bots never claim.
+Filed for others (待认领, "owner": null): created by the person filed_by names (a split child: only unowned, by the
+owner of its parent); its owner may go from none to the person who pushes only (claiming changes nothing else); an
+owner may release it back to none; nobody may take a claimed one. While nobody owns it, whoever filed it or the
+parent's owner may change, close or delete it; a split child is closed, never deleted, and its `split` record does
+not change while someone owns it. key, parent, unit, source and filed_by never change. Bots never claim.
 Rules for run branches (<prefix>/<owner>/<JIRA>-<slug>):
   bot accounts   may push only branches under <prefix>/ (well-formed names), never delete or force-push,
                  never push tags, never change bot_forbidden_paths (gates/, project-agent.yaml, CI, ...), and never
@@ -160,9 +161,17 @@ def _unowned(doc) -> bool:
     return isinstance(doc, dict) and "owner" in doc and doc["owner"] is None
 
 
+def _is_child(doc) -> bool:
+    """A child of a split (brain split): it names a parent, a unit or a split, or has source split."""
+    return isinstance(doc, dict) and (doc.get("source") == "split" or any(k in doc for k in ("parent", "unit",
+                                                                                              "split")))
+
+
 def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
-    """claim/<KEY>: created once by the person it names (or, filed for others, by the person filed_by names); an
-    owner goes from none to the pusher only, back to none by the owner, and nobody takes a claimed one."""
+    """claim/<KEY>: created once by the person it names (or, filed for others, by the person filed_by names; a child
+    of a split only unowned, by its parent's owner); an owner goes from none to the pusher only, back to none by the
+    owner, and nobody takes a claimed one. A child is closed, never deleted, and its split record stays as filed
+    while someone owns it."""
     key = branch[len("claim/"):]
     if not JIRA_RE.match(key):
         return ["%s: claim branches are claim/<PREFIX>-<n>" % branch]
@@ -174,6 +183,8 @@ def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
         holder = (before or {}).get("owner") if isinstance(before, dict) else None
         if not _unowned(before) and holder != user:
             return ["%s: claimed by %s; only they may change or release it" % (branch, holder or "unknown")]
+        if new == ZERO_SHA and _is_child(before):
+            return ["%s: a child of a split is closed with a reason (`brain intent close`), never deleted" % branch]
         if _unowned(before) and new == ZERO_SHA and not _may_manage(before, user, cwd):
             return ["%s: not claimed yet; only %s (who filed it) or the parent's owner may delete it"
                     % (branch, before.get("filed_by") or "who filed it")]
@@ -186,14 +197,19 @@ def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
         return ["%s: claim.json must name key %s and owner %s" % (branch, key, user)]
     owner = doc.get("owner")
     if before is None:                                  # a new claim
-        if _unowned(doc):
+        if "filed_by" in doc and doc.get("filed_by") != user:
+            return ["%s: claim.json must name owner %s, or no owner and filed_by %s" % (branch, user, user)]
+        if _is_child(doc):                              # only the parent's owner files its children, unowned
+            parent = _ref_claim(doc.get("parent"), cwd)
+            if not parent or parent.get("owner") != user:
+                return ["%s: a child of %s is filed by %s's owner (%s), not by %s" % (
+                    branch, doc.get("parent"), doc.get("parent"), (parent or {}).get("owner") or "nobody", user)]
+            if not _unowned(doc) or doc.get("filed_by") != user:
+                return ["%s: a child of a split is filed unowned: claim.json must have no owner and filed_by %s"
+                        % (branch, user)]
+        elif _unowned(doc):
             if doc.get("filed_by") != user:
                 return ["%s: claim.json must name owner %s, or no owner and filed_by %s" % (branch, user, user)]
-            if doc.get("parent"):
-                parent = _ref_claim(doc["parent"], cwd)
-                if not parent or parent.get("owner") != user:
-                    return ["%s: a child of %s is filed by %s's owner (%s), not %s" % (
-                        branch, doc["parent"], doc["parent"], (parent or {}).get("owner") or "nobody", user)]
         elif owner != user:
             return ["%s: claim.json must name key %s and owner %s" % (branch, key, user)]
     else:
@@ -210,6 +226,10 @@ def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
             elif owner != user:
                 return ["%s: claimed by %s; nobody may take a claimed one (its owner may keep it or release it)"
                         % (branch, user)]
+            elif doc.get("split", _GONE) != before.get("split", _GONE):
+                # the split record says where the child came from (its parent's run branch): only the parent's side
+                # changes it, while nobody owns the child
+                return ["%s: split never changes while someone owns the claim" % branch]
         elif owner is None and "owner" in doc:          # still unowned: changed by who filed it or the parent's owner
             if not _may_manage(before, user, cwd):
                 return ["%s: not claimed yet; only %s (who filed it) or the parent's owner may change it"

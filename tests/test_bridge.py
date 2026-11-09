@@ -455,6 +455,15 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.bridge.process(P, self.bridge.kit(P), self.mrs[8]), "accepted")
         self.assertTrue(any("RUN-PAY-1-1" in n and "src/refund/fees.py" in n for n in self.notes()), self.notes())
 
+    def test_split_child_needs_its_own_hand_over_note(self):
+        """A split child shares its parent's aidlc-state.md: its hand-over note is its own `### Next (team <unit>)`
+        subsection, so the shared Status and Next do not count for it."""
+        rec = self.run_json(intent="261108-pay-9-big", parent="PAY-9", unit="api", target_branch="ai/alice/PAY-9-big",
+                            lean_team="api")
+        commit_file(self.work, "aidlc-docs/261108-pay-9-big/aidlc-state.md", STATE_OK)
+        self.mrs[5]["sha"] = self.push("runs/PAY-1/run.json", json.dumps(rec))
+        self.rejected_with("no '### Next (team api)' items")
+
     def test_overlap_warning_between_split_siblings(self):
         """Children of one split (brain split) carry their units' Paths, globs included, as expected_paths: siblings
         whose paths overlap get the warning on the runner; a sibling with its own folder does not."""
@@ -462,7 +471,10 @@ class BridgeTest(unittest.TestCase):
             return self.run_json(key=key, branch=branch, intent="261108-pay-9-big", expected_paths=paths,
                                  parent="PAY-9", unit=unit, target_branch="ai/alice/PAY-9-big", lean_team=unit)
 
-        commit_file(self.work, "aidlc-docs/261108-pay-9-big/aidlc-state.md", STATE_OK)
+        # a child's hand-over note is its own `### Next (team <unit>)` subsection of the shared aidlc-state.md
+        notes = "".join("### Next (team %s)\nStatus: Construction %s step 1 of 2\n1. step 2\n" % (u, u)
+                        for u in ("api", "jobs", "web"))
+        commit_file(self.work, "aidlc-docs/261108-pay-9-big/aidlc-state.md", STATE_OK + notes)
         self.mrs[5]["sha"] = self.push("runs/PAY-1/run.json",
                                        json.dumps(child("PAY-1", BRANCH, "api", ["services/api/**"])))
         self.assertEqual(self.bridge.process(P, self.bridge.kit(P), self.mrs[5]), "accepted")
@@ -470,16 +482,16 @@ class BridgeTest(unittest.TestCase):
                                       (9, "PAY-3", "web", ["web/**", "services/api/refunds.py"])):
             br = "ai/alice/%s-%s" % (key, unit)
             sh("git", "-C", self.work, "switch", "-q", "-c", br, "main")
-            commit_file(self.work, "aidlc-docs/261108-pay-9-big/aidlc-state.md", STATE_OK)
+            commit_file(self.work, "aidlc-docs/261108-pay-9-big/aidlc-state.md", STATE_OK + notes)
             sha = self.push("runs/%s/run.json" % key, json.dumps(child(key, br, unit, paths)), branch=br)
             self.mrs[iid] = self.mr(iid, br, sha)
             self.events[iid] = [self.ev("alice", "add")]
             self.assertEqual(self.bridge.process(P, self.bridge.kit(P), self.mrs[iid]), "accepted")
 
-        def notes(iid):
+        def notes_of(iid):
             return [c[3]["body"] for c in self.fake.called("POST", GL + r"/merge_requests/%d/notes" % iid)]
-        self.assertTrue(notes(8) and not any("重叠" in n for n in notes(8)), notes(8))
-        self.assertTrue(any("RUN-PAY-1-1" in n and "services/api/refunds.py" in n for n in notes(9)), notes(9))
+        self.assertTrue(notes_of(8) and not any("重叠" in n for n in notes_of(8)), notes_of(8))
+        self.assertTrue(any("RUN-PAY-1-1" in n and "services/api/refunds.py" in n for n in notes_of(9)), notes_of(9))
 
     # ---------- decision loop ----------
 

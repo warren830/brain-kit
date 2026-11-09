@@ -99,12 +99,14 @@ brain claim --release PAY-8     # 放回去，又是待认领
 
 | 推送 | 谁可以 |
 |---|---|
-| 新建，写了主人 | 只有主人本人 |
-| 新建，待认领 | 只有 `filed_by` 写的那个人；小需求只有大需求的主人能登记 |
+| 新建，写了主人 | 只有主人本人；写了 `filed_by` 的话也必须是他 |
+| 新建，待认领 | 只有 `filed_by` 写的那个人 |
+| 新建小需求 | 只能是待认领的，只有大需求的主人能登记（`filed_by` 是他） |
 | 认领 | 主人只能从"没有"变成推送的人；别的字段一个都不能变 |
 | 放回 | 主人把自己改回"没有"；只改主人 |
-| 已认领的 | 只有主人能改、放、删；谁都不能抢过去 |
+| 已认领的 | 只有主人能改、放、删；谁都不能抢过去。小需求的 `split`（它从哪个拆分来）有人认领时不能改 |
 | 待认领时改、关、删 | 登记的人，或大需求的主人 |
+| 小需求 | 只能关（写原因），不能删 |
 | 任何时候 | `key`、`parent`、`unit`、`source`、`filed_by` 永远不变；机器人账号不能动 claim 分支 |
 
 文字字段照旧过内容检查：新建时查全部，之后只查这次改了的。
@@ -118,7 +120,7 @@ brain claim --release PAY-8     # 放回去，又是待认领
 | `unclaimed` | 待认领 | 没主人，没 run |
 | `claimed` | `<人>` 认领了 | 有主人，还没 run 分支 |
 | `in_progress` | `<人>` 在做 | 有 run 分支（本地或 origin） |
-| `merged` | 已合并 | run.json 到了 main；小需求的 run.json 到了大需求的 run 分支也算 |
+| `merged` | 已合并 | run.json 到了 main。小需求要两条都满足：它 `brain handoff` 时在 run.json 里记的那一笔（`mr`）到了大需求的 run 分支（或 main）；它的 run 分支还在时，分支的最新提交也在那里面。只有 run.json 不算：从它的分支开工（`--on`）或合过它的兄弟，也带着它的 run.json |
 | `closed` | 已关闭 | 关了 |
 
 大需求整体还有一个 `family_state`：`in_progress`（还有小需求没合并）、`ready_to_release`（都合并了，等评审和发布）、`done`（发布了，小需求也都合并了：大需求就算关了，不用再做什么）、`closed`（有人用 `brain intent close` 在大需求的 claim 上记了关闭）。
@@ -146,7 +148,7 @@ brain intent show KEY --json      # 一个，字段一样
 | `state` | 都有 | `unclaimed`、`claimed`、`in_progress`、`merged`、`closed`（2.3） |
 | `source` | 都有 | 老的 claim 没写的，填 `product` |
 | `blocked_by` | 小需求 | 依赖里还没合并的小需求号 |
-| `children` | 大需求 | 小需求号，按单元顺序 |
+| `children` | 大需求 | 小需求号，按登记的先后（先登记被依赖的单元） |
 | `progress` | 大需求 | `merged`、`total`（没关的小需求数）、`unclaimed`、`claimed`、`in_progress`、`closed`、`text`（`"n/m merged"`） |
 | `family_state` | 大需求 | `in_progress`、`ready_to_release`、`done`、`closed` |
 | `released` | 大需求 | RELEASE 批过没有（看大需求的 run 分支和 main） |
