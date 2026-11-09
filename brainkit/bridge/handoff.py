@@ -378,13 +378,7 @@ class Bridge(DecisionLoop):
         d = self.cfg.get("intake_dir")
         if not d:
             return ["the run uses material packages but the bridge has no intake_dir"]
-        pulled = ""
-        if os.path.isdir(os.path.join(d, ".git")):
-            try:
-                p = git_net(d, "pull", "-q", "--ff-only", timeout=self.git_timeout, check=False)
-                pulled = "" if p.returncode == 0 else (p.stderr or p.stdout).strip()[:300] or "git pull failed"
-            except NetworkError as e:
-                pulled = str(e)
+        pulled = self.sync_intake(d) if os.path.isdir(os.path.join(d, ".git")) else ""
         probs = []
         for m in materials:
             pdir = os.path.join(d, "packages", m["package"])
@@ -398,6 +392,44 @@ class Bridge(DecisionLoop):
             # the clone could not be brought up to date: not a reason to reject; checked again next round
             raise NetworkError("brain-intake (%s) could not be updated: %s" % (d, pulled))
         return probs
+
+    def sync_intake(self, d) -> str:
+        """Bring the bridge's brain-intake clone `d` up to date with origin: '' or why it could not. The bridge's own
+        commits there (vouchers whose push failed) are rebased onto origin, not left to block every later pull (each
+        voucher and each package is its own folder, so the rebase meets no conflict), and pushed again: a voucher
+        that could not be pushed goes out on a later round. A failed push is not a reason to refuse anything."""
+        try:
+            p = git_net(d, "pull", "-q", "--rebase", timeout=self.git_timeout, check=False)
+        except NetworkError as e:
+            return str(e)
+        if p.returncode != 0:
+            gdir = git(d, "rev-parse", "--absolute-git-dir", check=False).stdout.strip()
+            if gdir and any(os.path.isdir(os.path.join(gdir, x)) for x in ("rebase-merge", "rebase-apply")):
+                git(d, "rebase", "--abort", check=False)
+            return (p.stderr or p.stdout).strip()[:300] or "git pull failed"
+        ahead = git(d, "rev-list", "--count", "@{u}..HEAD", check=False)
+        if ahead.returncode == 0 and ahead.stdout.strip() not in ("", "0"):
+            try:
+                q = git_net(d, "push", "-q", timeout=self.git_timeout, check=False)
+                if q.returncode != 0:
+                    self.out("brain-intake (%s): %s local commit(s) not pushed yet: %s" % (
+                        d, ahead.stdout.strip(), one_line((q.stderr or q.stdout).strip(), 200)))
+            except NetworkError as e:
+                self.out("brain-intake (%s): local commits not pushed yet: %s" % (d, e))
+        return ""
+
+    def push_pending_vouchers(self):
+        """Voucher commits a failed push left in the bridge's clone go out on the next round, also when no hand-over
+        or answer publishes again. Nothing to do (no network) when the clone is not ahead of origin."""
+        vd = self.cfg.get("vouchers_dir")
+        if not self.cfg.get("publish_vouchers") or not vd or not os.path.isdir(vd):
+            return
+        top = git(vd, "rev-parse", "--show-toplevel", check=False)
+        ahead = git(vd, "rev-list", "--count", "@{u}..HEAD", check=False)
+        if top.returncode == 0 and ahead.returncode == 0 and ahead.stdout.strip() not in ("", "0"):
+            why = self.sync_intake(top.stdout.strip())
+            if why:
+                self.out("brain-intake: voucher commits not pushed yet: %s" % one_line(why, 200))
 
     @property
     def git_timeout(self) -> float:
@@ -424,6 +456,10 @@ class Bridge(DecisionLoop):
         up the others (as in dispatch, watch and collect): its error is raised at the end, after the rest. First,
         the comments earlier rounds could not post (tell_mr_due)."""
         errors = self.notes_due_round()
+        try:
+            self.push_pending_vouchers()
+        except Exception as e:  # noqa: BLE001
+            errors.append("brain-intake: %s" % e)
         for proj in self.cfg["projects"]:
             project = proj["project"] if isinstance(proj, dict) else proj
             try:

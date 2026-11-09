@@ -382,5 +382,87 @@ class UsersKeyCase(unittest.TestCase):
         self.assertEqual(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5]), "accepted")
 
 
+class IntakeCloneAfterAFailedPush(unittest.TestCase):
+    """R1-07: once a voucher's push to brain-intake failed, its commit stayed local and the bridge's `pull --ff-only`
+    no longer moved the clone on after someone published a package: every hand-over with a new package was retried
+    with "could not be updated", forever."""
+
+    def test_new_package_after_a_failed_voucher_push(self):
+        import json
+        from brainkit.intake import package
+        from tests import test_bridge as tb
+        from tests.helpers import commit_file, git_repo
+        t = bridge_fixture(self)
+        origin = os.path.join(t.d, "intake.git")
+        sh("git", "init", "-q", "--bare", "-b", "main", origin)
+        seed = git_repo(os.path.join(t.d, "seed"))
+        commit_file(seed, "vouchers/README", "vouchers\n")
+        sh("git", "-C", seed, "push", "-q", origin, "main")
+        clone = os.path.join(t.d, "intake")                         # the bridge's brain-intake clone
+        sh("git", "clone", "-q", origin, clone)
+        for k, v in (("user.name", "brain-bridge"), ("user.email", "bridge@example.com"), ("commit.gpgsign", "false")):
+            sh("git", "-C", clone, "config", k, v)
+        t.cfg.update(intake_dir=clone, vouchers_dir=os.path.join(clone, "vouchers"), publish_vouchers=True,
+                     publish_timeout=5)
+        # 1. PAY-1's voucher cannot be pushed (brain-intake unreachable): its commit stays in the clone
+        sh("git", "-C", clone, "remote", "set-url", "origin", os.path.join(t.d, "unreachable.git"))
+        t.bridge = t.new_bridge()
+        with self.assertRaises(Exception):
+            t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5])
+        sh("git", "-C", clone, "remote", "set-url", "origin", origin)
+        t.events[5].append(t.ev("alice", "remove"))                 # PAY-1 is not handed over after all
+        self.assertEqual(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5]), "unlabelled")
+        self.assertTrue(sh("git", "-C", clone, "log", "--format=%s", "origin/main..HEAD").stdout.strip())
+        # 2. someone publishes PAY-2's package from their own clone
+        other = os.path.join(t.d, "bob-intake")
+        sh("git", "clone", "-q", origin, other)
+        src = os.path.join(t.d, "doc2")
+        os.makedirs(src)
+        with open(os.path.join(src, "req.md"), "w", encoding="utf-8") as f:
+            f.write("# 手续费\n按笔收取。\n")
+        rep = package.build([src], "PAY-2", other, submitter="alice", consent=True, classification="internal",
+                            business="mask", kit_intake=KIT_INTAKE)
+        sh("git", "-C", other, "add", "-A")
+        sh("git", "-C", other, "commit", "-q", "-m", "materials for PAY-2")
+        sh("git", "-C", other, "push", "-q", "origin", "main")
+        # 3. PAY-2's hand-over uses that package: accepted on the first round
+        b2 = "ai/alice/PAY-2-fees"
+        sh("git", "-C", t.work, "switch", "-q", "-c", b2, "main")
+        commit_file(t.work, "aidlc-docs/261108-pay-2-fees/aidlc-state.md", tb.STATE_OK)
+        rec2 = t.run_json(key="PAY-2", branch=b2, intent="261108-pay-2-fees",
+                          materials=[{"package": rep["package"], "manifest_sha256": rep["manifest_sha256"]}])
+        t.mrs[8] = t.mr(8, b2, t.push("runs/PAY-2/run.json", json.dumps(rec2), branch=b2))
+        t.events[8] = [t.ev("alice", "add")]
+        self.assertEqual(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[8]), "accepted")
+        sh("git", "-C", clone, "fetch", "-q")
+        self.assertEqual(sh("git", "-C", clone, "log", "--format=%s", "origin/main..HEAD").stdout.strip(), "")
+        pushed = sh("git", "--git-dir", origin, "ls-tree", "-r", "--name-only", "main").stdout.split()
+        self.assertTrue(any(f.startswith("vouchers/RUN-PAY-1-") for f in pushed), pushed)   # PAY-1's went out too
+
+    def test_pending_voucher_commit_is_pushed_next_round(self):
+        from tests import test_bridge as tb
+        from tests.helpers import commit_file, git_repo
+        t = bridge_fixture(self)
+        origin = os.path.join(t.d, "intake.git")
+        sh("git", "init", "-q", "--bare", "-b", "main", origin)
+        seed = git_repo(os.path.join(t.d, "seed"))
+        commit_file(seed, "vouchers/README", "vouchers\n")
+        sh("git", "-C", seed, "push", "-q", origin, "main")
+        clone = os.path.join(t.d, "intake")
+        sh("git", "clone", "-q", origin, clone)
+        for k, v in (("user.name", "brain-bridge"), ("user.email", "bridge@example.com"), ("commit.gpgsign", "false")):
+            sh("git", "-C", clone, "config", k, v)
+        t.cfg.update(vouchers_dir=os.path.join(clone, "vouchers"), publish_vouchers=True, publish_timeout=5)
+        sh("git", "-C", clone, "remote", "set-url", "origin", os.path.join(t.d, "unreachable.git"))
+        t.bridge = t.new_bridge()
+        with self.assertRaises(Exception):
+            t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5])
+        sh("git", "-C", clone, "remote", "set-url", "origin", origin)
+        t.events[5].append(t.ev("alice", "remove"))
+        t.bridge.poll()                                              # no hand-over publishes: the round pushes it
+        pushed = sh("git", "--git-dir", origin, "ls-tree", "-r", "--name-only", "main").stdout.split()
+        self.assertTrue(any(f.startswith("vouchers/RUN-PAY-1-") for f in pushed), pushed)
+
+
 if __name__ == "__main__":
     unittest.main()
