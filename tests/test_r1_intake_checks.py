@@ -428,5 +428,34 @@ class R1_65FindingsListWhatWasMasked(Base):
         self.assertEqual(manifest["sources"][1]["findings"], {"pii": {"phone": 1}})
 
 
+
+class R1_66NothingTakenIn(Base):
+    """When every file was refused (an old .doc and a screenshot), an empty package was written and the run started."""
+
+    def setUp(self):
+        super().setUp()
+        self.file("退款需求.doc", b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1old word file", "wb")
+        self.file("截图.png", b"\x89PNG\r\n\x1a\n....", "wb")
+
+    def test_stops_with_the_reasons(self):
+        with self.assertRaises(BrainError) as cm:
+            self.build()
+        msg = str(cm.exception)
+        self.assertIn("没有一个文件收得进来，不写材料包", msg)
+        self.assertIn("src/退款需求.doc（不收 .doc 格式", msg)
+        self.assertIn("src/截图.png（图片不单独收", msg)
+        self.assertFalse(os.path.exists(os.path.join(self.store, "packages")))
+
+    def test_dry_run_lists_it(self):
+        rep = self.build(dry_run=True)
+        self.assertEqual(len(rep["blocking"]), 1)
+        self.assertIn("没有一个文件收得进来", rep["blocking"][0])
+
+    def test_one_file_taken_in_is_enough(self):
+        self.file("req.md", "# 退款\n\n14 天内可退。\n")
+        rep = self.build()
+        self.assertEqual((rep["sources"], len(rep["refused"])), (1, 2))
+
+
 if __name__ == "__main__":
     unittest.main()

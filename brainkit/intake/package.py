@@ -302,6 +302,9 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
 
     for r in refused:
         r["name"] = meta(r["name"])
+    if not converted:
+        block("没有一个文件收得进来，不写材料包：%s。请按原因改好再交。"
+              % "；".join("%s %s（%s）" % (r["id"], r["name"], r["reason"]) for r in refused))
     segs, toc, hidden_out, findings = [], [], [], []
     limit = int(kit_intake.get("segment_chars", 6000))
     shown = {}                                       # sid -> the body's hits as masked (values from other files too)
