@@ -168,5 +168,31 @@ class R1_59NameColumns(Base):
         self.assertIn("| PAY-12 | Refund timeout | [人名-", text)
 
 
+
+class R1_56EmphasisedLabels(Base):
+    """A label or a name in Markdown emphasis was not masked: **负责人**：李娜, **Owner:** Alice Wang, Reported by **Bob
+    Chen**."""
+
+    def people(self, text):
+        return [h.value for h in checks.scan(text) if h.cat == "pii" and h.kind == "person"]
+
+    def test_emphasis(self):
+        for text, names in (("**负责人**：李娜", ["李娜"]), ("- **联系人：** 王芳", ["王芳"]), ("负责人：**张伟**、**李娜**", ["张伟", "李娜"]),
+                            ("*处理人*：王芳", ["王芳"]), ("**Owner:** Alice Wang", ["Alice Wang"]),
+                            ("- Reported by **Bob Chen**", ["Bob Chen"]), ("__Assignee__: Alice Wang", ["Alice Wang"])):
+            self.assertEqual(self.people(text), names, text)
+        self.assertEqual(self.people("owner_id: Alice Wang"), [])        # a field name, not the Owner label
+        self.assertEqual(self.people("**负责人**：产品经理"), [])           # a role stays a role
+
+    def test_masked_in_the_package(self):
+        self.file("需求.md", "# 退款需求\n\n负责人：张伟\n\n**负责人**：李娜\n\n- **联系人：** 王芳\n- **Owner:** Alice Wang\n"
+                  "- Reported by **Bob Chen**\n")
+        text = self.segments(self.build())
+        for raw in ("张伟", "李娜", "王芳", "Alice Wang", "Bob Chen"):
+            self.assertNotIn(raw, text)
+        self.assertIn("**负责人**：[人名-2]", text)
+        self.assertIn("- Reported by **[人名-5]**", text)
+
+
 if __name__ == "__main__":
     unittest.main()

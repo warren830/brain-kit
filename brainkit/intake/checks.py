@@ -198,8 +198,16 @@ def _cell_person(x) -> bool:
     return verdict is not None and n == len(flat.split())
 
 
+# Markdown emphasis on a label or a name (**负责人**：李娜, - **联系人：** 王芳, **Owner:** Alice Wang, Reported by **Bob
+# Chen**): the label rules read the text with the markers blanked out (same length, so the offsets hold); an
+# underscore inside a word (owner_id) stays
+EMPHASIS_RE = re.compile(r"\*+|(?<![A-Za-z0-9])_+|_+(?![A-Za-z0-9])")
+
+
 def _labelled_names(text) -> list:
     hits = []
+    original = text
+    text = EMPHASIS_RE.sub(lambda m: " " * len(m.group(0)), text)
     for m in CJK_LABEL_NAME_RE.finditer(text):
         name, start = m.group(3), m.start(3)
         bare = m.group("duty") is None and not (m.group(1) or "").strip()
@@ -226,7 +234,7 @@ def _labelled_names(text) -> list:
             verdict = "name"                         # Owner: / On-call: / Assignee: a field that names a person
         spans = [w.span() for w in re.finditer(r"\S+", m.group("v"))]
         start, end = m.start("v"), m.start("v") + spans[n - 1][1]
-        hits.append(Hit("pii" if verdict == "name" else "review", "person", start, end, text[start:end]))
+        hits.append(Hit("pii" if verdict == "name" else "review", "person", start, end, original[start:end]))
     return hits
 
 
