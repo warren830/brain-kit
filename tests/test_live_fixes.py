@@ -195,5 +195,34 @@ class PublishPullsFirst(unittest.TestCase):
         self.assertIn("packages/PKG-2/manifest.json", files)
 
 
+class LocalRepoNeedsNoGitLabName(unittest.TestCase):
+    """2026-11-09: a repo with no GitLab (no remote, gitlab.base empty) asked for a GitLab token or brain.user before
+    a local run. Without GitLab the name only names claims and branches: the login name is used."""
+
+    def cfg(self, base):
+        from brainkit import config
+        c = config.merged(config.DEFAULTS, {})
+        c["gitlab"] = dict(c["gitlab"], base=base)
+        return c
+
+    def test_login_name_without_gitlab_and_the_gitlab_username_with_it(self):
+        repo = git_repo(os.path.join(tmpdir(self), "r"))
+        env = {k: v for k, v in os.environ.items() if k not in ("BRAIN_USER", "GITLAB_TOKEN", "BRAIN_GITLAB_TOKEN_FILE")}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("getpass.getuser", return_value="Yingchu"), \
+                mock.patch.object(cli, "read_token", return_value=None):
+            self.assertEqual(cli._me(repo, self.cfg("")), "yingchu")
+            with self.assertRaises(BrainError) as e:
+                cli._me(repo, self.cfg("https://gitlab.example"))
+            self.assertIn("GitLab username", str(e.exception))
+            sh("git", "-C", repo, "config", "brain.user", "dave")
+            self.assertEqual(cli._me(repo, self.cfg("https://gitlab.example")), "dave")
+            self.assertEqual(cli._me(repo, self.cfg("")), "dave")         # an explicit name always wins
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("getpass.getuser", return_value="no way!"), \
+                mock.patch.object(cli, "read_token", return_value=None):
+            sh("git", "-C", repo, "config", "--unset", "brain.user")
+            with self.assertRaises(BrainError):
+                cli._me(repo, self.cfg(""))
+
+
 if __name__ == "__main__":
     unittest.main()

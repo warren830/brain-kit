@@ -97,11 +97,30 @@ def _me(repo, cfg) -> str:
     if gl:
         return str(gl.current_user()["username"]).lower()
     who = os.environ.get("BRAIN_USER") or git(repo, "config", "brain.user", check=False).stdout.strip()
+    if not who and not cfg["gitlab"]["base"]:
+        # No GitLab here: the name only names this machine's claims and branches (ai/<name>/...); no server checks
+        # it and no bridge compares it, so the login name will do. With GitLab it must be the GitLab username.
+        who = _login_name()
+        if not who:
+            raise BrainError("who are you? your login name is not usable as a name here: "
+                             "`git config brain.user <name>` (lowercase letters, digits, . _ -)")
     if not who:
-        raise BrainError("who are you? set GITLAB_TOKEN (preferred) or `git config brain.user <gitlab-username>`")
+        raise BrainError("who are you? this repo uses GitLab (%s): set GITLAB_TOKEN (preferred) or "
+                         "`git config brain.user <your GitLab username>`; it must be your GitLab username: GitLab "
+                         "checks who pushes ai/<name>/... and the bridge checks who handed over" % cfg["gitlab"]["base"])
     if not USER_RE.match(who.lower()):
         raise BrainError("brain.user %r is not a GitLab username" % who)
     return who.lower()
+
+
+def _login_name() -> str:
+    """This machine's login name, lowercased, when it is a usable name; '' otherwise."""
+    import getpass
+    try:
+        name = getpass.getuser().strip().lower()
+    except Exception:  # noqa: BLE001 - no login name (no USER, no passwd entry): ask for one
+        return ""
+    return name if USER_RE.match(name) else ""
 
 
 def _store(repo, override=None) -> str:
