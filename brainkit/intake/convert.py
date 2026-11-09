@@ -754,6 +754,20 @@ def _xl_fill_paints(fill, theme, palette) -> bool:
 XL_HF_CODE_RE = re.compile(r'&(?:&|"[^"]*"|K(?:[0-9A-Fa-f]{6}|[0-9]{2}[+-][0-9]{3})|[0-9]+|[A-Za-z+-])')
 
 
+def _xl_comment_text(c, authors) -> str:
+    """A cell note's text without its author: Excel starts a note with the author's name in bold ("张伟:")."""
+    runs = c.findall("%s/%s" % (_q("s", "text"), _q("s", "r")))
+    if runs and runs[0].find("%s/%s" % (_q("s", "rPr"), _q("s", "b"))) is not None and \
+            "".join(t.text or "" for t in runs[0].iter(_q("s", "t"))).rstrip().endswith((":", "：")):
+        runs[0].clear()
+    text = "".join(t.text or "" for t in c.iter(_q("s", "t")))
+    author = authors[_int(c.get("authorId"))] if _int(c.get("authorId")) is not None and \
+        0 <= _int(c.get("authorId")) < len(authors) else ""
+    if author and text.lstrip().startswith(author):
+        text = re.sub(r"^\s*%s\s*[:：]?" % re.escape(author), "", text)
+    return text
+
+
 def convert_xlsx(path, name, max_cells=20000) -> Doc:
     d = Doc(name, "xlsx")
     z = _open_zip(path)
@@ -866,9 +880,9 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
             d.hide("%s（工作表 %s）" % ("、".join(sorted(set(hidden.values()))), sname), table_markdown(rows))
         for kind, part in _part_rels(z, target):
             cm = _xml(z, part) if kind == "comments" else None
+            authors = [a.text or "" for a in cm.iter(_q("s", "author"))] if cm is not None else []
             for c in (cm.iter(_q("s", "comment")) if cm is not None else []):
-                d.hide("Excel 批注 %s!%s" % (sname, c.get("ref", "")),
-                       "".join(t.text or "" for t in c.iter(_q("s", "t"))))
+                d.hide("Excel 批注 %s!%s" % (sname, c.get("ref", "")), _xl_comment_text(c, authors))
         if state != "visible":
             d.notes.append("工作表「%s」是隐藏的（%s），内容已移到隐藏区" % (sname, state))
             continue

@@ -357,7 +357,8 @@ class R1_54NothingDroppedSilently(unittest.TestCase):
                 '<Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
                 'comments" Target="../comments1.xml"/></Relationships>')
         comments = ('<?xml version="1.0"?><comments %s><authors><author>someone</author></authors><commentList>'
-                    '<comment ref="B2" authorId="0"><text><r><t>HIDDEN-COMMENT</t></r></text></comment>'
+                    '<comment ref="B2" authorId="0"><text><r><rPr><b/></rPr><t>someone:</t></r><r><t xml:space='
+                    '"preserve">\nHIDDEN-COMMENT</t></r></text></comment>'
                     '</commentList></comments>' % S)
         d = tmpdir(self)
         p = xlsx(os.path.join(d, "a.xlsx"), [("规则", None, rows, "")],
@@ -366,7 +367,7 @@ class R1_54NothingDroppedSilently(unittest.TestCase):
         self.assertIn("| 行 | 编号 | 负责人 |  |\n|---|---|---|---|\n| 2 | AC-4 | 张伟 |  |\n| 5 |  | B5 有 r | C5 接着 |"
                       "\n| 6 | A6 |  |  |", doc.text)
         self.assertIn(("Excel 批注 规则!B2", "HIDDEN-COMMENT"), doc.hidden)
-        self.assertNotIn("someone", str(doc.hidden))
+        self.assertNotIn("someone", str(doc.hidden))         # Excel starts a note with its author, in bold
         p2 = xlsx(os.path.join(d, "b.xlsx"), [("规则", None, rows, "")], [("xl/workbook.xml", (
             '<workbook %s %s><sheets><sheet name="规则" r:id="rId1"/><sheet name="缺页" r:id="rId9"/></sheets>'
             '</workbook>' % (S, R)))])
