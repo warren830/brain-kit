@@ -384,5 +384,28 @@ class R1_62GitleaksFinds(Base):
                          ["[令牌-1]", "[令牌-2]", "[密钥-1]", "[密钥-2]"])
 
 
+
+class R1_64SecretMessage(Base):
+    """--classification secret said 材料是绝密（），不收，只留哈希: empty brackets, and nothing is kept (README: 绝密不收)."""
+
+    def test_given_secret(self):
+        self.file("req.md", "# 退款\n\n## 验收\n1. 14 天内可退\n")
+        rep = self.build(classification="secret", dry_run=True)
+        self.assertEqual(rep["blocking"], ["门 2：材料按绝密处理（你选的是 secret）：绝密材料不收，不写材料包。"])
+        with self.assertRaises(BrainError) as cm:
+            self.build(classification="secret")
+        self.assertNotIn("（）", str(cm.exception))
+        self.assertNotIn("哈希", str(cm.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.store, "packages")))
+
+    def test_marked_secret(self):
+        self.file("a.md", "绝密★启用前\n\n# 方案\n")
+        self.file("b.md", "# 退款\n")
+        with self.assertRaises(BrainError) as cm:
+            self.build()
+        self.assertIn("（src/a.md=secret）", str(cm.exception))
+        self.assertIn("--exclude", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

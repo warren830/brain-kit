@@ -273,8 +273,9 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
         if CLASSES.index(cls) > CLASSES.index(effective):
             effective = cls
     if effective == "secret":
-        block("门 2：材料是绝密（%s），不收，只留哈希" % ", ".join(n for n, c in detected if c == "secret")
-                         or classification)
+        marked = ", ".join("%s=secret" % n for n, c in detected if c == "secret")
+        block("门 2：材料按绝密处理（%s）：绝密材料不收，不写材料包。%s"
+              % (marked or "你选的是 %s" % classification, "不想交这份，请用 --exclude 去掉。" if marked else ""))
     if effective == "confidential" and not kit_intake.get("allow_confidential"):
         block("门 2：材料按机密处理（%s），而 intake.allow_confidential 是 false（决策 02 未放行）。"
                          "请产品写一份脱敏摘要再交，或用 --exclude 去掉这份。"
