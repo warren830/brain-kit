@@ -152,45 +152,60 @@ def strip_hidden_html(text):
     return "".join(out), hidden
 
 
-MD_FENCE_RE = re.compile(r"(?m)^[ \t]*(?:(`{3,})[^`\n]*|(~{3,})[^\n]*)$")
+MD_FENCE_RE = re.compile(r"(?m)^ {0,3}(?:(`{3,})[^`\n]*|(~{3,})[^\n]*)$")    # up to 3 spaces: 4 is no fence
+# what may start a Markdown construct, leftmost first: a comment, a raw HTML tag (its attributes may hold a
+# backtick), a fence, a backtick run
+MD_TOKEN_RE = re.compile(r"<!--|<(?:/?[A-Za-z][A-Za-z0-9]*\b(?:\"[^\"]*\"|'[^']*'|[^>\"'])*|/?[A-Za-z][A-Za-z0-9]*\b[^>]*)>"
+                         r"|(?m:^ {0,3}(?:`{3,}[^`\n]*|~{3,}[^\n]*)$)|`+")
+MD_PARA_END_RE = re.compile(r"\n[ \t]*\n|\n {0,3}(?:`{3,}|~{3,})")       # a code span ends in its paragraph
 
 
 def protect_md_code(text):
     """Markdown code (fenced blocks, inline `code`) is shown as written: HTML in it is an example, not a hidden
-    element or a comment. Returns (text with each code part swapped for a mark, restore(s) putting them back)."""
+    element or a comment. Read left to right as Markdown does: whatever starts first wins, so a comment or a tag
+    that starts before a backtick hides it, and an escaped backtick starts nothing. Returns (text with each code
+    part swapped for a mark, restore(s) putting them back)."""
     spans = []
-
-    def inline(a, b):                                # code spans: a run of n backticks up to the next run of n
-        runs = [m.span() for m in re.finditer(r"`+", text[a:b])]
-        i = 0
-        while i < len(runs):
-            n = runs[i][1] - runs[i][0]
-            j = next((k for k in range(i + 1, len(runs)) if runs[k][1] - runs[k][0] == n), None)
-            if j is None or re.search(r"\n[ \t]*\n", text[a + runs[i][1]:a + runs[j][0]]):
-                i += 1                               # no end in the same paragraph: plain backticks
-                continue
-            spans.append((a + runs[i][0], a + runs[j][1]))
-            i = j + 1
-
     pos = 0
     while True:
-        m = MD_FENCE_RE.search(text, pos)
-        inline(pos, m.start() if m else len(text))
+        m = MD_TOKEN_RE.search(text, pos)
         if not m:
             break
-        fence = m.group(1) or m.group(2)
-        close = re.compile(r"(?m)^[ \t]*%s{%d,}[ \t]*$" % (re.escape(fence[0]), len(fence))).search(text, m.end())
-        end = close.end() if close else len(text)    # an unclosed fence runs to the end
-        spans.append((m.start(), end))
-        pos = end
-    mark = next(chr(c) for c in range(0xE000, 0xF900) if chr(c) not in text)    # a private-use character
+        tok = m.group(0)
+        if tok == "<!--":
+            close = text.find("-->", m.end())
+            pos = len(text) if close < 0 else close + 3
+        elif tok.startswith("<"):
+            pos = m.end()
+        elif m.group(0).lstrip(" ")[:3] in ("```", "~~~") and (m.start() == 0 or text[m.start() - 1] == "\n"):
+            fence = re.match(r" *(`+|~+)", tok).group(1)
+            close = re.compile(r"(?m)^ {0,3}%s{%d,}[ \t]*$" % (re.escape(fence[0]), len(fence))).search(text, m.end())
+            end = close.end() if close else len(text)        # an unclosed fence runs to the end
+            spans.append((m.start(), end))
+            pos = end
+        else:
+            a = m.start()
+            slashes = len(text[:a]) - len(text[:a].rstrip("\\"))
+            if slashes % 2:                                    # \` is a plain backtick
+                a += 1
+            n = m.end() - a
+            pos = m.end()
+            if n == 0:
+                continue
+            stop = MD_PARA_END_RE.search(text, pos)
+            close = re.compile(r"(?<!`)`{%d}(?!`)" % n).search(text, pos, stop.start() if stop else len(text))
+            if close:
+                spans.append((a, close.end()))
+                pos = close.end()
+    taken = set(text)
+    mark = next(chr(c) for c in list(range(0xE000, 0xF900)) + list(range(0xF0000, 0xFFFFE)) if chr(c) not in taken)
     parts, kept, last = [], [], 0
     for a, b in spans:
         parts.append(text[last:a] + "%s%d%s" % (mark, len(kept), mark))
         kept.append(text[a:b])
         last = b
     parts.append(text[last:])
-    back = re.compile("%s([0-9]+)%s" % (mark, mark))
+    back = re.compile("%s([0-9]+)%s" % (re.escape(mark), re.escape(mark)))
     return "".join(parts), lambda s: back.sub(lambda m: kept[int(m.group(1))], s)
 
 

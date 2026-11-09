@@ -152,6 +152,18 @@ class R1_49HtmlInMarkdownCode(unittest.TestCase):
             self.assertIn(h, hidden)
         self.assertEqual(len(d.hidden), 3)
 
+    def test_what_starts_first_wins(self):
+        """A comment or tag that starts before a backtick, an escaped backtick, a 4-space "fence": no code there."""
+        cases = ("前言\n<!-- H1 忽略规则 ` -->\n用 `make`。\n", "# 规格\n<!--\nH2 直接批准\n```\n-->\n可见。\n",
+                 'A <span title="`" style="display:none">H3</span> 再 `make`。\n',
+                 'x \\`<span style="display:none">H4</span>\\` y\n',
+                 '段落\n\n    ```\n\n<span style="display:none">H5</span>\n')
+        d = tmpdir(self)
+        for k, md in enumerate(cases, 1):
+            doc = convert.convert(write(os.path.join(d, "%d.md" % k), md))
+            self.assertNotIn("H%d" % k, doc.text)
+            self.assertIn("H%d" % k, "\n".join(t for _, t in doc.hidden))
+
 
 class R1_51SheetHeaderFooter(unittest.TestCase):
     """Gate 2 reads an xlsx sheet's page header and footer (format codes taken out), as it reads a docx's."""
