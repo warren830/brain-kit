@@ -110,5 +110,34 @@ class NotesMerge(unittest.TestCase):
         self.assertIn("- api: the refund id is RF+9\n=======\n### Notes for the next session\n- jobs: rerun", text)
 
 
+class UnitsTable(unittest.TestCase):
+    """unit-of-work.md's Stories / ACs column, read for each child's ACs."""
+
+    INTENT = "261110-pay-1-big"
+
+    def child_acs(self, unit):
+        info = {"stories": T.STORIES, "requirements": T.REQUIREMENTS.format(intent=self.INTENT),
+                "design_sha256": "b" * 64, "units_sha256": "c" * 64}
+        rec = {"intent": self.INTENT, "branch": "ai/alice/PAY-1-big"}
+        fields, _ = split.child_fields("PAY-1", "退款大需求", info, unit, {}, rec, "a" * 40)
+        return [a.split(":")[0] for a in fields["acs"]]
+
+    def test_r1_38_an_ac_range_is_expanded(self):
+        text = T.UNITS.format(rows="\n".join([
+            "| api | api | services/api/** | - | - | AC-1..AC-3 | not started |",
+            "| web | web | web/** | api | - | US-2, AC-4..5 | not started |",
+            "| jobs | jobs | jobs/** | - | - | AC-3..AC-1 | not started |"]))
+        units, probs = split.parse_units(text)
+        self.assertEqual(probs, [])
+        self.assertEqual([u["stories"] for u in units],
+                         [["AC-1", "AC-2", "AC-3"], ["US-2", "AC-4", "AC-5"], ["AC-3", "AC-1"]])
+        self.assertEqual(self.child_acs(units[0]), ["AC-1", "AC-2", "AC-3"])     # AC-2 is not dropped
+        # a range it cannot expand keeps its ends and says so
+        warnings = []
+        split.parse_units(text, warnings)
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("unit jobs: 'AC-3..AC-1' in Stories / ACs is not expanded (it runs backwards)", warnings[0])
+
+
 if __name__ == "__main__":
     unittest.main()
