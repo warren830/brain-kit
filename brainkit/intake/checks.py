@@ -501,10 +501,10 @@ PROPAGATE_KINDS = {"hkid", "cnid", "phone", "email", "card", "private_key", "clo
 
 def propagate(text, hits, values) -> list:
     """Add a hit for every occurrence of a value already judged sensitive anywhere in the submission (only the kinds
-    in PROPAGATE_KINDS)."""
+    in PROPAGATE_KINDS, and what gitleaks found: a key by its form)."""
     extra = []
     for (cat, kind), vals in values.items():
-        if kind not in PROPAGATE_KINDS:
+        if kind not in PROPAGATE_KINDS and not kind.startswith("gitleaks:"):
             continue
         for v in vals:
             if len(v) < 2:
@@ -521,8 +521,8 @@ _GITLEAKS_SEEN_MAX = 512     # a long-running process, do not run gitleaks again
 
 
 def gitleaks_hits(path) -> list:
-    """Extra secret findings from gitleaks when it is installed: [(rule, line)]. Empty when not installed. The result
-    for the same file with the same content is reused (gitleaks takes about half a second per call)."""
+    """Extra secret findings from gitleaks when it is installed: [(rule, line, secret)]. Empty when not installed. The
+    result for the same file with the same content is reused (gitleaks takes about half a second per call)."""
     tool = shutil.which("gitleaks")
     if not tool:
         return []
@@ -547,14 +547,27 @@ def _run_gitleaks(tool, path) -> list:
             if p.returncode == 0 and os.path.exists(report):
                 try:
                     with open(report) as f:
-                        return [(x.get("RuleID", ""), x.get("StartLine", 0)) for x in json.load(f) or []]
+                        return [(x.get("RuleID", ""), x.get("StartLine", 0), x.get("Secret") or "")
+                                for x in json.load(f) or []]
                 except ValueError:
                     return []
     return []
 
 
+def with_leaks(text, hits, leaks) -> list:
+    """`hits` plus a secret hit (kind gitleaks:<rule>) for every place in `text` where a value gitleaks found
+    (gitleaks_hits) stands, so it is masked and listed like the built-in finds."""
+    extra = []
+    for rule, _, secret in leaks:
+        start = text.find(secret) if len(secret) >= 4 else -1
+        while start >= 0:
+            extra.append(Hit("secret", "gitleaks:" + rule, start, start + len(secret), secret))
+            start = text.find(secret, start + len(secret))
+    return _dedupe(list(hits) + extra) if extra else hits
+
+
 class Masker:
-    """Same value -> same placeholder within one package."""
+    """Same value -> same placeholder within one package; numbered per label (令牌 is a bearer or a token)."""
 
     LABEL = {"hkid": "身份證", "cnid": "身份证", "phone": "电话", "email": "邮箱", "card": "卡号", "person": "人名",
              "kv_secret": "密钥", "bearer": "令牌", "token": "令牌", "amount": "金额", "company": "公司",
@@ -567,8 +580,9 @@ class Masker:
     def placeholder(self, kind, value):
         key = (kind, value)
         if key not in self.seen:
-            self.count[kind] = self.count.get(kind, 0) + 1
-            self.seen[key] = "[%s-%d]" % (self.LABEL.get(kind, kind), self.count[kind])
+            label = "密钥" if kind.startswith("gitleaks:") else self.LABEL.get(kind, kind)
+            self.count[label] = self.count.get(label, 0) + 1
+            self.seen[key] = "[%s-%d]" % (label, self.count[label])
         return self.seen[key]
 
 

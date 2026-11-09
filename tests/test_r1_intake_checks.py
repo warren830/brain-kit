@@ -329,5 +329,60 @@ class R1_69LinearDedupe(Base):
         self.assertIn("amount×12000", rep["findings"][0])
 
 
+
+FAKE_GITLEAKS = """#!%s
+# stand-in for gitleaks v8: `gitleaks dir FILE --report-format json --report-path R ...`; reports what gitleaks
+# reports for a Stripe live key (rule stripe-access-token)
+import json, re, sys
+a = sys.argv[1:]
+if not a or a[0] != "dir":
+    sys.exit(1)
+out = []
+with open(a[1], encoding="utf-8", errors="replace") as f:
+    for n, line in enumerate(f, 1):
+        for m in re.finditer(r"sk_live_[0-9A-Za-z]{24,}", line):
+            out.append({"RuleID": "stripe-access-token", "StartLine": n, "Match": m.group(0), "Secret": m.group(0)})
+with open(a[a.index("--report-path") + 1], "w") as f:
+    json.dump(out, f)
+"""
+
+
+class R1_62GitleaksFinds(Base):
+    """With gitleaks installed, a key only gitleaks knows (a Stripe key) was neither masked nor listed in findings.md."""
+
+    def setUp(self):
+        super().setUp()
+        bin_dir = os.path.join(self.d, "bin")
+        tool = write(os.path.join(bin_dir, "gitleaks"), FAKE_GITLEAKS % sys.executable)
+        os.chmod(tool, 0o755)
+        old = os.environ.get("PATH", "")
+        os.environ["PATH"] = bin_dir + os.pathsep + old
+        self.addCleanup(os.environ.__setitem__, "PATH", old)
+        self.key = "sk_" + "live_" + "FAKE" + "0" * 24              # built here: no key-shaped literal in the source
+
+    def test_masked_and_listed(self):
+        self.file("支付接入.md", "# 支付接入\n\n生产环境用这把 Stripe key：%s\n\n<!-- 备用：%s -->\n" % (self.key, self.key))
+        rep = self.build()
+        blob = self.package_text(rep)
+        self.assertNotIn(self.key, blob)
+        self.assertIn("生产环境用这把 Stripe key：[密钥-1]", self.segments(rep))
+        base = os.path.join(self.store, "packages", rep["package"])
+        self.assertIn("备用：[密钥-1]", read(os.path.join(base, "extras", "hidden.md")))
+        findings = read(os.path.join(base, "findings.md"))
+        self.assertIn("密钥（已打码，请轮换） gitleaks:stripe-access-token×1", findings)
+
+    def test_a_find_outside_the_text_is_listed(self):
+        self.file("a.html", '<html><body><p>见 <a href="https://pay.example.com/?k=%s">文档</a></p></body></html>' % self.key)
+        rep = self.build()
+        self.assertNotIn(self.key, self.package_text(rep))
+        self.assertIn("gitleaks 在原文件第 1 行找到 stripe-access-token", rep["findings"][0])
+
+    def test_placeholders_do_not_collide(self):
+        m = checks.Masker()
+        self.assertEqual([m.placeholder("bearer", "a" * 20), m.placeholder("token", "b" * 20),
+                          m.placeholder("kv_secret", "c" * 8), m.placeholder("gitleaks:x", "d" * 8)],
+                         ["[令牌-1]", "[令牌-2]", "[密钥-1]", "[密钥-2]"])
+
+
 if __name__ == "__main__":
     unittest.main()

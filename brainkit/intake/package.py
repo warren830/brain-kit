@@ -244,12 +244,15 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
         except Refused as e:
             refused.append(dict(info, reason=str(e)))
             continue
-        hits = checks.scan(doc.text)
+        leaks = checks.gitleaks_hits(path)          # what gitleaks finds is masked and listed like the built-in finds
+        hits = checks.with_leaks(doc.text, checks.scan(doc.text), leaks)
         hidden_text = "\n".join(t for _, t in doc.hidden)
-        hidden_hits = checks.scan(hidden_text) if hidden_text else []
+        hidden_hits = checks.with_leaks(hidden_text, checks.scan(hidden_text), leaks) if hidden_text else []
         secret_kinds = {h.kind for h in hits + hidden_hits if h.cat == "secret"}
-        for rule, line in checks.gitleaks_hits(path):
-            secret_kinds.add("gitleaks:" + rule)
+        secret_kinds |= {"gitleaks:" + rule for rule, _, _ in leaks}
+        for rule, line, secret in leaks:
+            if not (secret and (secret in doc.text or secret in hidden_text)):
+                doc.notes.append("gitleaks 在原文件第 %s 行找到 %s，收进来的文字里没有它；请照样轮换" % (line, rule))
         if secret_kinds & {"private_key", "cloud_key"} or any("private-key" in k or k.startswith("gitleaks:aws")
                                                                for k in secret_kinds):
             block("门 5：%s 里有私钥或云访问密钥，整份不收。请先删掉并轮换这把密钥。" % name)
