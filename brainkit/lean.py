@@ -26,6 +26,21 @@ def installed(repo) -> bool:
     return os.path.exists(os.path.join(repo, SCRIPT)) and os.path.exists(os.path.join(repo, DOCS, "lean.json"))
 
 
+def version(repo) -> str:
+    """VERSION of the AI-DLC Lean installed in `repo` ('' when there is none or it cannot be read)."""
+    try:
+        with open(os.path.join(repo, SCRIPT), encoding="utf-8", errors="replace") as f:
+            m = re.search(r'^VERSION = "([^"\n]+)"', f.read(), re.M)
+    except OSError:
+        return ""
+    return m.group(1) if m else ""
+
+
+def version_matches(have, pin) -> bool:
+    """A pin names a version or a release line: "0.3" takes 0.3, 0.3.0, 0.3.1, not 0.30 or 10.3."""
+    return have == pin or have.startswith(pin + ".")
+
+
 def call(repo, *args, check=True):
     if not installed(repo):
         raise BrainError("AI-DLC Lean is not installed here (run `brain install --lean <path>`)")

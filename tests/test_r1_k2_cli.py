@@ -302,5 +302,32 @@ class R1_32_InstallKeepsTheTeamsModel(Project):
         self.assertEqual(text.splitlines()[4:], ship.splitlines()[4:])    # nothing else changed
 
 
+class R1_102_LeanPin(Project):
+    def set_lean_version(self, v):
+        p = os.path.join(self.repo, lean.SCRIPT)
+        with open(p, encoding="utf-8") as f:
+            text = f.read()
+        import re
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(re.sub(r'^VERSION = "[^"]*"', 'VERSION = "%s"' % v, text, count=1, flags=re.M))
+
+    def test_r1_102_doctor_checks_the_lean_pin(self):
+        have = lean.version(self.repo)
+        self.assertRegex(have, r"^0\.3(\.|$)")
+        rc, out = brain(self.repo, "doctor", "--offline")
+        self.assertIn("OK   AI-DLC Lean %s (pinned 0.3)" % have, out)
+        self.set_lean_version("0.2.0")
+        rc, out = brain(self.repo, "doctor", "--offline")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("FAIL AI-DLC Lean 0.2.0 installed, pinned 0.3", out)
+        self.set_lean_version("0.30.0")                                  # not the 0.3 line
+        self.assertIn("FAIL AI-DLC Lean 0.30.0 installed", brain(self.repo, "doctor", "--offline")[1])
+        kp = os.path.join(self.repo, ".brain", "kit.json")
+        kit = load_json(kp)
+        kit["pins"]["lean"] = ""
+        write_json(kp, kit)
+        self.assertIn("OK   AI-DLC Lean 0.30.0 (not pinned)", brain(self.repo, "doctor", "--offline")[1])
+
+
 if __name__ == "__main__":
     unittest.main()

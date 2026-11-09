@@ -443,6 +443,15 @@ def doctor_checks(repo, cfg, fetch=True) -> list:
         last = ((p.stdout + p.stderr).strip().splitlines() or ["(no output)"])[-1].strip(" -")
         # Lean is a guardrail, not the gate (CI and GitLab are): its findings warn, they do not block.
         add(("OK" if p.returncode == 0 else "WARN", "AI-DLC Lean doctor: %s" % ("ok" if p.returncode == 0 else last)))
+        want, have = str(cfg["pins"].get("lean") or ""), lean.version(repo)
+        if not want:
+            add(("OK", "AI-DLC Lean %s (not pinned)" % (have or "version unknown")))
+        elif lean.version_matches(have, want):
+            add(("OK", "AI-DLC Lean %s (pinned %s)" % (have, want)))
+        else:
+            add(("FAIL", "AI-DLC Lean %s installed, pinned %s (%s pins): install that one (`brain install --lean "
+                         "<AI-DLC Lean %s checkout>`) and commit it" % (have or "of unknown version", want,
+                                                                       config.KIT_CONFIG, want)))
         why = mrdesc.write_problem(repo, cfg)
         add(("FAIL", "%s fingerprint_exclude: %s。%s" % (lean.CONFIG, why, mrdesc.exclude_fix(cfg))) if why else
             ("OK", "Lean does not count %s/ as code (%s fingerprint_exclude)" % (cfg["runs_dir"], lean.CONFIG)))
