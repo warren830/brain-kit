@@ -82,10 +82,60 @@ def collect(paths) -> list:
     return out
 
 
+# A classification mark is a label, not a word in a sentence (CLASS_MARKERS are the words). In the text it is
+#   - the word on a line, in a part of a line or in a table cell of its own, maybe with a qualifier, a suffix, a ★
+#     term or a "do not distribute" (机密, 【机密】, **CONFIDENTIAL**, 機密文件, Company Confidential, 绝密★启用前,
+#     Confidential – Do not distribute, Partner API Guide | Confidential | Page 3)
+#   - the value of a classification field (密级：机密, | 密级 | 秘密 |, Classification: Confidential)
+#   - a sentence about the document itself (本文件为机密文件, 本资料属于公司机密, This document is confidential)
+# The same words in a sentence about something else are content: 保证数据的机密性, 回答秘密问题, 机密字段（证件号）,
+# restricted to admins, a confidentiality agreement, a confidential client, 它是秘密. In a label (a header, a footer,
+# a sensitivity label) the word counts wherever it stands.
+_QUAL = r"(?:(?:strictly|highly|company|business|private[ \t]*(?:and|&))[ \t]+|商业|商業|公司|内部|內部|严格|嚴格|高度)"
+_SUFFIX = (r"(?:文件|文档|文檔|资料|資料|材料|件|级|級|使用|(?:[ \t]+use)?[ \t]+only|[ \t]+documents?"
+           r"|[ \t]+materials?)?(?![A-Za-z0-9一-鿿])")
+_DISTRIB = (r"请勿外传|請勿外傳|不得外传|不得外傳|严禁外传|嚴禁外傳|注意保密|do[ \t]+not[ \t]+(?:distribute|forward|copy|share)"
+            r"|not[ \t]+for[ \t]+distribution")
+_FIELD = (r"(?:文档|文檔|文件|资料|資料)?(?:密级|密級|保密级别|保密級別|保密等级|保密等級|安全级别|安全級別|敏感级别|敏感級別)"
+          r"|(?:(?:security|data|document|information)[ \t]+)?classification|sensitivity(?:[ \t]+label)?"
+          r"|(?:confidentiality|security)[ \t]+level")
+_DOC = (r"(?:本|此|该|該|这份|這份)(?:文件|文档|文檔|资料|資料|材料|报告|報告|邮件|郵件|方案|需求|说明|說明|指南|手册|手冊|内容|內容)"
+        r"[^。！？!?\n不非无無未]{0,8}?(?:为|為|是|属于|屬於|属|屬|系|列为|列為|涉及|含有|包含|定为|定為)?[ \t]*")
+_DOC_EN = (r"\b(?:this|the)[ \t]+(?:document|file|material|materials|presentation|deck|report|e-?mail|spec|specification"
+           r"|guide)[ \t]+(?:is|are|contains|includes|(?:is[ \t]+)?(?:classified|marked)(?:[ \t]+as)?)[ \t]+")
+_DECOR = " \t*_~`\"'“”‘’【】[]()（）<>《》「」『』#>"
+_PARTS_RE = re.compile(r"[ \t]*(?:[|·•–—★☆]|[ \t]-[ \t]|\t|[ \t]{2,})[ \t]*")    # not / (a URL path)
+
+
+def _mark_rules(word):
+    w = r"(?:%s)?(?:%s)%s" % (_QUAL, word, _SUFFIX)
+    return {"part": re.compile(r"(?i)^%s(?:[ \t]*[,，:：;；.。!！]?[ \t]*(?:%s))?[ \t.。!！]*$" % (w, _DISTRIB)),
+            "field": re.compile(r"(?i)(?:%s)[ \t]*(?:[:：=|]|为|為|是)?[ \t*_【\[(（「]*%s" % (_FIELD, w)),
+            "doc": re.compile(r"(?i)%s%s|%s%s(?![ \t]+(?:to|clients?)\b)" % (_DOC, w, _DOC_EN, w)),
+            "label": re.compile(r"(?i)(?<![A-Za-z])(?:%s)(?![A-Za-z]|性)" % word)}
+
+
+CLASS_MARKS = [(name, _mark_rules(rx.pattern)) for name, rx in CLASS_MARKERS]
+
+
+def _marked(line, rules) -> bool:
+    if rules["field"].search(line) or rules["doc"].search(line):
+        return True
+    s = line.strip()
+    if s.startswith("|"):                            # a table row: only a lone cell (fields are taken above)
+        cells = [c for c in (x.strip() for x in re.split(r"(?<!\\)\|", s.strip("|"))) if c]
+        parts = cells if len(cells) == 1 else []
+    else:
+        parts = _PARTS_RE.split(s)
+    return any(rules["part"].match(p.strip(_DECOR)) for p in parts)
+
+
 def detect_class(text, labels):
-    blob = "\n".join(labels) + "\n" + text[:4000] + "\n" + text[-2000:]
-    for name, rx in CLASS_MARKERS:
-        if rx.search(blob):
+    """The strongest classification mark (CLASS_MARKS) in the labels (properties, headers, footers) or near the start
+    or the end of the text, or None."""
+    lines = (text[:4000] + "\n" + text[-2000:]).split("\n")
+    for name, rules in CLASS_MARKS:
+        if any(rules["label"].search(x) for x in labels) or any(_marked(x, rules) for x in lines):
             return name
     return None
 

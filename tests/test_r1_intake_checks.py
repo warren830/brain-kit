@@ -227,5 +227,51 @@ class R1_60CompanyWords(Base):
                                                                                  "toc.md")))
 
 
+
+class R1_55ClassificationMarks(Base):
+    """Gate 2 took ordinary words for a classification mark (机密性, 秘密问题, 机密字段, restricted to, confidentiality) and
+    blocked the whole package; real marks must still win over the class the person gave."""
+
+    WORDS = ("## 非功能需求\n- 传输加密，保证数据的机密性、完整性和可用性", "用户忘记密码时回答秘密问题，答对后重置。",
+             "用户的机密字段（证件号）要加密存储。", "Access to the refund report is restricted to admins.",
+             "The partner signs a confidentiality agreement before the API key is issued.",
+             "- The mobile app is a public client, the backend a confidential client (OAuth 2.0)",
+             "- 不要把签名密钥当成普通配置，它是秘密，放 KMS", "本需求不涉及机密", "密级为秘密的文件需要审批",
+             "系统按文件密级（公开、内部、秘密、机密、绝密）控制访问", "| 字段 | 密级 |\n|---|---|\n| 证件号 | 机密 |",
+             "- 公开\n- 内部\n- 秘密\n- 机密\n- 绝密", "## 机密数据\n加密存储", "机密：泄露会造成严重损害",
+             "见 https://wiki.example.com/restricted/refunds")
+    MARKS = (("機密文件\n内容", "confidential"), ("**CONFIDENTIAL**", "confidential"), ("【机密】", "confidential"),
+             ("# 机密", "confidential"), ("Company Confidential", "confidential"), ("密级：机密", "confidential"),
+             ("| 文档密级 | 秘密 | 版本 | v1 |", "confidential"), ("Classification: Restricted", "confidential"),
+             ("本文件为机密文件，请勿外传", "confidential"), ("本资料属于公司机密。", "confidential"),
+             ("This document is confidential.", "confidential"),
+             ("This document contains confidential information.", "confidential"),
+             ("Partner API Guide | Confidential | Page 3", "confidential"), ("Confidential, do not distribute", "confidential"),
+             ("Strictly Confidential – Do not distribute", "secret"), ("绝密★启用前", "secret"), ("Top Secret", "secret"),
+             ("Internal Use Only", "internal"), ("本文件仅供内部使用", "internal"))
+
+    def test_words_in_sentences_are_not_marks(self):
+        for text in self.WORDS:
+            self.assertIsNone(package.detect_class("# 退款需求（内部）\n\n%s\n" % text, []), text)
+        self.assertIsNone(package.detect_class("正文", ["数据机密性规范 v1.0"]))
+
+    def test_marks(self):
+        for text, cls in self.MARKS:
+            self.assertEqual(package.detect_class("# 退款需求\n\n%s\n\n## 规则\n14 天内可退。\n" % text, []), cls, text)
+        for label, cls in (("Highly Confidential", "confidential"), ("XYZ Partner Guide Confidential Page 1", "confidential"),
+                           ("绝密", "secret")):
+            self.assertEqual(package.detect_class("# 退款需求\n", [label]), cls, label)
+
+    def test_gate_2_takes_the_words_and_still_stops_a_mark(self):
+        for i, text in enumerate(self.WORDS[:7]):
+            self.file("w%d/req.md" % i, "# 退款需求（内部）\n\n%s\n" % text)
+            rep = self.build([os.path.join(self.src, "w%d" % i)])
+            self.assertEqual(rep["classification"], "internal", text)
+        self.file("m/req.md", "# 合作方指南\n\n**CONFIDENTIAL**\n\n用户的机密字段要加密存储。\n")
+        with self.assertRaises(BrainError) as cm:
+            self.build([os.path.join(self.src, "m")])
+        self.assertIn("allow_confidential", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
