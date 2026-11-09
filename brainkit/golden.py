@@ -9,10 +9,13 @@ A task is a directory `tasks/<id>/` with `task.json`:
 hidden_tests are kept outside the snapshot: a .patch/.diff is applied in the work dir with `git apply`; any other
 path lives under `hidden/` in the task dir and is copied to the same path without the `hidden/` prefix.
 
-  snapshot()  `git archive` of base_sha into a fresh dir: no .git, no remotes, no credential files, no keys;
-              ablation variants drop one Brain file (and its archive). The manifest is returned, never written
-              into the snapshot, so the agent cannot learn its variant.
-  score()     apply the hidden tests, run the task's test command (scrubbed env), count passed / failed.
+  snapshot()  `git archive` of base_sha into a fresh dir outside any git repository: no .git, .gitmodules or
+              remotes, no credential / env files or key stores, no keys or password lines, no symlink that resolves
+              outside; ablation variants drop one Brain file (and its archive) and the copies of its entries in
+              proposal blocks and citing lines elsewhere. The manifest is returned, never written into the
+              snapshot, so the agent cannot learn its variant.
+  score()     apply the hidden tests, run the task's test command (scrubbed env), count passed / failed; a run in
+              which no test ran is an error, not a 0.
   plan()      tasks x variants x repeats -> jobs.
   run()       runner(job) -> work dir (the KiroCrew app dispatches for real; tests use a fake), then score.
   summarize() per variant mean / stdev and whether a drop exceeds normal variation (RULE below).
@@ -32,17 +35,35 @@ import subprocess
 import tarfile
 import tempfile
 
-from . import entries as E
+from . import entries as E, reflect
 from .common import BrainError, SHA_RE, git
 from .intake import checks
 
 VARIANTS = ("full", "no-PRODUCT", "no-TECH", "no-IMPROVEMENT")
 ABLATES = {"full": None, "no-PRODUCT": "PRODUCT", "no-TECH": "TECH", "no-IMPROVEMENT": "IMPROVEMENT"}
 TASK_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-CREDENTIAL_NAMES = (".git-credentials", ".netrc", "_netrc", ".pypirc")
+CREDENTIAL_NAMES = (".git-credentials", ".netrc", "_netrc", ".pypirc", ".pgpass", ".my.cnf", ".htpasswd",
+                    ".dockercfg", ".vault-token", ".s3cfg", ".boto", ".terraformrc", "terraform.rc")
+CREDENTIAL_PATHS = (".aws/credentials", ".docker/config.json", ".kube/config")     # in any folder
+KEY_STORE_EXTS = (".p12", ".pfx", ".jks", ".keystore")      # binary: the text scan cannot look inside
 NPM_AUTH_RE = re.compile(r"(?im)^[^#;\n]*(?:_authToken|_auth|_password)\s*=")
+YARN_AUTH_RE = re.compile(r"(?im)^[^#\n]*\bnpmAuth(?:Token|Ident)\s*:")
+# A credential assigned on its own line, env / shell / YAML style: an upper-case name ending in PASSWORD, SECRET,
+# TOKEN, API_KEY ... (DB_PASSWORD=..., export X_TOKEN=..., SECRET_KEY: ..., PASSWORD = "..."). The value is a literal:
+# unquoted right after '=' (or ': '), or quoted; never ${VAR}, $VAR, an expression, a call (os.environ[...]).
+PASSWORD_LINE_RE = re.compile(
+    r"(?m)^[ \t]*(?:export[ \t]+|set[ \t]+|-[ \t]+)?[A-Z0-9_]*(?:PASSWORD|PASSWD|_PASS|_PWD|SECRET|SECRET_KEY|"
+    r"TOKEN|API_KEY|APIKEY|ACCESS_KEY|PRIVATE_KEY|CREDENTIALS?)"
+    r"(?:(?:=|:[ \t]+)(?![\"'])(?!(?:None|null|NULL|nil|true|false|True|False|[*xX]+)[ \t]*(?:#.*)?$)"
+    r"[^\s\"'$#{}()<>\[\]`,;]{4,}[ \t]*(?:#.*)?$"
+    r"|[ \t]*[=:][ \t]*(?:\"[^\"$\n{]{4,}\"|'[^'$\n{]{4,}'))")
+# Source code and docs are left to the other rules: test fixtures and README examples (API_TOKEN: 'fake-...',
+# export X_TOKEN=your-token) would refuse almost every repository.
+PASSWORD_SKIP_EXTS = (".py", ".pyi", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".go", ".java", ".kt", ".kts",
+                      ".scala", ".rb", ".rs", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs", ".php", ".swift", ".m",
+                      ".md", ".markdown", ".rst", ".adoc", ".txt", ".ipynb")
 SECRET_RULES = (("private key", checks.PRIVATE_KEY_RE), ("cloud access key", checks.CLOUD_KEY_RE),
-                ("token", checks.TOKEN_RE))
+                ("token", checks.TOKEN_RE), ("password assignment", PASSWORD_LINE_RE))
 SCAN_MAX_BYTES = 2 * 1024 * 1024
 ENV_DROP_PARTS = ("TOKEN", "SECRET", "PASSWORD", "KEY", "CREDENTIAL")
 ENV_DROP_PREFIXES = ("GITLAB_", "AWS_", "BRAIN_", "JIRA_", "KIROCREW_", "GIT_CONFIG_", "GIT_ASKPASS", "SSH_AUTH_SOCK",
@@ -187,6 +208,8 @@ def _extract(tar_path, out_dir):
             os.makedirs(parent, exist_ok=True)
             if not _inside(out_dir, parent):
                 raise BrainError("archive member %s would be written outside the snapshot" % name)
+            if os.path.lexists(dst):
+                raise BrainError("archive member %s comes twice" % name)
             if m.issym():
                 target = m.linkname
                 inner = os.path.normpath(os.path.join(os.path.dirname(name), target))
@@ -198,6 +221,18 @@ def _extract(tar_path, out_dir):
             with open(dst, "wb") as f:
                 shutil.copyfileobj(src, f)
             os.chmod(dst, 0o755 if m.mode & 0o111 else 0o644)
+
+
+def _check_links(root):
+    """Every symlink must resolve (through other links, as the file system does) to a place inside the snapshot.
+    Checked on the finished tree: a link can look harmless until a later link or a removal changes what it
+    points through (up -> . and esc -> up/.. escape although normpath("up/..") is ".")."""
+    for d, dirs, files in os.walk(root):
+        for name in sorted(dirs + files):
+            p = os.path.join(d, name)
+            if os.path.islink(p) and not _inside(root, p):
+                raise BrainError("symlink %s -> %s points outside the snapshot" % (
+                    os.path.relpath(p, root).replace(os.sep, "/"), os.readlink(p)))
 
 
 def _walk_files(root):
@@ -236,8 +271,33 @@ def tree_digest(root) -> str:
     return h.hexdigest()
 
 
+def _is_env_file(name) -> bool:
+    """.env, .env.<x>, .env-<x>, .env_<x>, .envrc, .envrc.<x> (docs/eval.md: `.env*`)."""
+    return name in (".env", ".envrc") or name.startswith((".env.", ".env-", ".env_", ".envrc."))
+
+
+def _why_removed(root, rel, name) -> str:
+    p = os.path.join(root, *rel.split("/"))
+    if name == ".git":
+        return "git metadata"
+    if name == ".gitmodules":
+        return "git metadata (submodule remotes)"     # remote URLs, maybe with a password in them
+    if name in CREDENTIAL_NAMES or any(rel == c or rel.endswith("/" + c) for c in CREDENTIAL_PATHS):
+        return "credential file"
+    if _is_env_file(name):
+        return "env file"
+    if name.lower().endswith(KEY_STORE_EXTS):
+        return "key store"
+    for want, rx in ((".npmrc", NPM_AUTH_RE), (".yarnrc.yml", YARN_AUTH_RE)):
+        if name == want and not os.path.islink(p):
+            with open(p, encoding="utf-8", errors="replace") as f:
+                if rx.search(f.read()):
+                    return "credential file (npm auth)"
+    return ""
+
+
 def _hygiene(root) -> list:
-    """Remove credential files and git metadata; return [{path, why}]."""
+    """Remove git metadata, credential and env files, key stores; return [{path, why}]."""
     removed = []
     for d, dirs, files in os.walk(root):
         if ".git" in dirs:
@@ -246,23 +306,85 @@ def _hygiene(root) -> list:
             _remove(root, rel)
             removed.append({"path": rel, "why": "git metadata"})
         for name in sorted(files):
-            p = os.path.join(d, name)
-            rel = os.path.relpath(p, root).replace(os.sep, "/")
-            why = None
-            if name == ".git":
-                why = "git metadata"
-            elif name in CREDENTIAL_NAMES:
-                why = "credential file"
-            elif name == ".env" or name.startswith(".env."):
-                why = "env file"
-            elif name == ".npmrc" and not os.path.islink(p):
-                with open(p, encoding="utf-8", errors="replace") as f:
-                    if NPM_AUTH_RE.search(f.read()):
-                        why = "credential file (npm auth)"
+            rel = os.path.relpath(os.path.join(d, name), root).replace(os.sep, "/")
+            why = _why_removed(root, rel, name)
             if why:
                 _remove(root, rel)
                 removed.append({"path": rel, "why": why})
     return removed
+
+
+def _submodules(repo, sha) -> list:
+    """Paths of submodules (gitlinks) in the commit: git archive leaves them empty."""
+    out = git(repo, "ls-tree", "-r", "-z", sha).stdout
+    return sorted(e.split("\t", 1)[1] for e in out.split("\0") if e.startswith("160000 ") and "\t" in e)
+
+
+def _scrub_ablated(root, brain_dir, fkey, ids) -> list:
+    """A Brain entry lives on outside its file: the run's brain-proposal block it came from and the decision rows
+    that cite its id stay in aidlc-docs/<intent>/decisions.md (and a reflector's reflect-proposals.md). In every
+    Markdown file outside the Brain folder, drop the brain-proposal blocks for `fkey` (file: <fkey>, or a rel target
+    in it) or citing one of its entries, and every other line that cites one. Returns [{path, blocks, lines}]."""
+    letter = E.FILES[fkey]["letter"]
+    legacy = sorted(i for i in ids if E.LEGACY_ID_RE.match(i))
+    cite = re.compile(r"(?<![A-Za-z0-9-])(?:%s-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3}%s)(?![A-Za-z0-9-])"
+                      % (letter, "".join("|" + re.escape(i) for i in legacy)))
+    out = []
+    for rel in _walk_files(root):
+        p = os.path.join(root, *rel.split("/"))
+        if not rel.lower().endswith(".md") or rel.startswith(brain_dir + "/") or os.path.islink(p) \
+                or os.path.getsize(p) > SCAN_MAX_BYTES:
+            continue
+        with open(p, "rb") as fh:
+            raw = fh.read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if not cite.search(text) and "brain-proposal" not in text:
+            continue
+        lines = text.split("\n")
+        drop, blocks = set(), 0
+        for start, end, fields in reflect.block_spans(text):
+            target = (fields.get("rel") or "").split()[1:2]
+            try:
+                fk = E.file_key(fields["file"]) if fields.get("file") else None
+            except BrainError:
+                fk = None
+            if fk is None and target:
+                fk = E.LETTER_FILE.get(target[0][:1])
+            if fk == fkey or any(cite.search(l) for l in lines[start:end]):
+                drop.update(range(start, end))
+                blocks += 1
+        cited = [n for n, l in enumerate(lines) if n not in drop and cite.search(l)]
+        if not drop and not cited:
+            continue
+        drop.update(cited)
+        with open(p, "w", encoding="utf-8", newline="") as fh:
+            fh.write("\n".join(l for n, l in enumerate(lines) if n not in drop))
+        out.append({"path": rel, "blocks": blocks, "lines": len(cited)})
+    return out
+
+
+def _entry_ids(path) -> set:
+    if not os.path.isfile(path) or os.path.islink(path):
+        return set()
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return {m.group(1) for m in (E.HEADER_RE.match(l) for l in fh.read().split("\n")) if m}
+
+
+def _git_repo_above(path):
+    """The git repository (work tree or git dir) that `path` lies in, or None. GIT_* settings are ignored: an agent
+    in the snapshot would not have them either."""
+    d = os.path.realpath(path)
+    while not os.path.isdir(d):
+        d = os.path.dirname(d)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    p = subprocess.run(["git", "-C", d, "rev-parse", "--absolute-git-dir"], capture_output=True, text=True, env=env)
+    if p.returncode != 0:
+        return None
+    top = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"], capture_output=True, text=True, env=env)
+    return (top.stdout.strip() if top.returncode == 0 and top.stdout.strip() else p.stdout.strip()) or d
 
 
 def _secret_hits(root) -> list:
@@ -277,15 +399,18 @@ def _secret_hits(root) -> list:
             continue
         text = raw.decode("utf-8", errors="replace")
         for label, rx in SECRET_RULES:
+            if rx is PASSWORD_LINE_RE and rel.lower().endswith(PASSWORD_SKIP_EXTS):
+                continue
             if rx.search(text):
                 hits.append({"path": rel, "rule": label})
     return hits
 
 
 def snapshot(repo, base_sha, out_dir, variant="full", brain_dir="brain") -> dict:
-    """Extract base_sha into a NEW empty out_dir (no .git, no remotes, no credentials); drop the variant's Brain
-    file. Returns the manifest (not written into the snapshot). A tree that still holds a key is refused and
-    nothing is left behind."""
+    """Extract base_sha into a NEW empty out_dir (no .git, no remotes, no credentials); for an ablation variant drop
+    the Brain file, its archive and the proposal blocks and lines that carry its entries elsewhere (_scrub_ablated).
+    Returns the manifest (not written into the snapshot). Refused, with nothing left behind: an out_dir inside a git
+    repository (git would find that repository from the snapshot), a symlink that resolves outside, a key."""
     if variant not in VARIANTS:
         raise BrainError("variant must be one of %s" % ", ".join(VARIANTS))
     p = git(repo, "rev-parse", "-q", "--verify", "%s^{commit}" % base_sha, check=False)
@@ -295,21 +420,32 @@ def snapshot(repo, base_sha, out_dir, variant="full", brain_dir="brain") -> dict
     out_dir = os.path.abspath(out_dir)
     if os.path.lexists(out_dir) and (not os.path.isdir(out_dir) or os.listdir(out_dir)):
         raise BrainError("%s exists and is not empty: a snapshot goes into a fresh directory" % out_dir)
+    above = os.path.realpath(repo) if _inside(repo, out_dir) else _git_repo_above(out_dir)
+    if above:
+        raise BrainError("%s is inside the git work tree (or repository) %s: from the snapshot, git would find that "
+                         "repository, its history and remotes. Put snapshots in a directory outside any git "
+                         "repository." % (out_dir, above))
     os.makedirs(out_dir, exist_ok=True)
     try:
         with tempfile.TemporaryDirectory(prefix="brain-golden-") as tmp:
             tar_path = os.path.join(tmp, "base.tar")
             git(repo, "archive", "--format=tar", "--output=" + tar_path, sha)
             _extract(tar_path, out_dir)
+        _check_links(out_dir)                         # before anything is removed through a link
         removed = _hygiene(out_dir)
         bd = brain_dir.strip("/")
         f = ABLATES[variant]
+        scrubbed = []
         if f:
+            ids = set()
             for name in ("%s.md" % f, "%s-archive.md" % f):
                 rel = "%s/%s" % (bd, name)
+                ids |= _entry_ids(os.path.join(out_dir, *rel.split("/")))
                 if os.path.lexists(os.path.join(out_dir, *rel.split("/"))):
                     _remove(out_dir, rel)
                     removed.append({"path": rel, "why": "ablation (%s)" % variant})
+            scrubbed = _scrub_ablated(out_dir, bd, f, ids)
+        _check_links(out_dir)                         # a removal can change what a link resolves through
         hits = _secret_hits(out_dir)
         if hits:
             raise BrainError("snapshot of %s refused: %s. Pick another base_sha or clean the tree first; a snapshot "
@@ -317,7 +453,8 @@ def snapshot(repo, base_sha, out_dir, variant="full", brain_dir="brain") -> dict
                                  sha[:12], ", ".join("%s (%s)" % (h["path"], h["rule"]) for h in hits)))
         bpath = os.path.join(out_dir, *bd.split("/"))
         brain_files = sorted(os.listdir(bpath)) if os.path.isdir(bpath) else []
-        return {"base_sha": sha, "variant": variant, "removed": removed, "files": len(_walk_files(out_dir)),
+        return {"base_sha": sha, "variant": variant, "removed": removed, "scrubbed": scrubbed,
+                "submodules": _submodules(repo, sha), "files": len(_walk_files(out_dir)),
                 "brain_files": brain_files, "tree_sha256": tree_digest(out_dir)}
     except BaseException:
         shutil.rmtree(out_dir, ignore_errors=True)
@@ -375,14 +512,19 @@ def apply_hidden(workdir, task):
 
 UNITTEST_RAN_RE = re.compile(r"^Ran (\d+) tests? in ", re.M)
 UNITTEST_END_RE = re.compile(r"^(OK|FAILED)(?: \(([^)]*)\))?\s*$", re.M)
+PYTEST_NONE_RE = re.compile(r"\bno tests ran\b|^=*\s*(?:[0-9]+ (?:skipped|deselected|xfailed|xpassed|warnings?)"
+                            r"(?:, )?)+ in [0-9.]+s\b")
 PYTEST_ITEM_RE = re.compile(r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)\b")
 
 
 def parse_counts(out, exit_code) -> tuple:
-    """(passed, failed, parser) from unittest or pytest output; else from the exit code."""
+    """(passed, failed, parser) from unittest or pytest output; else from the exit code. (0, 0, parser) when the
+    output says no test ran (none found, or all skipped): score() turns that into an error, never a 0."""
     ran = UNITTEST_RAN_RE.findall(out)
     if ran:
         total = int(ran[-1])
+        if total == 0:
+            return 0, 0, "unittest"          # "Ran 0 tests": OK on Python <= 3.11, NO TESTS RAN (exit 5) after
         ends = UNITTEST_END_RE.findall(out)
         counts = {}
         if ends:
@@ -403,6 +545,8 @@ def parse_counts(out, exit_code) -> tuple:
                 word = "error" if word.startswith("error") else word
                 c[word] = c.get(word, 0) + int(n)
             return c.get("passed", 0), c.get("failed", 0) + c.get("error", 0), "pytest"
+        if PYTEST_NONE_RE.search(line):
+            return 0, 0, "pytest"                # "no tests ran in 0.01s", "3 skipped in 0.01s"
     return (1, 0, "exit") if exit_code == 0 else (0, 1, "exit")
 
 
@@ -424,8 +568,12 @@ def score(workdir, task, timeout=600) -> dict:
         raise BrainError("test command %s cannot run: %s" % (cmd[0], e))
     passed, failed, how = parse_counts(out, code)
     total = passed + failed
+    if not total:
+        raise BrainError("no test ran (%s output, exit %d): no pass or fail to count, so no score. Check "
+                         "test_command and hidden_tests (unittest discovery needs an __init__.py in tests/; all "
+                         "skipped counts as none)" % (how, code))
     return {"task": task["id"], "passed": passed, "failed": failed, "exit": code, "parsed": how,
-            "score": round(passed / total, 6) if total else 0.0, "ok": code == 0 and failed == 0,
+            "score": round(passed / total, 6), "ok": code == 0 and failed == 0,
             "output_sha256": hashlib.sha256(out.encode("utf-8", "replace")).hexdigest()}
 
 
@@ -566,11 +714,13 @@ def summarize(results, tasks=None, min_drop=0.05) -> dict:
             elif len(full) < 2 or len(ab) < 2:
                 row["verdict"] = "not enough runs"
             else:
-                drop = statistics.mean(full) - statistics.mean(ab)
+                # Scores are stored with 6 decimals; the mean drop is compared at that precision, so binary float
+                # error cannot flip the boundary (0.3 - 0.25 = 0.04999999999999999 is a drop of 0.05 >= 0.05).
+                drop = round(statistics.mean(full) - statistics.mean(ab), 6)
                 sep = max(ab) < min(full)
-                row.update(drop=round(drop, 6), separated=sep,
+                row.update(drop=drop, separated=sep,
                            chance=round(1.0 / math.comb(len(full) + len(ab), len(full)), 6))
-                row["verdict"] = "drop" if sep and drop >= min_drop else "no drop"
+                row["verdict"] = "drop" if sep and drop >= round(min_drop, 6) else "no drop"
             comparisons.append(row)
     by_variant = {}
     for v in variants:

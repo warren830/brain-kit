@@ -9,7 +9,8 @@
                                                   claim (or check the claim), branch, Lean intent, run.json
   brain handoff [--no-push] [--no-label]          publish materials, commit the hand-over, label the MR
   brain crew-agent [--force]                      install the KiroCrew version of brain-dev (~/.kiro/agents/brain-dev.json)
-                                                  KiroCrew does not read .kiro/hooks/: Lean's hooks ride on this agent spec
+                                                  KiroCrew does not read .kiro/hooks/: Lean's hooks ride on this spec;
+                                                  --force refreshes brain-kit's fields and Lean's hooks, keeps the rest
   brain status
   brain lint [--base REF] [--static]              Brain rules; against the merge-base with main by default
   brain entry add|replace|withdraw|same|adds-to|repeat|purge|show ...
@@ -105,8 +106,9 @@ def _check_jira_claim(cfg, key):
 
 def _claim(repo, cfg, me, key, title):
     """Tracker none: claim `key` (or the next free one). Returns the key."""
-    if key and not key.startswith(cfg["req_prefix"] + "-"):
-        raise BrainError("keys in this repo start with %s- (req_prefix)" % cfg["req_prefix"])
+    if key:
+        from .intents import key_problem
+        key_problem(key, cfg["req_prefix"])     # same rule as `brain intent add --key`
     doc = claims.claim(repo, cfg["req_prefix"], me, title or "", key=key)
     return doc["key"]
 
@@ -286,52 +288,103 @@ def doctor_checks(repo, cfg, fetch=True) -> list:
 CREW_EVENTS = (("agentSpawn", "SessionStart"), ("userPromptSubmit", "UserPromptSubmit"), ("preToolUse", "PreToolUse"))
 
 
-def agent_hook_commands(spec) -> dict:
-    """{trigger: [command, ...]} from an agent spec in either format: the original
+def agent_hooks(spec) -> list:
+    """[(trigger, command, matcher)] from an agent spec in either format: the original
     {"hooks": {"agentSpawn": [{"command": ...}]}} or the list Kiro rewrites specs into on upgrade (kiroUpgrade,
-    seen 2026-11-08): {"hooks": [{"trigger": "agentSpawn", "action": {"type": "command", "command": ...}}]}."""
+    seen 2026-11-08): {"hooks": [{"trigger": "agentSpawn", "action": {"type": "command", "command": ...}}]}.
+    matcher is None when the hook has none."""
     hooks = spec.get("hooks") if isinstance(spec, dict) else None
-    out = {}
+    out = []
     if isinstance(hooks, dict):
         for trig, rows in hooks.items():
             for h in rows if isinstance(rows, list) else []:
                 if isinstance(h, dict):
-                    out.setdefault(str(trig), []).append(str(h.get("command") or ""))
+                    out.append((str(trig), str(h.get("command") or ""), h.get("matcher")))
     elif isinstance(hooks, list):
         for h in hooks:
             if isinstance(h, dict):
                 act = h.get("action") if isinstance(h.get("action"), dict) else {}
-                out.setdefault(str(h.get("trigger") or ""), []).append(str(act.get("command") or h.get("command") or ""))
+                out.append((str(h.get("trigger") or ""), str(act.get("command") or h.get("command") or ""),
+                            h.get("matcher")))
     return out
 
 
+def agent_hook_commands(spec) -> dict:
+    """{trigger: [command, ...]} (see agent_hooks; kept for callers of the earlier interface)."""
+    out = {}
+    for t, c, _ in agent_hooks(spec):
+        out.setdefault(t, []).append(c)
+    return out
+
+
+def _is_lean(ev, command) -> bool:
+    return CREW_HOOK in command and ev in command
+
+
+def _lean_hook_ok(trigger, ev, command, matcher) -> bool:
+    """Lean's hook for `ev`, and for PreToolUse one that sees every tool call: matcher "*" or none (a guard that
+    only sees some tools lets the others through)."""
+    return _is_lean(ev, command) and (trigger != "preToolUse" or matcher in (None, "", "*"))
+
+
 def missing_lean_hooks(spec) -> list:
-    """[(trigger, lean event)] of Lean's three hooks the spec does not carry under the right trigger."""
-    cmds = agent_hook_commands(spec)
-    return [(t, ev) for t, ev in CREW_EVENTS if not any(CREW_HOOK in c and ev in c for c in cmds.get(t, []))]
+    """[(trigger, lean event)] of Lean's three hooks the spec does not carry (as they must be, under their trigger)."""
+    hooks = agent_hooks(spec)
+    return [(t, ev) for t, ev in CREW_EVENTS if not any(tt == t and _lean_hook_ok(t, ev, c, m) for tt, c, m in hooks)]
 
 
 def add_lean_hooks(spec, missing) -> dict:
-    """Add the missing hooks in the spec's own format; everything else (other tools' hooks, kiroUpgrade) stays."""
+    """Add the missing hooks in the spec's own format (Kiro's list format for an upgraded spec, even one without
+    hooks yet); a Lean hook for the same trigger that is wrong (a PreToolUse guard with a narrow matcher) is replaced.
+    Everything else (other tools' hooks, kiroUpgrade) stays."""
     spec = dict(spec)
     hooks = spec.get("hooks")
-    if isinstance(hooks, list):
-        hooks = list(hooks)
+    wrong = {(t, ev) for t, ev in missing}
+
+    def stale(trig, command):
+        return any(trig == t and _is_lean(ev, command) for t, ev in wrong)
+
+    if isinstance(hooks, list) or ("kiroUpgrade" in spec and not hooks):
+        out = [h for h in (hooks or []) if not (isinstance(h, dict) and stale(
+            str(h.get("trigger") or ""), str((h.get("action") if isinstance(h.get("action"), dict) else {})
+                                             .get("command") or h.get("command") or "")))]
         for t, ev in missing:
             h = {"name": "brain-%s" % t, "trigger": t,
                  "action": {"type": "command", "command": "python3 %s %s" % (CREW_HOOK, ev)}, "timeout": 10}
             if t == "preToolUse":
                 h["matcher"] = "*"
-            hooks.append(h)
+            out.append(h)
     else:
-        hooks = {k: list(v) for k, v in (hooks or {}).items()} if isinstance(hooks, dict) else {}
+        out = {k: [h for h in v if not (isinstance(h, dict) and stale(str(k), str(h.get("command") or "")))]
+               if isinstance(v, list) else v for k, v in hooks.items()} if isinstance(hooks, dict) else {}
         for t, ev in missing:
             h = {"command": "python3 %s %s" % (CREW_HOOK, ev)}
             if t == "preToolUse":
                 h = {"matcher": "*", "command": h["command"]}
-            hooks.setdefault(t, []).append(h)
-    spec["hooks"] = hooks
+            out[t] = (out[t] if isinstance(out.get(t), list) else []) + [h]
+    spec["hooks"] = out
     return spec
+
+
+# brain-dev.json fields brain-kit writes and `brain crew-agent --force` refreshes; any other field (Kiro's own, other
+# tools') and other tools' hooks are left as they are
+CREW_OWNED_FIELDS = ("name", "description", "model", "prompt", "tools", "resources")
+
+
+def crew_agent_update(have, ship) -> tuple:
+    """(spec, what differs) to bring an installed brain-dev.json up to brain-kit's: the owned fields from `ship`
+    (not when the installed one has another JSON type: Kiro rewrote it, leave it), and Lean's hooks."""
+    new, changed = dict(have), []
+    for k in CREW_OWNED_FIELDS:
+        if k not in ship or have.get(k) == ship[k] or (k in have and type(have[k]) is not type(ship[k])):
+            continue
+        new[k] = ship[k]
+        changed.append(k)
+    missing = missing_lean_hooks(new)
+    if missing:
+        new = add_lean_hooks(new, missing)
+        changed += ["Lean's %s hook" % t for t, _ in missing]
+    return new, changed
 
 
 def crew_checks(repo) -> list:
@@ -345,11 +398,17 @@ def crew_checks(repo) -> list:
                             "(run `brain crew-agent`)"))
     else:
         try:
-            missing = missing_lean_hooks(load_json(p))
+            have = load_json(p)
+            missing = missing_lean_hooks(have)
             add = ("OK", "KiroCrew brain-dev carries Lean's 3 hooks") if not missing else \
-                ("FAIL", "KiroCrew brain-dev.json lacks Lean's %s hook(s) (run `brain crew-agent --force`)"
-                 % ", ".join(t for t, _ in missing))
+                ("FAIL", "KiroCrew brain-dev.json lacks Lean's %s hook(s) as Lean needs them (run `brain crew-agent "
+                         "--force`)" % ", ".join(t for t, _ in missing))
             out.append(add)
+            _, changed = crew_agent_update(have, load_json(CREW_AGENT_SRC))
+            fields = [c for c in changed if c in CREW_OWNED_FIELDS]
+            if fields:
+                out.append(("WARN", "KiroCrew brain-dev.json differs from brain-kit's in %s (`brain crew-agent "
+                                    "--force` refreshes them)" % ", ".join(fields)))
         except ValueError:
             out.append(("FAIL", "~/.kiro/agents/brain-dev.json is not valid JSON"))
     if not os.path.exists(os.path.join(repo, CREW_HOOK)):
@@ -364,23 +423,26 @@ def crew_checks(repo) -> list:
 
 def cmd_crew_agent(a):
     p = crew_agent_path()
+    ship = load_json(CREW_AGENT_SRC)
     if os.path.exists(p):
         try:
             have = load_json(p)
         except ValueError:
             raise BrainError("%s is not valid JSON; fix or remove it by hand" % p)
-        missing = missing_lean_hooks(have)
-        if not missing:
-            print("%s carries Lean's hooks; nothing to do." % p)
+        if not isinstance(have, dict):
+            raise BrainError("%s is not an agent spec (a JSON object); fix or remove it by hand" % p)
+        new, changed = crew_agent_update(have, ship)
+        if not changed:
+            print("%s is up to date (Lean's hooks included)." % p)
             return 0
         if not a.force:
-            raise BrainError("%s lacks Lean's %s hook(s); rerun with --force to add them (the rest of the file stays)"
-                             % (p, ", ".join(t for t, _ in missing)))
-        write_json(p, add_lean_hooks(have, missing))
-        print("Added Lean's %s hook(s) to %s; other hooks and settings kept." % (", ".join(t for t, _ in missing), p))
+            raise BrainError("%s differs from brain-kit's brain-dev in: %s. Rerun with --force to refresh them "
+                             "(other tools' hooks and other settings stay)" % (p, ", ".join(changed)))
+        write_json(p, new)
+        print("Refreshed %s: %s; other tools' hooks and other settings kept." % (p, ", ".join(changed)))
         return 0
     os.makedirs(os.path.dirname(p), exist_ok=True)
-    write_json(p, load_json(CREW_AGENT_SRC))
+    write_json(p, ship)
     print("Installed %s. In KiroCrew pick agent brain-dev; use engine kas (v3): "
           "`kirocrew config set agent.acp_backend kas`." % p)
     return 0
@@ -556,20 +618,33 @@ def publish_materials(store, rec) -> list:
     return warn
 
 
-def _wait_for_mr_version(gl, project, iid, sha, timeout=None) -> bool:
+def _label_check(gl, project, iid, sha, timeout=None):
+    """('', mr) when the MR may be labelled for `sha`: GitLab has recorded its push (an MR version) and the MR head
+    is still `sha`. Otherwise (why, mr or None). The bridge hands over the MR head it sees when the label lands, so
+    only the commit this command pushed is labelled: if someone pushed on top of it, the label would hand over
+    their commit under the owner's name."""
     import time
     from .rest import head_pushed_at
     timeout = float(os.environ.get("BRAIN_MR_VERSION_WAIT", "60")) if timeout is None else timeout
     deadline = time.time() + timeout
     while True:
         try:
-            if head_pushed_at(gl.mr_versions(project, iid), sha):
-                return True
+            recorded = head_pushed_at(gl.mr_versions(project, iid), sha) is not None
         except BrainError:
-            pass
+            recorded = False
+        if recorded:
+            mr = gl.mr(project, iid) or {}
+            if mr.get("sha") == sha:
+                return "", mr
+            return ("the MR head is now %s, not %s which this hand-over pushed: someone pushed to the branch after "
+                    "you" % (str(mr.get("sha") or "?")[:12], sha[:12])), mr
         if time.time() >= deadline:
-            return False
+            return "GitLab has not recorded the push of %s on the MR within %ds" % (sha[:12], timeout), None
         time.sleep(2)
+
+
+def _label_names(mr) -> list:
+    return [x if isinstance(x, str) else str((x or {}).get("name") or "") for x in (mr or {}).get("labels") or []]
 
 
 def runner_kit_problems(repo) -> list:
@@ -624,14 +699,22 @@ def cmd_handoff(a):
     mr = gl.mr_for_branch(proj, br)
     if not mr:
         mr = gl.create_mr(proj, br, cfg["default_branch"], "%s %s" % (rec["key"], b["slug"].replace("-", " ")), [])
-    # The bridge only takes a hand-over whose label is newer than the push GitLab recorded (a push after the label
-    # is not what the owner handed over). GitLab records the MR version a moment after the push: wait for it.
-    if not _wait_for_mr_version(gl, proj, mr["iid"], head):
-        print("WARN: GitLab has not recorded the push yet; if the bridge rejects the hand-over, add label '%s' "
-              "again." % cfg["handoff_label"])
-    gl.edit_labels(proj, mr["iid"], add=[cfg["handoff_label"]], remove=[cfg["rejected_label"]])
-    print("Handed off: MR !%s labelled '%s'. The bridge checks it and the team runner continues." %
-          (mr["iid"], cfg["handoff_label"]))
+    # The bridge only takes a hand-over whose label is newer than the push GitLab recorded, and whose MR head is
+    # this hand-over commit. GitLab records the MR version a moment after the push: wait for it, then look at the
+    # MR head once more right before labelling.
+    label = cfg["handoff_label"]
+    why, now = _label_check(gl, proj, mr["iid"], head)
+    if why:
+        print("Pushed %s, but NOT labelled MR !%s: %s.\nNothing was handed over. Look at the MR: if its latest version "
+              "is %s and nothing came after it, add the label '%s' by hand; if someone pushed on top, pull, look at "
+              "their commit and run `brain handoff` again." % (head[:12], mr["iid"], why, head[:12], label))
+        return 0
+    if label in _label_names(now):
+        # GitLab records no event when a label the MR already has is added again; the bridge would see the old one
+        gl.edit_labels(proj, mr["iid"], remove=[label])
+    gl.edit_labels(proj, mr["iid"], add=[label], remove=[cfg["rejected_label"]])
+    print("Handed off: MR !%s labelled '%s' at %s. The bridge checks it and the team runner continues." %
+          (mr["iid"], label, head[:12]))
     return 0
 
 

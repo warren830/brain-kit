@@ -23,11 +23,21 @@ def urllib_transport(method, url, headers, body, timeout=20):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read()
     except urllib.error.HTTPError as e:
-        return e.code, e.read()
+        return e.code, read_error_body(e, method, url)
     except urllib.error.URLError as e:
         raise BrainError("cannot reach %s: %s" % (urllib.parse.urlsplit(url).netloc, e.reason))
     except (OSError, http.client.HTTPException) as e:  # timeouts and dropped connections mid-response
         raise BrainError("%s %s failed: %s" % (method, urllib.parse.urlsplit(url).netloc, e or type(e).__name__))
+
+
+def read_error_body(e, method, url) -> bytes:
+    """The body of an HTTP error response. Reading it can time out or lose the connection as well (a 502 from a
+    proxy, say): that is a BrainError like any other network failure, so callers that survive BrainError survive it."""
+    try:
+        return e.read()
+    except (OSError, http.client.HTTPException, ValueError) as x:
+        raise BrainError("%s %s -> HTTP %s, and its body could not be read: %s"
+                         % (method, urllib.parse.urlsplit(url).netloc, e.code, x or type(x).__name__))
 
 
 try:  # optional machine-local transport (gitignored): transport_for(base) -> transport or None
@@ -170,15 +180,22 @@ class GitLab(Rest):
             body["remove_labels"] = ",".join(remove)
         return self.call("PUT", "/projects/%s/merge_requests/%d" % (q(project), int(iid)), body=body)
 
-    def label_events(self, project, iid, per_page=100, max_pages=50):
+    def pages(self, path, query, per_page, max_pages, what):
+        """Every row of a paged list, or BrainError when there are more than per_page * max_pages: a list cut short
+        must not pass for the whole one. Exactly that many is fine (the page after the last is asked for)."""
         out = []
         for page in range(1, max_pages + 1):
-            rows = self.call("GET", "/projects/%s/merge_requests/%d/resource_label_events" % (q(project), int(iid)),
-                             {"per_page": per_page, "page": page}) or []
+            rows = self.call("GET", path, dict(query, per_page=per_page, page=page)) or []
             out += rows
             if len(rows) < per_page:
                 return out
-        raise BrainError("too many label events on !%s" % iid)
+        if self.call("GET", path, dict(query, per_page=per_page, page=max_pages + 1)):
+            raise BrainError("too many %s (more than %d): not read" % (what, per_page * max_pages))
+        return out
+
+    def label_events(self, project, iid, per_page=100, max_pages=50):
+        return self.pages("/projects/%s/merge_requests/%d/resource_label_events" % (q(project), int(iid)), {},
+                          per_page, max_pages, "label events on !%s" % iid)
 
     def comment(self, project, iid, text):
         return self.call("POST", "/projects/%s/merge_requests/%d/notes" % (q(project), int(iid)), body={"body": text})
@@ -186,25 +203,13 @@ class GitLab(Rest):
     def mr_notes(self, project, iid, per_page=100, max_pages=20):
         """All notes on an MR, oldest first. More than max_pages pages is an error, not a short list: a flood of
         notes must not hide a later answer (a conflicting one, say) from whoever reads them."""
-        out = []
-        for page in range(1, max_pages + 1):
-            rows = self.call("GET", "/projects/%s/merge_requests/%d/notes" % (q(project), int(iid)),
-                             {"sort": "asc", "order_by": "created_at", "per_page": per_page, "page": page}) or []
-            out += rows
-            if len(rows) < per_page:
-                return out
-        raise BrainError("too many notes on !%s (more than %d): not read" % (iid, per_page * max_pages))
+        return self.pages("/projects/%s/merge_requests/%d/notes" % (q(project), int(iid)),
+                          {"sort": "asc", "order_by": "created_at"}, per_page, max_pages, "notes on !%s" % iid)
 
     def mr_versions(self, project, iid, per_page=100, max_pages=20):
         """The MR's versions (one per push GitLab recorded: head_commit_sha, created_at), all pages."""
-        out = []
-        for page in range(1, max_pages + 1):
-            rows = self.call("GET", "/projects/%s/merge_requests/%d/versions" % (q(project), int(iid)),
-                             {"per_page": per_page, "page": page}) or []
-            out += rows
-            if len(rows) < per_page:
-                return out
-        raise BrainError("too many versions on !%s (more than %d): not read" % (iid, per_page * max_pages))
+        return self.pages("/projects/%s/merge_requests/%d/versions" % (q(project), int(iid)), {}, per_page,
+                          max_pages, "versions on !%s" % iid)
 
     def file_raw(self, project, path, ref):
         """File bytes at ref, or None when it does not exist."""
@@ -216,14 +221,17 @@ class GitLab(Rest):
                 return None
             raise
 
-    def commit_exists(self, project, sha):
+    def commit(self, project, sha):
+        """The commit (id, parent_ids, ...) as GitLab shows it, or None when it does not exist."""
         try:
-            self.call("GET", "/projects/%s/repository/commits/%s" % (q(project), q(sha)))
-            return True
+            return self.call("GET", "/projects/%s/repository/commits/%s" % (q(project), q(sha))) or {}
         except HttpError as e:
             if e.status == 404:
-                return False
+                return None
             raise
+
+    def commit_exists(self, project, sha):
+        return self.commit(project, sha) is not None
 
 
 class Jira(Rest):

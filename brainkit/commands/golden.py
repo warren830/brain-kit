@@ -39,6 +39,11 @@ def cmd_snapshot(a):
                                                 ", ".join(man["brain_files"]) or "无"))
     for r in man["removed"]:
         print("  去掉 %s（%s）" % (r["path"], r["why"]))
+    for r in man.get("scrubbed", []):
+        print("  删掉 %s 里的 %d 个 brain-proposal 块、%d 行引用（%s 的条目在别处的副本）" % (
+            r["path"], r["blocks"], r["lines"], G.ABLATES[man["variant"]]))
+    for path in man.get("submodules", []):
+        print("  子模块 %s：内容不在快照里（git archive 不带子模块），是个空目录" % path)
     print("  tree sha256 %s；清单没写进快照（agent 看不到自己是哪一组）" % man["tree_sha256"][:16])
     return 0
 
@@ -93,7 +98,7 @@ def register(sub):
     gs = s.add_subparsers(dest="golden_op", required=True)
     x = gs.add_parser("snapshot", help="git archive of the task's base_sha into a fresh dir (no .git, no tokens)")
     x.add_argument("task_dir", help="tasks/<id> (holds task.json)")
-    x.add_argument("--out", required=True, help="new, empty directory")
+    x.add_argument("--out", required=True, help="new, empty directory outside any git repository")
     x.add_argument("--variant", choices=G.VARIANTS, default="full")
     x.add_argument("--repo", help="the project repo (default: the repo you are in)")
     x.add_argument("--json", action="store_true")

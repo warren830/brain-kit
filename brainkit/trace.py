@@ -18,12 +18,24 @@ Sources
   Brain usage       brainkit.usage: entries loaded at brain_commit, cited ids, stale and unknown citations
   credits           passed in by the KiroCrew app, optional. Kiro reports no token counts (input/output/cache = 0)
 
+Which copy of the run branch (branch_tip): the branch as merged (second parent of the merge commit on the default
+branch) when there is one; otherwise the freshest of refs/heads/<branch> and refs/remotes/origin/<branch> (the one
+that contains the other); when they diverged, origin's, and the trace says so (src.git.tip_note).
+Merged (git_history: merge_of, landing), without asking GitLab: the tip is on the default branch (merge commit or
+fast-forward); else
+runs/<KEY>/run.json arrived on the default branch's first-parent line (squash or rebase merge, or a fast-forward
+whose branch is gone): the merge is the last commit of the run there (see _run_stretch). The run's own commits are
+never counted as hotfixes.
+
 People: only GitLab usernames and pseudonyms already in the sources. Git and Lean identities (emails, names, hosts)
-become a pseudonym G-<6 hex> of the email. Human message text is never copied, except what decisions.md holds.
+become a pseudonym G-<6 hex> of the email; Lean's audit file names (<host>-<6 hex>.jsonl) become L-<6 hex>; emails
+and home directories in free text (blocked commands, stage notes, failed check commands) are replaced. Human message
+text is never copied, except what decisions.md holds.
 Answers an eval oracle gave (golden tasks, `eval_oracle: true`) are kept apart and never count as a person's.
 """
 from __future__ import annotations
 
+import functools
 import glob
 import hashlib
 import json
@@ -49,14 +61,19 @@ DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 ASSUMPTION_RE = re.compile(r"^\s*[-*]?\s*(A-[1-9][0-9]*)\s*[:：.)]\s*(\S.*)$")
 FIX_RE = re.compile(r"(?i)(hot-?fix|\bfix(?:es|ed)?\b|\bbug|defect|regression|\brevert|roll ?back|修复|热修|回滚|缺陷|故障)")
 REVERTS_RE = re.compile(r"This reverts commit ([0-9a-f]{7,40})")
-SPLIT_RE = re.compile(r"[\s,/;:()（）、+，：]+")
-AGENT_WORDS = {"agent", "ai", "assistant", "brain-run", "brain-dev", "kiro", "claude", "model", "llm", "bot",
-               "智能体", "机器人"}
-CHECK_WORDS = {"check", "checks", "ci", "verify", "lean", "test", "tests", "lint", "gate", "gates", "hook", "pipeline",
-               "检查", "测试"}
-PERSON_WORDS = {"human", "person", "owner", "product", "builder", "security", "data", "pm", "po", "tl", "lead",
-                "reviewer", "user", "产品", "人", "负责人", "开发", "安全", "评审", "业务"}
-BRIDGE_WORDS = {"bridge", "桥"}
+# decisions.md Who: the runner's vocabulary (remote/prompts/brain-run.md §5), plus an optional note in brackets
+_ENTRY = r"[PTIJ]-(?:[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3}|[0-9]{1,5})"
+_NOTE = r"(?:\s*[(（][^()（）]*[)）])?"
+WHO_WORD_RE = re.compile(r"^(?i:(agent|check))" + _NOTE + r"$")
+WHO_BRAIN_RE = re.compile(r"^(?i:brain)\s+(%s(?:\s*[,，、;；]\s*%s)*)" % (_ENTRY, _ENTRY) + _NOTE + r"$")
+WHO_PERSON_RE = re.compile(r"^(P-[0-9A-F]{4})\s+V-[0-9a-f]{10}" + _NOTE + r"$")
+WHO_OWNER_RE = re.compile(r"^(?i:owner)" + _NOTE + r"$")   # local half: the run owner answered in chat
+# claim sources that report a defect (no source: an old plain claim = product); gap / eval-gap / debt / schedule
+# intents say what is missing, not that something broke
+DEFECT_SOURCES = (None, "product", "alert")
+# identities in free text: emails (and user@host), home directories
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*")
+HOME_RE = re.compile(r"(?:/Users|/home)/[^/\s'\"`;|&]+|[A-Za-z]:\\Users\\[^\\\s'\"`;|&]+")
 NO_TOKENS = "Kiro 经 KiroCrew 只给 credits，input/output/cache token 数都是 0"
 
 
@@ -70,6 +87,29 @@ def pseudonym(email):
     """G-<6 hex> for a git / Lean identity: the email itself never leaves this module."""
     e = str(email or "").strip().lower()
     return "G-" + _sha(e.encode())[:6].upper() if e else None
+
+
+def scrub(text, limit=None):
+    """Free text from Lean (a blocked command, a stage note): emails become their pseudonym, home directories ~.
+    Scrubbed first, cut to `limit` after, so a cut never leaves half an email."""
+    if text is None:
+        return None
+    s = HOME_RE.sub("~", EMAIL_RE.sub(lambda m: pseudonym(m.group(0)), str(text)))
+    return s[:limit] if limit else s
+
+
+def audit_labels(paths) -> dict:
+    """{audit file path: label}. Lean names its file <host>-<6 hex>.jsonl (the clone id): the label is
+    aidlc-docs/audit/L-<6 hex of sha256(path)>.jsonl, the same for the same file on every machine."""
+    out, used = {}, set()
+    for p in sorted(paths):
+        h = _sha(p.encode()).upper()
+        n = 6
+        while "L-" + h[:n] in used:
+            n += 2
+        used.add("L-" + h[:n])
+        out[p] = "%s/audit/L-%s.jsonl" % (lean.DOCS, h[:n])
+    return out
 
 
 def _utc(s):
@@ -103,7 +143,7 @@ def _g(repo, *args):
 
 
 def _commit(repo, rev):
-    if not rev:
+    if not rev or not isinstance(rev, str):
         return None
     out = _g(repo, "rev-parse", "-q", "--verify", rev + "^{commit}")
     return out.strip() if out and out.strip() else None
@@ -160,10 +200,14 @@ class Tree:
 # ---------- Lean ----------
 
 def lean_events(tree, intent):
-    """(events of this intent oldest first, {file: chain status}). Lean's own rule: each record's hash covers the
-    record without the hash; prev links to the record before; seq counts up from 1."""
+    """(events of this intent oldest first, {file label: chain status}). Lean's own rule: each record's hash covers
+    the record without the hash; prev links to the record before; seq counts up from 1. Files are named by their
+    label (audit_labels): Lean's file name carries the clone's host name."""
     events, chains = [], {}
-    for path in [p for p in tree.files(lean.DOCS + "/audit") if p.endswith(".jsonl")]:
+    paths = [p for p in tree.files(lean.DOCS + "/audit") if p.endswith(".jsonl")]
+    labels = audit_labels(paths)
+    for path in paths:
+        label = labels[path]
         prev, seq, bad, n = "GENESIS", 0, None, 0
         for i, line in enumerate((tree.read(path) or "").splitlines(), 1):
             if not line.strip():
@@ -185,11 +229,11 @@ def lean_events(tree, intent):
                     prev, seq = h, body["seq"]
             n += 1
             if rec.get("intent") == intent:
-                rec["_src"] = "%s#%s" % (path, rec.get("seq", "line %d" % i))
+                rec["_src"] = "%s#%s" % (label, rec.get("seq", "line %d" % i))
                 rec["_file"] = path
                 rec["_at"] = _utc(rec.get("ts"))
                 events.append(rec)
-        chains[path] = {"records": n, "chain": "ok" if bad is None else "broken at line %d" % bad}
+        chains[label] = {"records": n, "chain": "ok" if bad is None else "broken at line %d" % bad}
     events.sort(key=lambda e: (e["_at"] or "", e["_file"], e.get("seq") if isinstance(e.get("seq"), int) else 0))
     return events, chains
 
@@ -211,7 +255,7 @@ def stages_of(events) -> list:
         row["times"][st] = row["times"].get(st, 0) + 1
         note = d.get("note") if e["event"] == "STAGE_COMPLETED" else d.get("reason") if e["event"] == "STAGE_SKIPPED" \
             else None
-        row.update(state=st, at=e["_at"], note=note if isinstance(note, str) else None, src=e["_src"])
+        row.update(state=st, at=e["_at"], note=scrub(note) if isinstance(note, str) else None, src=e["_src"])
     return sorted(rows.values(), key=lambda r: (r["first_at"] or "", r["id"]))
 
 
@@ -221,11 +265,12 @@ def checks_of(events, tree, intent) -> dict:
         if e.get("event") != "VERIFY":
             continue
         d = _data(e)
-        res = [r for r in d.get("results") or [] if isinstance(r, dict)]
-        failed = [str(r.get("cmd", ""))[:120] for r in res if r.get("exit") not in (0, None)]
+        res = [r for r in d.get("results") or [] if isinstance(r, dict)] if isinstance(d.get("results"), list) else []
+        failed = [scrub(r.get("cmd", ""), 120) for r in res if r.get("exit") not in (0, None)]
+        drift = d.get("protected_drift")
         rounds.append({"at": e["_at"], "ok": bool(d.get("ok")), "detail": {
             "checks": len(res), "failed": failed, "fingerprint": str(d.get("fingerprint") or "")[:8] or None,
-            "protected_drift": len(d.get("protected_drift") or [])}, "src": e["_src"]})
+            "protected_drift": len(drift) if isinstance(drift, list) else 0}, "src": e["_src"]})
     path = "%s/%s/construction/build-and-test/build-and-test-summary.md" % (lean.DOCS, intent)
     text = tree.read(path)
     summary = None
@@ -252,20 +297,174 @@ def default_ref(repo, cfg, ref):
     return None
 
 
-def branch_tip(repo, branch, ref, dref):
-    """(sha, how) of the run branch's last commit, or (None, None)."""
-    if ref and _short_ref(ref) == branch and _commit(repo, ref):
-        return _commit(repo, ref), "ref %s" % ref
-    for r in ("refs/heads/" + branch, "refs/remotes/origin/" + branch):
+@functools.lru_cache(maxsize=16)
+def _merges(repo, dref_sha) -> tuple:
+    """((sha, parents, subject), ...) of the merge commits on dref_sha's first-parent line, newest first (a commit's
+    history never changes, so one read per default-branch head serves every trace of an eval)."""
+    out = []
+    for line in (_g(repo, "log", "--merges", "--first-parent", "--format=%H%x00%P%x00%s", dref_sha) or "").splitlines():
+        parts = line.split("\0")
+        if len(parts) == 3:
+            out.append((parts[0], tuple(parts[1].split()), parts[2]))
+    return tuple(out)
+
+
+def _parents(repo, sha) -> list:
+    return (_g(repo, "rev-list", "--parents", "-n", "1", sha) or "").split()[1:]
+
+
+def first_added(repo, dref, path):
+    """The first commit on the default branch's first-parent line that brought `path` (oldest), or None."""
+    if not dref:
+        return None
+    out = (_g(repo, "log", "--first-parent", "--diff-filter=A", "--format=%H", dref, "--", path) or "").split()
+    return out[-1] if out else None
+
+
+def merged_tip(repo, branch, dref, run_json):
+    """(sha, how) of the run branch as merged: the second parent of GitLab's merge commit ("Merge branch '<branch>'
+    into '<default>'"), or of the merge commit that brought run.json to the default branch; (None, None)."""
+    dsha = _commit(repo, dref) if dref else None
+    if not dsha:
+        return None, None
+    for h, parents, subject in _merges(repo, dsha):
+        if branch and ("'%s'" % branch) in subject and len(parents) >= 2:
+            return parents[1], "second parent of merge commit %s on %s" % (h[:12], dref)
+    s = first_added(repo, dref, run_json)
+    ps = _parents(repo, s) if s else []
+    if len(ps) >= 2 and git(repo, "cat-file", "-e", "%s:%s" % (ps[1], run_json), check=False).returncode == 0:
+        return ps[1], "second parent of merge commit %s on %s (the commit that brought %s)" % (s[:12], dref, run_json)
+    return None, None
+
+
+def branch_tip(repo, branch, ref, dref, run_json=None):
+    """(sha, how, note) of the run branch's last commit, or (None, None, None).
+    The branch as merged wins (a stale local branch must not cut the run short). Otherwise the freshest of origin's
+    and the local copy: the one that contains the other; diverged: origin's. `note` says what was not used."""
+    if ref and branch and _short_ref(ref) == branch and _commit(repo, ref):
+        return _commit(repo, ref), "ref %s" % ref, None
+    cands = []
+    for r in (("refs/remotes/origin/" + branch, "refs/heads/" + branch) if branch else ()):
         c = _commit(repo, r)
         if c:
-            return c, r
-    if dref:   # merged and deleted: GitLab's merge commit says "Merge branch '<branch>' into '<default>'"
-        for line in (_g(repo, "log", "--merges", "--first-parent", "--format=%H%x00%P%x00%s", dref) or "").splitlines():
-            parts = line.split("\0")
-            if len(parts) == 3 and ("'%s'" % branch) in parts[2] and len(parts[1].split()) >= 2:
-                return parts[1].split()[1], "second parent of merge commit %s on %s" % (parts[0][:12], dref)
-    return None, None
+            cands.append((r, c))
+    m, how = merged_tip(repo, branch, dref, run_json) if run_json else (None, None)
+    if m:
+        notes = []
+        for r, c in cands:
+            if c == m:
+                continue
+            if _ancestor(repo, c, m):
+                notes.append("%s (%s) is older: the merged branch contains it" % (r, c[:12]))
+            elif _ancestor(repo, m, c):
+                notes.append("%s (%s) has commits after the merge: not part of it" % (r, c[:12]))
+            else:
+                notes.append("%s (%s) has diverged from the merged branch: not used" % (r, c[:12]))
+        return m, how, "; ".join(notes) or None
+    if not cands:
+        return None, None, None
+    (r0, c0), rest = cands[0], cands[1:]
+    if not rest or rest[0][1] == c0:
+        return c0, r0, None
+    (r1, c1) = rest[0]
+    if _ancestor(repo, c1, c0):
+        return c0, r0, "%s (%s) is older: %s contains it" % (r1, c1[:12], r0)
+    if _ancestor(repo, c0, c1):
+        return c1, r1, "%s is ahead of %s (%s): commits not pushed yet" % (r1, r0, c0[:12])
+    return c0, r0, "%s (%s) and %s (%s) have diverged: using %s" % (r1, c1[:12], r0, c0[:12], r0)
+
+
+def _run_stretch(repo, cfg, dref, start, key, intent, match=None, match_first=0):
+    """(commits, matched): the run's commits on the default branch's first-parent line, oldest first, from `start`
+    (the commit that brought run.json) up to the last one that belongs to the run: it touches runs/<KEY>/ or
+    aidlc-docs/<intent>/, a bot made it (kit.json bot_emails), or `match` (patch-ids of the branch's commits) says it
+    is a copy of one. The walk ends at a merge commit or at a commit that touches another run's runs/<KEY2>/.
+    Commits in between that belong to nobody (a person's push inside the run) are part of it."""
+    parent = (_parents(repo, start) or [None])[0]
+    shas = (_g(repo, "rev-list", "--first-parent", "--reverse", ("%s..%s" % (parent, dref)) if parent else dref)
+            or "").split()
+    shas = shas[shas.index(start):] if start in shas else []
+    bots = {x.lower() for x in cfg.get("bot_emails", [])}
+    runs = cfg["runs_dir"] + "/"
+    docs = "%s/%s/" % (lean.DOCS, intent) if intent else None
+    cands, done = [], False
+    for i in range(0, len(shas), 64):
+        log = _g(repo, "-c", "core.quotepath=false", "show", "--name-only",
+                 "--format=%x01%H%x00%P%x00%ae%x00%ce", *shas[i:i + 64]) or ""
+        for chunk in log.split("\x01")[1:]:
+            lines = chunk.split("\n")
+            h, parents, ae, ce = (lines[0].split("\0") + [""] * 4)[:4]
+            files = [x for x in lines[1:] if x.strip()]
+            if cands and (len(parents.split()) > 1 or any(
+                    f.startswith(runs) and JIRA_RE.match(f[len(runs):].split("/", 1)[0]) and
+                    f[len(runs):].split("/", 1)[0] != key for f in files)):
+                done = True
+                break
+            own = any(f.startswith("%s%s/" % (runs, key)) or (docs and f.startswith(docs)) for f in files) or \
+                ae.lower() in bots or ce.lower() in bots
+            cands.append((h, own or not cands))
+        if done:
+            break
+    matched = match([h for h, _ in cands[match_first:]]) if match and cands else set()
+    last = max([i for i, (h, own) in enumerate(cands) if own or h in matched] or [-1])
+    return [h for h, _ in cands[:last + 1]], matched
+
+
+def _patch_ids(repo, *revs) -> set:
+    """Patch-ids (git patch-id --stable) of the non-merge commits `git log revs` lists."""
+    p = subprocess.run(["git", "-C", repo, "log", "-p", "--no-merges", "--format=commit %H", *revs],
+                       capture_output=True)
+    return _pids(repo, p.stdout) if p.returncode == 0 else set()
+
+
+def _pids(repo, patch) -> set:
+    p = subprocess.run(["git", "-C", repo, "patch-id", "--stable"], input=patch, capture_output=True)
+    return {line.split()[0] for line in p.stdout.decode("utf-8", "replace").splitlines() if line.strip()}
+
+
+def _pid_of(repo, sha_list) -> dict:
+    """{sha: patch-id} for these commits."""
+    p = subprocess.run(["git", "-C", repo, "show", "-p", "--format=commit %H", *sha_list], capture_output=True)
+    q = subprocess.run(["git", "-C", repo, "patch-id", "--stable"], input=p.stdout, capture_output=True)
+    out = {}
+    for line in q.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            out[parts[1]] = parts[0]
+    return out
+
+
+def landing(repo, cfg, dref, tip, key, intent):
+    """The tip is not on the default branch, but runs/<KEY>/run.json is: a squash or rebase merge (the branch is
+    still here). The merge is the last run commit after the one that brought run.json; rebased copies of the branch's
+    commits are recognised by patch-id. None when run.json never reached the default branch."""
+    rp = "%s/%s/run.json" % (cfg["runs_dir"], key)
+    s = first_added(repo, dref, rp)
+    if not s or _ancestor(repo, s, tip):
+        return None
+    base = (_g(repo, "merge-base", tip, dref) or "").strip()
+    branch = _patch_ids(repo, tip, *(["^" + base] if base else []))
+    n = len((_g(repo, "rev-list", "--no-merges", tip, *(["^" + base] if base else [])) or "").split())
+
+    def match(shas):
+        pid = _pid_of(repo, shas[:n + 5]) if branch else {}
+        return {h for h, x in pid.items() if x in branch}
+    seq, matched = _run_stretch(repo, cfg, dref, s, key, intent, match=match)
+    src = "%s on the first-parent line of %s from %s (the commit that brought %s)" % (
+        "patch-ids of the branch's commits and the run's records" if matched else "the run's records", dref, s[:12],
+        rp)
+    if matched:
+        return {"commit": seq[-1], "at": _cdate(repo, seq[-1]), "how": "rebase merge (the branch is still here)",
+                "src": src, "own": seq, "start": s, "rebased": True,
+                "note": "%d of the commits on %s are copies of the branch's" % (len(matched), dref)}
+    note = None
+    if base:
+        d = subprocess.run(["git", "-C", repo, "diff", base, tip], capture_output=True)
+        same = _pids(repo, d.stdout) == set(_pid_of(repo, [s]).values()) if d.returncode == 0 else False
+        note = "the squash commit carries exactly the branch's changes" if same else \
+            "the squash commit differs from the branch's changes (conflicts resolved, or the branch moved on)"
+    return {"commit": seq[-1], "at": _cdate(repo, seq[-1]), "how": "squash merge (the branch is still here)",
+            "src": src, "own": seq, "note": note}
 
 
 def merge_of(repo, tip, dref):
@@ -284,19 +483,6 @@ def merge_of(repo, tip, dref):
     return line[lo] if line and _ancestor(repo, tip, line[lo]) else None
 
 
-def added_on(repo, dref, path):
-    """Merged without a findable branch tip (squash or rebase merge, branch deleted): the first commit on the
-    default branch's first-parent line that added run.json."""
-    if not dref:
-        return None
-    out = (_g(repo, "log", "--first-parent", "--diff-filter=A", "--format=%H%x00%cI", dref, "--", path) or "").split()
-    if not out:
-        return None
-    h, cd = (out[-1].split("\0") + [""])[:2]
-    return {"commit": h, "at": _utc(cd), "how": "added run.json (squash or rebase merge)",
-            "src": "first commit on the first-parent line of %s that added %s" % (dref, path)}
-
-
 def _cdate(repo, sha):
     out = _g(repo, "log", "-1", "--format=%cI", sha)
     return _utc(out.strip()) if out else None
@@ -304,24 +490,47 @@ def _cdate(repo, sha):
 
 def git_history(repo, cfg, rec, ref, key):
     """Commits of the run branch, the hand-over commit, the merge, park.json history."""
-    branch, bc = rec.get("branch") or "", rec.get("brain_commit")
+    branch = rec.get("branch") if isinstance(rec.get("branch"), str) else ""
+    bc = rec.get("brain_commit") if isinstance(rec.get("brain_commit"), str) else None
+    intent = rec.get("intent") if isinstance(rec.get("intent"), str) else None
+    rp = "%s/%s/run.json" % (cfg["runs_dir"], key)
     dref = default_ref(repo, cfg, ref)
-    tip, tip_how = branch_tip(repo, branch, ref, dref)
-    out = {"tip": tip, "tip_src": tip_how, "default_ref": dref, "merge": None, "commits": None, "range": None,
-           "handover_commit": None, "park": None}
-    if not tip:
-        out["merge"] = added_on(repo, dref, "%s/%s/run.json" % (cfg["runs_dir"], key))
-        return out
-    m = merge_of(repo, tip, dref)
-    if m:
-        out["merge"] = {"commit": m, "at": _cdate(repo, m), "how": "merge commit" if m != tip else "fast-forward",
-                        "src": "first-parent line of %s" % dref}
-    if m and m != tip:
-        exclude = m + "^1"
-    elif dref and not m:
-        exclude = dref
-    else:
-        exclude = bc if _commit(repo, bc or "") else None
+    tip, tip_how, tip_note = branch_tip(repo, branch, ref, dref, rp)
+    out = {"tip": tip, "tip_src": tip_how, "tip_note": tip_note, "default_ref": dref, "merge": None, "commits": None,
+           "range": None, "handover_commit": None, "park": None}
+    if tip:
+        m = merge_of(repo, tip, dref)
+        if m:
+            out["merge"] = {"commit": m, "at": _cdate(repo, m), "how": "merge commit" if m != tip else "fast-forward",
+                            "src": "first-parent line of %s" % dref}
+            exclude = m + "^1" if m != tip else (bc if _commit(repo, bc) else None)
+        else:
+            out["merge"] = landing(repo, cfg, dref, tip, key, intent) if dref else None
+            exclude = dref or (bc if _commit(repo, bc) else None)
+            if out["merge"] and out["merge"].get("rebased"):   # the run as merged: its copies on the default branch
+                note = "%s (%s): its commits were rebased onto %s, the copies there are used" % (tip_how, tip[:12],
+                                                                                               dref)
+                tip = out["merge"]["commit"]
+                exclude = (_parents(repo, out["merge"]["start"]) or [None])[0]
+                out.update(tip=tip, tip_src="last run commit on the first-parent line of %s (rebase merge)" % dref,
+                           tip_note="; ".join(x for x in (note, tip_note) if x))
+    else:   # no branch: run.json on the default branch says how it was merged
+        s = first_added(repo, dref, rp)
+        if not s:
+            return out
+        seq, _ = _run_stretch(repo, cfg, dref, s, key, intent)
+        src = "the run's records on the first-parent line of %s from %s (the commit that brought %s)" % (dref, s[:12],
+                                                                                                      rp)
+        if len(seq) == 1:   # one commit carries the run: its own commits are not listed
+            out["merge"] = {"commit": s, "at": _cdate(repo, s), "how": "squash merge (the branch is gone): the "
+                            "commit that brought run.json", "src": src, "own": seq}
+            return out
+        tip = seq[-1]
+        out.update(tip=tip, tip_src="last run commit on the first-parent line of %s (fast-forward or rebase merge, "
+                                    "the branch is gone)" % dref)
+        out["merge"] = {"commit": tip, "at": _cdate(repo, tip), "how": "fast-forward or rebase merge (the branch "
+                        "is gone): the last run commit", "src": src, "own": seq}
+        exclude = (_parents(repo, s) or [None])[0]
     rng = [tip] + (["^" + exclude] if exclude else [])
     out["range"] = "%s ^%s" % (tip[:12], exclude[:40] if exclude else "(root)")
     bots = {x.lower() for x in cfg.get("bot_emails", [])}
@@ -391,7 +600,11 @@ def _park_row(raw, src, at, commit=None):
 
 
 def after_merge(repo, cfg, key, merge, commits, dref, as_of):
-    """Reverts, hotfix commits and defect claims within WINDOW_DAYS after the merge. Messages are read, not kept."""
+    """Reverts, hotfix commits and defect claims within WINDOW_DAYS after the merge. Messages are read, not kept.
+    "After the merge" = on the default branch and not in the merge's history (no `git log --since`: one commit with
+    an older committer date would stop the walk); the window is then judged by each commit's committer date. The
+    run's own commits (the branch's, and its copies on the default branch) are never a hotfix. A claim counts as a
+    defect only when it reports one (source product or alert, or an old claim without a source)."""
     if not merge or not merge.get("at"):
         return {"value": None, "window_closed": None, "window_end": None, "evidence": [],
                 "src": "no merge found", "rules": None}
@@ -399,11 +612,10 @@ def after_merge(repo, cfg, key, merge, commits, dref, as_of):
     end = start + timedelta(days=WINDOW_DAYS)
     closed = as_of >= end
     until = min(end, as_of)            # judged "as of": later commits are not looked at
-    own = {c["sha"] for c in commits or []} | {merge["commit"]}
+    own = {c["sha"] for c in commits or []} | {merge["commit"]} | set(merge.get("own") or [])
     key_re = re.compile(r"(?<![A-Za-z0-9-])%s(?![0-9])" % re.escape(key))
     ev = []
-    log = _g(repo, "log", "--format=%x01%H%x00%cI%x00%B", "--since=" + merge["at"], "--until=" + iso(until),
-             dref) or ""
+    log = _g(repo, "log", "--format=%x01%H%x00%cI%x00%B", dref, "^" + merge["commit"]) or ""
     for chunk in log.split("\x01")[1:]:
         h, cd, body = (chunk.split("\0", 2) + ["", ""])[:3]
         if h in own:
@@ -426,7 +638,7 @@ def after_merge(repo, cfg, key, merge, commits, dref, as_of):
             doc = json.loads(_show(repo, r, "claim.json") or "null")
         except ValueError:
             continue
-        if not isinstance(doc, dict):
+        if not isinstance(doc, dict) or doc.get("source") not in DEFECT_SOURCES:
             continue
         at = _utc(doc.get("created_at"))
         title = str(doc.get("title") or "")
@@ -435,9 +647,10 @@ def after_merge(repo, cfg, key, merge, commits, dref, as_of):
             ev.append({"claim": "claim/" + k2, "at": at, "rule": "defect claim names %s" % key, "src": r})
     return {"value": True if ev else (False if closed else None), "window_closed": closed, "window_end": iso(end),
             "evidence": sorted(ev, key=lambda x: (x["at"], x.get("sha", x.get("claim")))),
-            "rules": "revert of a run commit; a commit naming %s with hotfix/fix/bug/defect/revert/修复/热修/回滚/缺陷; "
-                     "a new claim/<KEY> whose title names %s with such a word" % (key, key),
-            "src": "git log %s, claim/* refs" % dref}
+            "rules": "revert of a run commit; a commit after the merge (not one of the run's own) naming %s with "
+                     "hotfix/fix/bug/defect/revert/修复/热修/回滚/缺陷; a new claim/<KEY> reporting a defect (source "
+                     "product or alert, or none) whose title names %s with such a word" % (key, key),
+            "src": "git log %s ^%s, claim/* refs" % (dref, merge["commit"][:12])}
 
 
 # ---------- decisions.md and requirements.md ----------
@@ -471,32 +684,31 @@ def decision_rows(text):
 
 
 def classify_who(who, bot_users=()):
-    """(by, who shown) from a decisions.md Who cell. by: agent | check | bridge | person | None (unknown).
-    A cell that is not a role word, a username or a pseudonym is not shown (it may be a real name)."""
-    w = str(who or "").strip()
+    """(by, who shown) from a decisions.md Who cell, in the runner's vocabulary (remote/prompts/brain-run.md §5):
+      agent                     -> agent        (also a kit.json bot user: the runner's account)
+      brain <entry id>[, <id>]  -> brain        (who shown: the ids)
+      check                     -> check
+      <P-xxxx> <V-xxxxxxxxxx>   -> person       (who shown: the pseudonym)
+      owner                     -> person       (local half: the run owner answered in chat; kit/.kiro/steering)
+    each optionally followed by a note in brackets ("agent (A-2)"). Empty -> (None, None). Anything else is
+    ("unclassified", None): not guessed, and not shown (it may be a real name); eval lists where it is."""
+    w = str(who or "").strip().strip("`").strip()
     if not w:
         return None, None
-    low = w.lower()
-    toks = [t for t in SPLIT_RE.split(low) if t]
-    bots = {b.lower() for b in bot_users}
-    pseud = PSEUD_RE.search(w)
-    if toks and toks[0] in BRIDGE_WORDS:
-        return "bridge", toks[0]
-    if toks and (toks[0] in AGENT_WORDS or toks[0] in bots):
-        return "agent", toks[0]
-    if toks and (toks[0] in CHECK_WORDS or low in ("brain lint", "lean verify")):
-        return "check", toks[0]
-    if pseud:
-        return "person", pseud.group(0)
-    if toks and toks[0] in PERSON_WORDS:
-        return "person", toks[0]
-    if VOUCHER_RE.search(w):
-        return "person", None
-    if USER_RE.match(low):
-        return "person", low
-    if re.match(r"^[一-鿿]{2,4}$", w):
-        return "person", None
-    return None, None
+    if w.lower() in {b.lower() for b in bot_users}:
+        return "agent", w.lower()
+    m = WHO_WORD_RE.match(w)
+    if m:
+        return m.group(1).lower(), m.group(1).lower()
+    m = WHO_BRAIN_RE.match(w)
+    if m:
+        return "brain", ", ".join(re.findall(_ENTRY, m.group(1)))
+    m = WHO_PERSON_RE.match(w)
+    if m:
+        return "person", m.group(1)
+    if WHO_OWNER_RE.match(w):
+        return "person", "owner"
+    return "unclassified", None
 
 
 def md_decisions(text, path, bot_users):
@@ -604,29 +816,51 @@ def voucher_files(vdir, key, allowed_signers=None):
     return out
 
 
-def _credits(credits, key, run_ids):
-    """The KiroCrew app's record(s) for this requirement: a number, one record, or {"runs": {RUN-id|KEY: record}}."""
+NOT_PASSED = "credits not passed in (the KiroCrew app passes them; they are not readable here)"
+
+
+def _is_num(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def credits_shape(credits) -> str:
+    """none | one (a number or a single record: one run's) | keyed ({"runs": {KEY|RUN-id: record}}) | bad."""
     if credits is None:
-        return None
-    if isinstance(credits, (int, float)) and not isinstance(credits, bool):
-        return [{"credits": credits}]
+        return "none"
+    if _is_num(credits):
+        return "one"
     if not isinstance(credits, dict):
-        return None
-    if any(k in credits for k in ("credits", "total", "turns", "manual")):
-        return [credits]
+        return "bad"
+    return "one" if any(k in credits for k in ("credits", "total", "turns", "manual")) else "keyed"
+
+
+def _credits(credits, key, run_ids):
+    """(the KiroCrew app's record(s) for this requirement or None, why there are none). A number or one record is
+    this requirement's (brain eval passes one only when there is one run). Keyed records count when the key is the
+    requirement key, a run id the ledger / vouchers know, or RUN-<KEY>-<n> (a run id names its requirement)."""
+    shape = credits_shape(credits)
+    if shape == "none":
+        return None, NOT_PASSED
+    if shape == "bad":
+        return None, "credits passed in, but not a number or a JSON object"
+    if shape == "one":
+        return [credits if isinstance(credits, dict) else {"credits": credits}], None
     pool = credits.get("runs") if isinstance(credits.get("runs"), dict) else credits
-    picked = [pool[k] for k in sorted(pool) if (k == key or k in run_ids) and isinstance(pool[k], (dict, int, float))]
-    return [p if isinstance(p, dict) else {"credits": p} for p in picked] or None
+    rx = re.compile(r"^RUN-%s-[1-9][0-9]*$" % re.escape(key))
+    picked = [pool[k] for k in sorted(pool) if (k == key or k in run_ids or rx.match(k)) and
+              (isinstance(pool[k], dict) or _is_num(pool[k]))]
+    recs = [p if isinstance(p, dict) else {"credits": p} for p in picked]
+    return (recs, None) if recs else (None, "credits passed in, but none for %s or its runs" % key)
 
 
 def _num(x):
-    return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and x >= 0 else None
+    return float(x) if _is_num(x) and x >= 0 else None
 
 
-def cost_of(recs) -> dict:
+def cost_of(recs, why=NOT_PASSED) -> dict:
     if not recs:
         return {"credits": None, "per_turn": None, "context": None, "tokens": None, "tokens_why": NO_TOKENS,
-                "src": None, "why": "credits not passed in (the KiroCrew app passes them; they are not readable here)"}
+                "src": None, "why": why}
     total, turns, ctx, ok = 0.0, [], None, False
     for r in recs:
         t = _num(r.get("credits", r.get("total")))
@@ -674,9 +908,12 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
     run_src = "%s (%s)" % (rp, tree.label)
     intent = rec.get("intent") if isinstance(rec.get("intent"), str) and rec.get("intent") else None
     owner = rec.get("owner") if isinstance(rec.get("owner"), str) and USER_RE.match(rec.get("owner")) else None
+    branch = rec.get("branch") if isinstance(rec.get("branch"), str) and rec.get("branch") else None
     handoff = rec.get("handoff") if isinstance(rec.get("handoff"), dict) else None
     handoff_at = _utc(handoff.get("requested_at")) if handoff else None
-    missing = []
+    missing = ["%s: %s is not a %s (ignored)" % (run_src, f, what) for f, what in (
+        ("intent", "string"), ("branch", "string"), ("brain_commit", "string"), ("handoff", "JSON object"))
+        if rec.get(f) is not None and not isinstance(rec[f], dict if f == "handoff" else str)]
 
     events, chains = lean_events(tree, intent) if intent else ([], {})
     if not chains:
@@ -686,12 +923,12 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
     dec_text = tree.read(dec_path) if dec_path else None
     req_path = docs + "/inception/requirements/requirements.md" if docs else None
 
-    hist = git_history(repo, cfg, rec, ref, key) if rec.get("branch") else {
-        "tip": None, "tip_src": None, "default_ref": default_ref(repo, cfg, ref), "merge": None, "commits": None,
-        "range": None, "handover_commit": None, "park": None}
+    hist = git_history(repo, cfg, rec, ref, key) if branch else {
+        "tip": None, "tip_src": None, "tip_note": None, "default_ref": default_ref(repo, cfg, ref), "merge": None,
+        "commits": None, "range": None, "handover_commit": None, "park": None}
     if hist["tip"] is None:
         missing.append("run branch %s (not found locally, on origin, or as a merge on the default branch)"
-                       % rec.get("branch"))
+                       % branch)
         row = _park_row(tree.read("%s/%s/park.json" % (cfg["runs_dir"], key)),
                         "%s/%s/park.json (%s)" % (cfg["runs_dir"], key, tree.label), None)
         hist["park"] = [row] if row else []
@@ -725,21 +962,28 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
             "who": d["answerer"] if d["answerer"] and USER_RE.match(str(d["answerer"])) else None,
             "voucher_id": d["voucher_id"], "at": _utc(d["updated"]) if d["answer"] else None,
             "asked_at": _utc(d["created"]), "eval_oracle": False, "signature": None, "text": None, "cites": [],
-            "recorded_in": None, "src": ["bridge ledger decisions"]}
+            "rejected_items": None, "recorded_in": None, "src": ["bridge ledger decisions"]}
     oracle = []
+
+    def _s(x):
+        return x if isinstance(x, str) and x else None
     for v in vouchers:
-        if v.get("kind") != "answer" or not v.get("decision"):
+        if v.get("kind") != "answer" or not _s(v.get("decision")):
             continue
         k = (v.get("run_id"), v.get("decision"))
         row = bridge.setdefault(k, {"id": v.get("decision"), "source": "bridge", "run_id": v.get("run_id"),
                                     "by": "bridge", "kind": None, "lean_request": None, "state": None,
                                     "choice": None, "who": None, "voucher_id": None, "at": None, "asked_at": None,
                                     "eval_oracle": False, "signature": None, "text": None, "cites": [],
-                                    "recorded_in": None, "src": []})
-        row.update(kind=v.get("decision_kind") or row["kind"],
-                   lean_request=v.get("lean_request") or row["lean_request"],
-                   choice=v.get("choice"), voucher_id=v.get("voucher_id"), at=_utc(v.get("issued_at")) or row["at"],
-                   signature=v.get("_sig"), eval_oracle=v.get("eval_oracle") is True)
+                                    "rejected_items": None, "recorded_in": None, "src": []})
+        items = v.get("rejected_items")   # batch review: the items of review_items the answer rejected
+        row.update(kind=_s(v.get("decision_kind")) or row["kind"],
+                   lean_request=_s(v.get("lean_request")) or row["lean_request"],
+                   choice=_s(v.get("choice")), voucher_id=_s(v.get("voucher_id")),
+                   at=_utc(v.get("issued_at")) or row["at"], signature=v.get("_sig"),
+                   eval_oracle=v.get("eval_oracle") is True,
+                   rejected_items=[str(x)[:40] for x in items if isinstance(x, str)][:50]
+                   if isinstance(items, list) and items else row["rejected_items"])
         if isinstance(v.get("answerer"), str) and PSEUD_RE.fullmatch(v["answerer"]):
             row["who"] = v["answerer"]
         row["src"] = row["src"] + [v["_src"]]
@@ -763,6 +1007,8 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
         h = {"at": b["at"], "kind": kind, "what": what, "choice": b["choice"], "who": b["who"], "channel": "bridge",
              "decision": b["id"], "voucher_id": b["voucher_id"], "judgment_point": True, "after_handover": None,
              "src": list(b["src"])}
+        if kind == "rejection" and b["rejected_items"]:
+            h["rejected_items"] = b["rejected_items"]
         humans.append(h)
         if b["voucher_id"]:
             vmap[b["voucher_id"]] = h
@@ -784,7 +1030,8 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
         ps = PSEUD_RE.search(chan) or PSEUD_RE.search(words)
         kind = {"APPROVED": "approval", "REJECTED": "rejection", "APPROVAL_REFUSED": "approval_refused",
                 "HUMAN_TURN": "allow_test_change"}[ev]
-        humans.append({"at": e["_at"], "kind": kind, "what": d.get("kind") if ev != "HUMAN_TURN" else None,
+        humans.append({"at": e["_at"], "kind": kind,
+                       "what": d.get("kind") if ev != "HUMAN_TURN" and isinstance(d.get("kind"), str) else None,
                        "choice": None, "who": ps.group(0) if ps else pseudonym((e.get("actor") or {}).get("git_email")
                                                                                 if isinstance(e.get("actor"), dict)
                                                                                 else None),
@@ -798,7 +1045,7 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
                            else "code", "choice": None, "who": c["who"], "channel": "git", "decision": None,
                            "voucher_id": None, "judgment_point": False, "after_handover": True, "sha": c["sha"],
                            "src": [c["src"]]})
-    crecs = _credits(credits, key, run_ids)
+    crecs, credits_why = _credits(credits, key, run_ids)
     for r in crecs or []:
         for m in r.get("manual") or [] if isinstance(r.get("manual"), list) else []:
             if isinstance(m, dict) and isinstance(m.get("kind"), str):
@@ -818,8 +1065,8 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
 
     # ----- actions -----
     blocked = [{"at": e["_at"], "gate": _data(e).get("gate"), "tool": _data(e).get("tool"),
-                "path": _data(e).get("path"),
-                "command": str(_data(e)["command"])[:120] if _data(e).get("command") else None, "src": e["_src"]}
+                "path": scrub(_data(e)["path"]) if _data(e).get("path") else None,
+                "command": scrub(_data(e)["command"], 120) if _data(e).get("command") else None, "src": e["_src"]}
                for e in events if e.get("event") == "BLOCKED"]
     turns = {}
     for e in events:
@@ -837,7 +1084,7 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
         handovers.append({"at": _utc(h["updated"]), "kind": "bridge " + str(h["state"]), "run_id": h["run_id"],
                           "mr_iid": h["iid"], "sha": str(h["sha"]).split("#", 1)[0],
                           "voucher_id": h["voucher_id"],
-                          "reason": str(h["reason"])[:300] if h["reason"] else None, "src": "bridge ledger handoffs"})
+                          "reason": scrub(h["reason"], 300) if h["reason"] else None, "src": "bridge ledger handoffs"})
     for v in vouchers:
         if v.get("kind") == "handoff":
             handovers.append({"at": _utc(v.get("issued_at")), "kind": "voucher", "run_id": v.get("run_id"),
@@ -866,32 +1113,40 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
                 "at": first_ok["at"] if first_ok else None, "rejections": len(rejections),
                 "src": "RELEASE approvals/rejections (Lean audit) and acceptance answers (bridge)"}
     merged = hist["merge"]
+    led_states = sorted({str(r["state"]) for r in (led or {}).get("runs", [])}) if led else None
+    merged_at = {"value": merged["at"] if merged else None, "commit": merged["commit"] if merged else None,
+                 "how": merged["how"] if merged else None,
+                 "src": merged["src"] if merged else "no merge into %s found" % (hist["default_ref"] or
+                                                                                   cfg["default_branch"]),
+                 "note": merged.get("note") if merged else None, "bridge_state": led_states}
+    if not merged and led_states and "merged" in led_states:
+        merged_at["note"] = "the bridge ledger says the MR was merged, but %s here has no merge of it (fetch it?)" % (
+            hist["default_ref"] or cfg["default_branch"])
     outcome = {
         "handed_over": {"value": bool(handoff), "at": handoff_at,
                         "bridge_accepted": any(h["kind"] == "bridge accepted" for h in handovers) if led else None,
                         "src": run_src + " handoff" + ("; bridge ledger handoffs" if led else "")},
         "accepted": accepted,
-        "merged_at": {"value": merged["at"] if merged else None, "commit": merged["commit"] if merged else None,
-                      "how": merged["how"] if merged else None,
-                      "src": merged["src"] if merged else "no merge into %s found" % (hist["default_ref"] or
-                                                                                        cfg["default_branch"])},
+        "merged_at": merged_at,
         "reverted_or_hotfixed_within_14d": after_merge(repo, cfg, key, merged, hist["commits"], hist["default_ref"],
                                                        as_of_dt),
     }
 
     if credits is None:
         missing.append("credits (not passed in)")
+    elif not crecs:
+        missing.append("credits (%s)" % credits_why)
     missing.append("pushes (git keeps no push log; person commits after hand-over stand in for them)")
     missing.append("CI pipelines (GitLab, not readable here)")
     return {
         "schema": SCHEMA, "key": key, "as_of": iso(as_of_dt), "ref": tree.label,
-        "intent": intent, "owner": owner, "branch": rec.get("branch") if isinstance(rec.get("branch"), str) else None,
+        "intent": intent, "owner": owner, "branch": branch,
         "brain_commit": brain["brain_commit"], "run_ids": run_ids,
         "src": {"key": "argument", "intent": run_src, "owner": run_src, "branch": run_src,
                 "brain_commit": run_src, "run_ids": "bridge ledger runs + voucher files",
                 "as_of": "argument" if as_of else "clock", "lean_audit": chains, "git": {
-                    "tip": hist["tip"], "tip_src": hist["tip_src"], "range": hist["range"],
-                    "default_ref": hist["default_ref"]}},
+                    "tip": hist["tip"], "tip_src": hist["tip_src"], "tip_note": hist["tip_note"],
+                    "range": hist["range"], "default_ref": hist["default_ref"]}},
         "stages": stages_of(events),
         "actions": {"commits": hist["commits"], "pushes": None, "blocked": blocked, "turns": turns,
                     "handovers": handovers, "questions": hist["park"]},
@@ -900,7 +1155,7 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
         "checks": checks_of(events, tree, intent) if intent else None,
         "humans": humans,
         "brain": brain,
-        "cost": cost_of(crecs),
+        "cost": cost_of(crecs, credits_why),
         "outcome": outcome,
         "missing": missing,
     }
@@ -917,6 +1172,9 @@ def render(t) -> str:
         out.append("Lean 日志：" + "；".join("%s %d 条 %s" % (os.path.basename(p), c["records"],
                                                            "链完好" if c["chain"] == "ok" else c["chain"])
                                          for p, c in sorted(chains.items())))
+    g = t["src"]["git"]
+    if g.get("tip_note"):
+        out.append("分支：用的是 %s；%s" % (g["tip_src"], g["tip_note"]))
     if t["stages"]:
         mark = {"done": "x", "skipped": "S", "started": "-"}
         out.append("")
@@ -948,15 +1206,19 @@ def render(t) -> str:
     out.append("Brain：装载 %s 条，引用 %d 条%s" % (b["loaded"] if b["loaded"] is not None else "?", len(b["cited"]),
                                             "，过时引用 %s" % ", ".join(b["stale"]) if b["stale"] else ""))
     cost = t["cost"]
-    out.append("credits：%s" % (cost["credits"] if cost["credits"] is not None else "没有（KiroCrew 没传）"))
+    out.append("credits：%s" % (cost["credits"] if cost["credits"] is not None else
+                               "没有（KiroCrew 没传）" if cost.get("why") == NOT_PASSED else "没有（%s）" % cost.get("why")))
     o = t["outcome"]
+    m = o["merged_at"]
     out.append("")
-    out.append("交接：%s；验收：%s%s；合并：%s" % (
+    out.append("交接：%s；验收：%s%s；合并：%s%s" % (
         "是" if o["handed_over"]["value"] else "否",
         {True: "通过", False: "被驳回", None: "没有记录"}[o["accepted"]["value"]],
         "（一次通过）" if o["accepted"]["first_time"] else ("（驳回 %d 次）" % o["accepted"]["rejections"]
                                                        if o["accepted"]["rejections"] else ""),
-        o["merged_at"]["value"] or "没有"))
+        m["value"] or "没有", "（%s）" % m["how"] if m.get("how") else ""))
+    if m.get("note"):
+        out.append("  " + m["note"])
     r = o["reverted_or_hotfixed_within_14d"]
     if r["window_end"]:
         out.append("14 天内回滚/热修/缺陷：%s（窗口到 %s%s）" % (

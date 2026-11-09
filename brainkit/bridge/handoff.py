@@ -14,7 +14,8 @@ What a hand-over must prove (otherwise the MR gets a comment and the 'rejected' 
      GitLab recorded the MR head as pushed (its MR versions; commit dates are the pusher's and are not used);
   3. the owner is in brain-authz and is not a bot;
   4. the requirement is theirs: Jira assignee + claim status (tracker jira), or claim/<KEY> names them (none);
-  5. run.json at the MR head is valid for this branch and was handed off by the owner;
+  5. run.json at the MR head is valid for this branch and was handed off by the owner, and the MR head is the commit
+     that wrote it (`brain handoff`'s commit): a commit pushed on top of it is not part of the hand-over;
   6. the Lean hand-over note (aidlc-state.md) at the MR head is filled in;
   7. the Brain commit exists; material packages are in brain-intake with the recorded hash;
      no other run is open for this requirement.
@@ -70,6 +71,16 @@ def load_bridge_config(path) -> dict:
     return cfg
 
 
+def _event_order(ev):
+    """Sort key of a label event: GitLab's event id (it only grows), then GitLab's time."""
+    try:
+        n = int(ev.get("id") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    t = gl_time(ev.get("created_at"))
+    return n, t.timestamp() if t else float("-inf")
+
+
 class Bridge(DecisionLoop):
     def __init__(self, cfg, gitlab, jira, kirocrew=None, out=print, signer=None):
         """`signer`: any object with sign(voucher) -> signature; default the one bridge.json names (sign.py)."""
@@ -79,9 +90,17 @@ class Bridge(DecisionLoop):
         self.kc = kirocrew
         self.out = out
         # a subclass may also bring its signer as a class attribute
-        self.signer = signer or getattr(self, "signer", None) or sign.signer_from_config(cfg)
+        self.signer = signer or getattr(self, "signer", None)
+        if self.signer is None:
+            probs = sign.signer_file_problems(cfg)
+            if probs:
+                raise BrainError("bridge config: " + "; ".join(probs))
+            self.signer = sign.signer_from_config(cfg)
         self.ledger = Ledger(cfg["ledger"])
-        authz = load_json(cfg["identities"])
+        try:
+            authz = load_json(cfg["identities"])
+        except (OSError, ValueError) as e:
+            raise BrainError("bridge config: identities %s cannot be read: %s" % (cfg["identities"], e))
         self.ids = authz.get("users", {})
         self.roles = authz.get("roles", {})
         self._kit = {}
@@ -108,12 +127,11 @@ class Bridge(DecisionLoop):
     # ---------- checks ----------
 
     def last_label_event(self, project, iid, label):
-        """The latest add/remove event on `label` (all pages), or None."""
-        last = None
-        for ev in self.gl.label_events(project, iid):
-            if (ev.get("label") or {}).get("name") == label and ev.get("action") in ("add", "remove"):
-                last = ev
-        return last
+        """The latest add/remove event on `label` (all pages), or None. Latest by GitLab's event id, then its time;
+        the order GitLab lists them in is not relied on."""
+        evs = [ev for ev in self.gl.label_events(project, iid) if isinstance(ev, dict)
+               and (ev.get("label") or {}).get("name") == label and ev.get("action") in ("add", "remove")]
+        return max(evs, key=_event_order) if evs else None
 
     @staticmethod
     def _adder(ev):
@@ -197,6 +215,8 @@ class Bridge(DecisionLoop):
             return p, f
         if not rec.get("handoff"):
             p.append("run.json has no hand-over (run `brain handoff`)")
+        else:
+            p += self.handoff_commit_problems(project, sha, runrec.path(kit["runs_dir"], b["key"]), raw)
         f.update(intent=rec["intent"], brain_commit=rec["brain_commit"], materials=rec.get("materials", []),
                  expected_paths=rec.get("expected_paths", []))
         p += self.check_materials(f["materials"])
@@ -207,9 +227,28 @@ class Bridge(DecisionLoop):
             p += ["hand-over note: " + x for x in lean.handover_text_problems(state.decode("utf-8", "replace"))]
         if not self.gl.commit_exists(project, rec["brain_commit"]):
             p.append("brain_commit %s does not exist" % rec["brain_commit"][:12])
-        if self.ledger.open_run_for(b["key"]):
+        other = self.ledger.open_run_for(b["key"])
+        if other is not None and not self.ledger.is_reservation_for(other, project, mr["iid"], sha):
             p.append("%s already has an open run on the team runner" % b["key"])
         return p, f
+
+    def handoff_commit_problems(self, project, sha, path, raw) -> list:
+        """The MR head must be the commit that wrote run.json's hand-over (`brain handoff` commits run.json and
+        nothing else on top of the owner's work). A commit someone pushes on top of it - between `brain handoff`'s
+        push and its label, say - leaves run.json as it was: it was not handed over, however the label times fall.
+        Rule: the head has one parent, and run.json there differs from run.json at that parent."""
+        c = self.gl.commit(project, sha)
+        parents = c.get("parent_ids") if isinstance(c, dict) else None
+        if not isinstance(parents, list) or not parents or not all(isinstance(x, str) for x in parents):
+            return ["GitLab does not show the parent of %s: cannot tell that it is the hand-over commit" % sha[:12]]
+        if len(parents) != 1:
+            return ["the MR head %s is a merge, not the hand-over commit `brain handoff` makes: run it again"
+                    % sha[:12]]
+        if self.gl.file_raw(project, path, parents[0]) == raw:
+            return ["the MR head %s is not the hand-over commit (it does not change %s): a commit pushed after "
+                    "`brain handoff` was not handed over; look at it, then run `brain handoff` again"
+                    % (sha[:12], path)]
+        return []
 
     def check_jira(self, kit, key, owner, ident) -> list:
         if not self.jira or not ident.get("jira"):
@@ -286,30 +325,42 @@ class Bridge(DecisionLoop):
             self.ledger.release_handoff(project, iid, key)
             raise
 
+    def _reject(self, project, kit, iid, sha, key, probs):
+        self.ledger.set_handoff(project, iid, key, "checking", "rejected", reason="; ".join(probs)[:2000])
+        self.gl.comment(project, iid, "AI 接手被拒（%s）：\n" % sha[:12] + "\n".join("- " + x for x in probs) +
+                        "\n\n改好后重新推送，再打一次标签 `%s`。" % kit["handoff_label"])
+        self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
+        self.out("rejected %s!%d @%s: %s" % (project, iid, sha[:12], "; ".join(probs)))
+        return "rejected"
+
     def _process(self, project, kit, mr, iid, sha, key, adder, label_event=None):
         probs, f = self.verify(project, kit, mr, adder, label_event=label_event)
         if probs:
-            self.ledger.set_handoff(project, iid, key, "checking", "rejected", reason="; ".join(probs)[:2000])
-            self.gl.comment(project, iid, "AI 接手被拒（%s）：\n" % sha[:12] + "\n".join("- " + x for x in probs) +
-                            "\n\n改好后重新推送，再打一次标签 `%s`。" % kit["handoff_label"])
-            self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
-            self.out("rejected %s!%d @%s: %s" % (project, iid, sha[:12], "; ".join(probs)))
-            return "rejected"
+            return self._reject(project, kit, iid, sha, key, probs)
         overlap_note = ""
         for other, both in self.overlaps(project, f["key"], f["expected_paths"]):
             overlap_note += "\n\n注意：和 %s 预计改动重叠（%s），合并时留意顺序。" % (other, ", ".join(both[:5]))
-        run_id = self.ledger.next_run_id(f["key"])
-        voucher = {
-            "schema": 1, "kind": "handoff", "run_id": run_id, "project": project, "mr_iid": iid, "sha": sha,
-            "branch": f["branch"], "owner": f["owner"], "key": f["key"], "intent": f["intent"],
-            "brain_commit": f["brain_commit"], "materials": f["materials"], "route": "recheck",
-            "issued_at": iso(utcnow()),
-            "expires_at": later(self.cfg["contract_ttl_hours"]), "issuer": sign.PRINCIPAL,
-        }
-        voucher["voucher_id"] = "V-" + sign.digest(voucher)[:10]
+        # The run id is taken before signing, as one step with the check that the requirement has no open run:
+        # two hand-overs of one requirement (two MRs, two threads) never both get a contract.
+        run_id = self.ledger.reserve_run(f["key"], project, iid, sha,
+                                         stale_after=max(900, 4 * float(getattr(self.signer, "timeout", 0) or 0)))
+        if run_id is None:
+            return self._reject(project, kit, iid, sha, key, ["%s already has an open run on the team runner"
+                                                              % f["key"]])
         try:
-            sig = self.signer.sign(voucher)     # SignerUnavailable: nothing signed, checked again next round
+            voucher = {
+                "schema": 1, "kind": "handoff", "run_id": run_id, "project": project, "mr_iid": iid, "sha": sha,
+                "branch": f["branch"], "owner": f["owner"], "key": f["key"], "intent": f["intent"],
+                "brain_commit": f["brain_commit"], "materials": f["materials"], "route": "recheck",
+                "issued_at": iso(utcnow()),
+                "expires_at": later(self.cfg["contract_ttl_hours"]), "issuer": sign.PRINCIPAL,
+            }
+            voucher["voucher_id"] = "V-" + sign.digest(voucher)[:10]
+            # SignerUnavailable: nothing signed, checked again next round (asking for this same voucher)
+            ref = "handoff %s!%d %s" % (project, iid, key)
+            voucher, sig = self.sign_voucher(ref, voucher)
         except sign.SignerRefused as e:
+            self.ledger.release_run(run_id)
             why = "; ".join(e.reasons)
             self.ledger.set_handoff(project, iid, key, "checking", "rejected", reason=("signer: " + why)[:2000])
             self.gl.comment(project, iid, "AI 接手被拒（%s）：交接的检查都过了，但签名服务没有签这份合同：\n%s\n\n"
@@ -318,14 +369,22 @@ class Bridge(DecisionLoop):
             self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
             self.out("signer refused %s!%d @%s: %s" % (project, iid, sha[:12], why))
             return "rejected"
-        write_json(os.path.join(self.cfg["vouchers_dir"], run_id, voucher["voucher_id"] + ".json"),
-                   {"voucher": voucher, "sig": sig})
-        if self.cfg.get("publish_vouchers"):
-            self.publish(run_id, voucher["voucher_id"])
-        write_json(os.path.join(self.cfg["spool_dir"], "requests", run_id + ".json"),
-                   {"voucher": voucher, "sig": sig}, mode=0o640)
-        self.ledger.add_run(run_id, project, f["key"], iid, sha, voucher["voucher_id"], paths=f["expected_paths"],
-                            owner=f["owner"], voucher=voucher)
+        except BaseException:
+            self.ledger.release_run(run_id)
+            raise
+        try:
+            write_json(os.path.join(self.cfg["vouchers_dir"], run_id, voucher["voucher_id"] + ".json"),
+                       {"voucher": voucher, "sig": sig})
+            if self.cfg.get("publish_vouchers"):
+                self.publish(run_id, voucher["voucher_id"])
+            write_json(os.path.join(self.cfg["spool_dir"], "requests", run_id + ".json"),
+                       {"voucher": voucher, "sig": sig}, mode=0o640)
+            self.ledger.add_run(run_id, project, f["key"], iid, sha, voucher["voucher_id"],
+                                paths=f["expected_paths"], owner=f["owner"], voucher=voucher)
+        except BaseException:
+            self.ledger.release_run(run_id)     # not recorded: the next round checks again, with this voucher
+            raise
+        self.ledger.drop_pending_voucher(ref)
         self.ledger.set_handoff(project, iid, key, "checking", "accepted", run_id=run_id,
                                 voucher_id=voucher["voucher_id"])
         self.gl.edit_labels(project, iid, add=[kit["running_label"]], remove=[kit["handoff_label"],

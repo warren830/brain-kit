@@ -65,6 +65,18 @@ class Proposal:
 
 def _blocks(text, open_re, what, free=()) -> tuple:
     """([(fields, body, start line)], problems) for the fenced blocks `open_re` opens. Fields in `free` keep '#'."""
+    spans, probs = _spans(text, open_re, what, free)
+    return [(f, b, start) for f, b, start, _, closed in spans if closed], probs
+
+
+def block_spans(text, open_re=FENCE_OPEN_RE) -> list:
+    """[(first line index, end line index (exclusive), fields)] of the fenced blocks `open_re` opens, the fences
+    included; a block that is not closed runs to the end. For tools that cut blocks out (golden ablation)."""
+    return [(start - 1, end, f) for f, _, start, end, _ in _spans(text, open_re, "block")[0]]
+
+
+def _spans(text, open_re, what, free=()) -> tuple:
+    """([(fields, body, start line, end line index (exclusive), closed)], problems)."""
     blocks, probs = [], []
     lines = text.split("\n")
     i = 0
@@ -91,30 +103,37 @@ def _blocks(text, open_re, what, free=()) -> tuple:
             j += 1
         if j >= len(lines):
             probs.append("line %d: %s block is not closed" % (start, what))
+            blocks.append((_fields(lines[start:], free)[0], "", start, len(lines), False))
             break
-        block = lines[start:j]
-        fields, body, in_body = {}, [], False
-        for n, line in enumerate(block):
-            if in_body:
-                body.append(line)
-            elif line.strip() == "---":
-                in_body = True
-            elif not line.strip():
-                continue
-            elif ":" in line:
-                k, v = line.split(":", 1)
-                k = k.strip().lower()
-                if k not in free:
-                    v = re.sub(r"\s+#.*$", "", v)          # trailing "# comment" after a value
-                v = v.strip()
-                if k in fields:
-                    probs.append("line %d: %s given twice" % (start + n + 1, k))
-                fields[k] = v
-            else:
-                probs.append("line %d: expected 'key: value' or '---'" % (start + n + 1))
-        blocks.append((fields, "\n".join(body), start))
+        fields, body, more = _fields(lines[start:j], free, start)
+        probs += more
+        blocks.append((fields, body, start, j + 1, True))
         i = j + 1
     return blocks, probs
+
+
+def _fields(block, free=(), start=0) -> tuple:
+    """(fields, body, problems) of the lines inside one block."""
+    fields, body, in_body, probs = {}, [], False, []
+    for n, line in enumerate(block):
+        if in_body:
+            body.append(line)
+        elif line.strip() == "---":
+            in_body = True
+        elif not line.strip():
+            continue
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            k = k.strip().lower()
+            if k not in free:
+                v = re.sub(r"\s+#.*$", "", v)          # trailing "# comment" after a value
+            v = v.strip()
+            if k in fields:
+                probs.append("line %d: %s given twice" % (start + n + 1, k))
+            fields[k] = v
+        else:
+            probs.append("line %d: expected 'key: value' or '---'" % (start + n + 1))
+    return fields, "\n".join(body), probs
 
 
 def parse(text) -> tuple:
@@ -496,40 +515,61 @@ REFLECTOR_PROMPT = os.path.join(KIT_ROOT, "remote", "prompts", "brain-reflector.
 REFLECTOR_AGENT = os.path.join(KIT_ROOT, "remote", "agents", "brain-reflector.json")
 
 
-def run_ref(repo, cfg, key) -> str:
-    """Where the accepted run is: the default branch once merged, else its run branch (origin first)."""
+def _has(repo, rev) -> bool:
+    return git(repo, "cat-file", "-e", rev, check=False).returncode == 0
+
+
+def locate_run(repo, cfg, key) -> dict:
+    """Where the accepted run is, from the refs already on this machine; nothing is fetched and no ref moves.
+    Order: the default branch once merged (origin/<main>, then <main>), else its run branch (origin's copy first,
+    then a local branch). Only when none is here, `git ls-remote origin` (read-only) looks for the run branch; the
+    person fetches it (the returned "fetch" command). Returns {"ref", "read" (a revision to read run.json from, or
+    None when its commit is not here yet), "fetch" (a command, or None)}."""
     rel = "%s/%s/run.json" % (cfg["runs_dir"], key)
-    main = cfg["default_branch"]
+    main, prefix = cfg["default_branch"], cfg["branch_prefix"]
     has_origin = git(repo, "remote", "get-url", "origin", check=False).returncode == 0
-    if has_origin:
-        git(repo, "fetch", "-q", "origin", main, check=False)
     for ref in (("origin/" + main,) if has_origin else ()) + (main,):
-        if git(repo, "cat-file", "-e", "%s:%s" % (ref, rel), check=False).returncode == 0:
-            return ref
-    prefix = cfg["branch_prefix"]
-    if has_origin:
-        out = git(repo, "ls-remote", "origin", "refs/heads/%s/*" % prefix, check=False).stdout
-        for line in out.splitlines():
-            name = line.split("\t", 1)[-1][len("refs/heads/"):]
+        if _has(repo, "%s:%s" % (ref, rel)):
+            return {"ref": ref, "read": ref, "fetch": None}
+    for space, short in (("refs/remotes/origin/%s/" % prefix, "origin/"), ("refs/heads/%s/" % prefix, "")):
+        for full in git_out(repo, "for-each-ref", "--format=%(refname)", space).split():
+            name = prefix + "/" + full[len(space):]
             b = parse_branch(name, prefix)
             if b and b["key"] == key:
-                git(repo, "fetch", "-q", "origin", "+refs/heads/%s:refs/remotes/origin/%s" % (name, name), check=False)
-                return "origin/" + name
-    for name in git_out(repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/%s/" % prefix).split():
-        b = parse_branch(name, prefix)
-        if b and b["key"] == key:
-            return name
-    raise BrainError("no run for %s found (not on %s, no %s/*/%s-* branch): pass --ref" % (key, main, prefix, key))
+                return {"ref": short + name, "read": short + name, "fetch": None}
+    if has_origin:
+        out = git(repo, "ls-remote", "origin", "refs/heads/%s/*" % prefix, check=False).stdout
+        for line in sorted(out.splitlines()):
+            sha, _, full = line.partition("\t")
+            name = full[len("refs/heads/"):]
+            b = parse_branch(name, prefix)
+            if b and b["key"] == key:
+                return {"ref": "origin/" + name, "read": sha if _has(repo, sha + "^{commit}") else None,
+                        "fetch": "git -C %s fetch origin +refs/heads/%s:refs/remotes/origin/%s" % (repo, name, name)}
+    raise BrainError("no run for %s here (not on %s, no %s/*/%s-* branch on this machine%s). --draft does not fetch: "
+                     "run `git fetch origin` first, or pass --ref" % (key, main, prefix, key,
+                                                                      " or on origin" if has_origin else ""))
+
+
+def run_ref(repo, cfg, key) -> str:
+    """The ref of the accepted run (locate_run; read-only)."""
+    return locate_run(repo, cfg, key)["ref"]
 
 
 def draft(repo, cfg, key, ref=None, vouchers_dir=None) -> str:
-    """What a person does to run the reflector in a local KiroCrew session, and the exact message to send it."""
-    ref = ref or run_ref(repo, cfg, key)
+    """What a person does to run the reflector in a local KiroCrew session, and the exact message to send it.
+    Print-only: nothing is fetched, no ref, worktree or file changes (locate_run)."""
+    loc = {"ref": ref, "read": ref, "fetch": None} if ref else locate_run(repo, cfg, key)
+    ref = loc["ref"]
     rel = "%s/%s/run.json" % (cfg["runs_dir"], key)
-    p = git(repo, "show", "%s:%s" % (ref, rel), check=False)
-    if p.returncode != 0:
-        raise BrainError("%s has no %s" % (ref, rel))
-    intent = _intent(p.stdout, "%s:%s" % (ref, rel))
+    if loc["read"]:
+        p = git(repo, "show", "%s:%s" % (loc["read"], rel), check=False)
+        if p.returncode != 0:
+            raise BrainError("%s has no %s" % (ref, rel))
+        intent = _intent(p.stdout, "%s:%s" % (ref, rel))
+        intent_line = "- intent: %s (aidlc-docs/%s/)" % (intent, intent)
+    else:
+        intent_line = "- intent: the \"intent\" field of %s in this workspace (aidlc-docs/<intent>/)" % rel
     wt = os.path.join(worktree_root(repo), "reflector-%s" % key)
     out = "%s/%s/reflect-proposals.md" % (cfg["runs_dir"], key)
     with open(REFLECTOR_PROMPT, encoding="utf-8") as f:
@@ -538,17 +578,21 @@ def draft(repo, cfg, key, ref=None, vouchers_dir=None) -> str:
         "You are brain-reflector for %s, in a fresh session. This run:" % key,
         "- key: %s" % key,
         "- ref: %s (this workspace is a detached checkout of it)" % ref,
-        "- intent: %s (aidlc-docs/%s/)" % (intent, intent),
+        intent_line,
         "- workspace: %s" % wt,
         "- vouchers: %s (answers the bridge signed; may be missing on this machine)"
         % os.path.join(vouchers_dir or "<brain-intake>/vouchers", "RUN-%s-*" % key),
         "- output: %s (in this workspace only)" % out,
         "",
         prompt])
+    first = ["1. 给它建一个单独的工作区（不动你现在的目录）："]
+    if loc["fetch"]:
+        first = ["1. 这个 run 的分支只在 origin 上，先取下来，再给它建一个单独的工作区（不动你现在的目录）：",
+                 "     " + loc["fetch"]]
     steps = [
         "brain reflect --draft %s：在本机 KiroCrew 里开一个新会话，让它读完这个 run，写出 Brain 提案和缺口。" % key,
-        "",
-        "1. 给它建一个单独的工作区（不动你现在的目录）：",
+        "（只看本机已有的分支，不 fetch、不改任何东西；要最新的，先 git fetch origin 再跑一次。）",
+        ""] + first + [
         "     git -C %s worktree add --detach %s %s" % (repo, wt, ref),
         "2. 装 agent（一次）：把 %s 拷到 ~/.kiro/agents/brain-reflector.json，" % REFLECTOR_AGENT,
         "   prompt 改成 file://%s；不装也行，用默认 agent，下面的消息里已经带着全部说明。" % REFLECTOR_PROMPT,

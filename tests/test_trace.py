@@ -99,7 +99,7 @@ def add_run(w, key, slug, day, bad):
     rows = [["D-1", "2026-11-%02d" % day, "requirements", "单号按 T-PAY-1-1", "PRD 和样例不一致", "agent"]]
     if bad:
         rows += [["D-2", "2026-11-01", "design", "新建 refunds 表", "最简单", "product"],
-                 ["D-3", "2026-11-01", "code", "重试 3 次", "CI 不稳", "verify"],
+                 ["D-3", "2026-11-01", "code", "重试 3 次", "CI 不稳", "check"],
                  ["D-4", "2026-11-01", "code", "日志字段", "", ""],
                  ["D-5", "2026-11-01", "", "张三定的 X", "", "张三"]]
     else:
@@ -137,7 +137,7 @@ def add_run(w, key, slug, day, bad):
     commit(repo, files, "%s: code" % key, t(4, 50), BOT)
     if bad:
         commit(repo, {"src/%s.py" % slug: "x = 2\n"}, "%s: my fix" % key, t(5), "bob@example.com")
-        rows.append(["D-6", "2026-11-01", "code", "按 D-2 的回答 A（%s）" % v[2], "", "product (P-ABCD)"])
+        rows.append(["D-6", "2026-11-01", "code", "按 D-2 的回答 A", "", "P-ABCD %s" % v[2]])
         prop = ("\n## Brain proposals\n\n```brain-proposal\nfile: TECH\ntype: pitfall\nrel: repeats T-PAY-1-2\n"
                 "src: D-4\n---\n又重试超过 3 次。\n```\n")
     else:
@@ -239,8 +239,11 @@ class Trace(unittest.TestCase):
                          (1, "PAY-2", r.intent, "alice", r.branch, r.base))
         self.assertEqual(t["run_ids"], ["RUN-PAY-2-1"])
         self.assertEqual(t["src"]["intent"], "runs/PAY-2/run.json (working tree)")
+        labels = trace.audit_labels(["aidlc-docs/audit/local-PAY-2.jsonl", "aidlc-docs/audit/runner-PAY-2.jsonl"])
         self.assertEqual({p: c["chain"] for p, c in t["src"]["lean_audit"].items()},
-                         {"aidlc-docs/audit/local-PAY-2.jsonl": "ok", "aidlc-docs/audit/runner-PAY-2.jsonl": "ok"})
+                         {labels["aidlc-docs/audit/local-PAY-2.jsonl"]: "ok",
+                          labels["aidlc-docs/audit/runner-PAY-2.jsonl"]: "ok"})
+        self.assertNotIn("local-PAY-2", json.dumps(t))            # Lean's file name carries the host name
         self.assertEqual(t["src"]["git"]["tip"], r.tip)
         self.assertEqual(t["as_of"], AS_OF)
 
@@ -271,7 +274,7 @@ class Trace(unittest.TestCase):
         t = self.t
         md = {d["id"]: d for d in t["decisions"] if d["source"] == "decisions.md"}
         self.assertEqual({k: d["by"] for k, d in md.items()},
-                         {"D-1": "agent", "D-2": "person", "D-3": "check", "D-4": None, "D-5": "person",
+                         {"D-1": "agent", "D-2": "unclassified", "D-3": "check", "D-4": None, "D-5": "unclassified",
                           "D-6": "person"})
         self.assertEqual(md["D-1"]["cites"], ["T-PAY-1-1"])
         self.assertIsNone(md["D-5"]["who"])                       # a name in the Who column is not repeated
@@ -422,19 +425,20 @@ class TraceEdges(unittest.TestCase):
         commit(repo, {".brain/kit.json": json.dumps(KIT), "runs/PAY-3/run.json": json.dumps(rec),
                       "aidlc-docs/audit/c.jsonl": lines}, "init", "2026-11-01T00:00:00Z")
         t = trace.build(repo, config.load(repo), "PAY-3", as_of=AS_OF)
-        self.assertEqual(t["src"]["lean_audit"]["aidlc-docs/audit/c.jsonl"]["chain"], "broken at line 2")
+        label = trace.audit_labels(["aidlc-docs/audit/c.jsonl"])["aidlc-docs/audit/c.jsonl"]
+        self.assertEqual(t["src"]["lean_audit"][label]["chain"], "broken at line 2")
         self.assertEqual([s["id"] for s in t["stages"]], ["release"])   # still shown, flagged by the chain status
 
     def test_who_column(self):
         c = trace.classify_who
+        # the runner's vocabulary (remote/prompts/brain-run.md §5); anything else is unclassified, never shown
         self.assertEqual(c("agent (A-2)"), ("agent", "agent"))
         self.assertEqual(c("brain-bot", ["brain-bot"]), ("agent", "brain-bot"))
-        self.assertEqual(c("lean verify"), ("check", "lean"))
-        self.assertEqual(c("product via V-0123456789"), ("person", "product"))
-        self.assertEqual(c("P-AB12"), ("person", "P-AB12"))
-        self.assertEqual(c("alice"), ("person", "alice"))
-        self.assertEqual(c("王小明"), ("person", None))
-        self.assertEqual(c("Dr. Who Esq."), (None, None))
+        self.assertEqual(c("check"), ("check", "check"))
+        self.assertEqual(c("brain T-PAY-1-2"), ("brain", "T-PAY-1-2"))
+        self.assertEqual(c("P-AB12 V-0123456789"), ("person", "P-AB12"))
+        for other in ("lean verify", "product via V-0123456789", "P-AB12", "alice", "王小明", "Dr. Who Esq."):
+            self.assertEqual(c(other), ("unclassified", None), other)
         self.assertEqual(c(""), (None, None))
 
     @unittest.skipUnless(sign.available(), "ssh-keygen not found")

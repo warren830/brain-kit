@@ -46,12 +46,17 @@ LEAN_REQ_RE = re.compile(r"^(%s) ([0-9a-f]{6,64})$" % "|".join(LEAN_KINDS))
 ITEM_ID_RE = re.compile(r"^[AD]-[1-9][0-9]{0,3}$")     # review items: decisions D-n (Who = agent), assumptions A-n
 ITEMS_RE = re.compile(r"^([AD]-[1-9][0-9]{0,3}(?:(?:\s*[,，、]\s*|\s+)[AD]-[1-9][0-9]{0,3})*)(?![0-9A-Za-z_-])"
                       r"[ \t:：,，、-]*(.*)$", re.I)
+# an item id anywhere in the free text after the listed items: the list did not end where the reply meant it to
+ITEM_TOKEN_RE = re.compile(r"(?<![0-9A-Za-z_])[AD]-[0-9]+(?![0-9A-Za-z_])", re.I)
 MAX_REVIEW_ITEMS = 50
 KIND_LABEL = {"clarify": "澄清", "design": "设计", "plan": "计划", "acceptance": "验收", "action": "危险动作",
               "other": "其他"}
 DECISION_ID_RE = re.compile(r"^D-[1-9][0-9]*$")
 RUN_ID = r"RUN-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,5}"
-USER = r"[a-z0-9][a-z0-9._-]{0,63}"
+# a GitLab username (GitLab's namespace path rule): letters, digits, '_', '-', '.'; 1-255 characters; it does not
+# start with '-' and does not end with '.'. (GitLab also refuses names ending in .git / .atom; matching them here is
+# harmless: this only reads back the names the bridge itself wrote.)
+USER = r"(?:[A-Za-z0-9_.][A-Za-z0-9_.-]{0,253}[A-Za-z0-9_-]|[A-Za-z0-9_])"
 # the first line of a question note (question_text): decision, kind, run, commit and park.json hash, who answers
 Q_HEAD_RE = re.compile(r"^\*\*(D-[1-9][0-9]*) · ([^·*\n]+) · (%s)\*\* · 提交 ([0-9a-f]{12}) · park ([0-9a-f]{12}) · "
                        r"需要 (@%s(?:、@%s)*) 回答$" % (RUN_ID, USER, USER))
@@ -63,14 +68,16 @@ CREATE TABLE IF NOT EXISTS decisions (
   id TEXT PRIMARY KEY, run_id TEXT NOT NULL, project TEXT NOT NULL, iid INTEGER NOT NULL, sha TEXT NOT NULL,
   park_hash TEXT NOT NULL, kind TEXT NOT NULL, lean_request TEXT, state TEXT NOT NULL, note_id INTEGER,
   answer TEXT, answerer TEXT, voucher_id TEXT, created TEXT NOT NULL, updated TEXT NOT NULL,
-  qnote_id INTEGER, told_id INTEGER,
+  qnote_id INTEGER, told_id INTEGER, sign_told INTEGER,
   UNIQUE (run_id, sha, park_hash));
 """
 # note_id: replies after this note count (the question, or the end of a round); qnote_id: the question note;
-# told_id: replies up to here have been told why they do not count. States: posting (row written, question not on
-# the MR yet), open, answered, delivered, delivery_unknown, refused (the signer would not sign), stale, void, invalid,
-# closed.
-ADDED_COLUMNS = ("qnote_id", "told_id")
+# told_id: replies up to here have been told why they do not count; sign_told: the MR was told that an answer could
+# not be signed yet (once). States: posting (row written, question not on the MR yet), open, answered, delivered,
+# delivery_unknown, refused (the signer would not sign), stale, void, invalid, closed.
+ADDED_COLUMNS = ("qnote_id", "told_id", "sign_told")
+# fields of a voucher that change from one attempt to the next; the rest says what is signed
+VOUCHER_TIME_FIELDS = ("issued_at", "expires_at", "voucher_id")
 
 
 def validate_park(park) -> list:
@@ -239,12 +246,38 @@ def _norm(text) -> str:
     return "\n".join(l.rstrip() for l in str(text or "").replace("\r\n", "\n").split("\n")).strip()
 
 
+def _edited(note) -> bool:
+    """GitLab moves updated_at when a note is edited (its author, and Maintainers or admins for others' notes): such
+    a reply may not say what its author wrote. A note without updated_at (not from GitLab's API) is taken as posted;
+    one whose times cannot be read is taken as edited."""
+    if note.get("updated_at") in (None, ""):
+        return False
+    c, u = gl_time(note.get("created_at")), gl_time(note.get("updated_at"))
+    return c is None or u is None or u > c
+
+
+def _recorded_question(decision):
+    """(present, note id) of the question note the decision was bound to when it was asked: the ledger's qnote_id,
+    or an answer voucher's question_note. (False, None) when the decision record names none."""
+    keys = decision.keys()
+    for k in ("qnote_id", "question_note"):
+        if k in keys:
+            try:
+                n = int(decision[k] or 0)
+            except (TypeError, ValueError):
+                n = 0
+            return True, n if n > 0 else None
+    return False, None
+
+
 def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, question_id=None, after=None):
     """Does an answer on the MR count for this decision, and which one? Pure: no GitLab, no ledger, no clock.
 
     decision     {"id": "D-5", "run_id": "RUN-PAY-3-1", "sha": <40 hex>, "park_hash": <sha256 hex of park.json>}
                  (a ledger row, or an answer voucher's decision/run_id/sha/park_hash); "kind" and "lean_request",
-                 when given, must agree with park.json
+                 when given, must agree with park.json; "qnote_id" (ledger) or "question_note" (voucher), when
+                 given, is the question note the decision is bound to: only that note counts, and when it is gone
+                 the decision is void (a copy posted again, by whoever holds the bridge's token, binds nothing)
     park_raw     the bytes of runs/<KEY>/park.json at that sha, or None
     notes        every note on the MR, as GitLab returns them (id, body, author.username, created_at, system)
     kit          the kit config from the default branch (decision_roles, bot_users, bridge_user)
@@ -252,8 +285,8 @@ def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, 
     owner        the run's owner
     head         the MR head now
     pushed_at    when GitLab recorded `sha` as the MR head (rest.head_pushed_at of the MR versions); None: unknown
-    question_id  the note id the bridge recorded when it posted the question (None: it is found on the MR; then
-                 kit bridge_user tells the bridge's notes from people's)
+    question_id  the note id the bridge recorded when it posted the question (None: the decision's own record, or
+                 else it is found on the MR; then kit bridge_user tells the bridge's notes from people's)
     after        only replies after this note count (the bridge's round: a conflict starts a new one); default the
                  question. With bridge_user known, the bridge's own conflict notes end a round as well.
     -> Verdict
@@ -286,6 +319,13 @@ def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, 
     who = allowed_people(kit, kind, owner, roles)
     if not who:
         return void("nobody may answer a %s decision" % kind)
+    has_record, recorded = _recorded_question(decision)
+    if has_record:
+        if recorded is None:
+            return void("no question note is recorded for %s" % did)
+        if question_id and int(question_id) != recorded:
+            return void("note %s is not the question note %d recorded for %s" % (question_id, recorded, did))
+        question_id = recorded
 
     notes = sorted((n for n in notes or [] if isinstance(n, dict)), key=_nid)
     bridge = str(kit.get("bridge_user") or "").lower()
@@ -315,7 +355,8 @@ def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, 
                                                                " by %s" % bridge if bridge else ""))
     if question_id and int(question_id) not in [_nid(n) for n in asked]:
         return void("note %s is not the question %s" % (question_id, did))
-    q = asked[0]   # the first copy (a retried post may leave two equal ones)
+    # the recorded note; else the first copy (a retried post may leave two equal ones)
+    q = posted[0] if question_id else asked[0]
     when, pushed = gl_time(q.get("created_at")), gl_time(pushed_at)
     if pushed is None:
         return void("GitLab shows no MR version with head %s" % sha[:12])
@@ -345,7 +386,12 @@ def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, 
         if author not in who:
             feedback.append((nid, "@%s 不在 %s 的可回答名单里，这条回复不算。" % (author, did)))
             continue
-        if not (choice in ("approve", "reject") if park.get("lean_request") else choice in options):
+        if _edited(n):
+            feedback.append((nid, "%s：这条回复发出后被编辑过，编辑过的回复不算（别人也可能改过它）。请另发一条新的回复。"
+                             % did))
+            continue
+        # a Lean request, or a question without options, is answered approve/reject (question_text says so)
+        if not (choice in ("approve", "reject") if park.get("lean_request") or not options else choice in options):
             feedback.append((nid, "%s 没有选项 %s，这条回复不算。" % (did, choice)))
             continue
         note, items = m.group(3), ()
@@ -355,6 +401,12 @@ def check_answer(decision, park_raw, notes, kit, roles, owner, head, pushed_at, 
             unknown = [i for i in listed if i not in review]
             if unknown:
                 feedback.append((nid, "%s 没有待审项 %s，这条回复不算。" % (did, "、".join(unknown))))
+                continue
+            more = sorted({x.upper() for x in ITEM_TOKEN_RE.findall(im.group(2) or "")})
+            if more:
+                feedback.append((nid, "%s：驳回的项号要全部写在开头、用逗号分开（如 `answer %s reject A-1,D-3 说明`），"
+                                      "说明里不要再写项号；这条回复的说明里还有 %s，不算，请重新回复。"
+                                 % (did, did, "、".join(more))))
                 continue
             items = tuple(i for i in review if i in listed)     # the park's order, each once
             note = im.group(2)
@@ -406,6 +458,24 @@ class DecisionLoop:
     def question_text(self, did, row, park, who, kind, sha, park_hash) -> str:
         return question_text(did, row["run_id"], park, who, kind, sha, park_hash)
 
+    def sign_voucher(self, ref, voucher):
+        """(voucher, signature) through self.signer. A signer that did not answer in time may still sign after we
+        stopped waiting: the voucher asked for is kept under `ref` (what it is for), and the next attempt for the same
+        thing asks for that very voucher again (the same request), so the late signature is used instead of a new
+        one being asked for every round. The caller drops it (ledger.drop_pending_voucher) once the signed voucher is
+        stored; a refusal drops it here."""
+        core = {k: v for k, v in voucher.items() if k not in VOUCHER_TIME_FIELDS}
+        old = self.ledger.pending_voucher(ref)
+        if old is not None and {k: v for k, v in old.items() if k not in VOUCHER_TIME_FIELDS} == core \
+                and (not old.get("expires_at") or str(old["expires_at"]) > iso(utcnow())):
+            voucher = old
+        self.ledger.set_pending_voucher(ref, voucher)
+        try:
+            return voucher, self.signer.sign(voucher)
+        except sign.SignerRefused:
+            self.ledger.drop_pending_voucher(ref)
+            raise
+
     def check_bridge_user(self, kit):
         """kit.json bridge_user must be the account this bridge's token posts as, or no answer would count."""
         want = str(kit.get("bridge_user") or "").lower()
@@ -444,8 +514,9 @@ class DecisionLoop:
                 seen()
                 continue
             ph = hashlib.sha256(raw).hexdigest()
-            old = db.execute("SELECT * FROM decisions WHERE run_id=? AND sha=? AND park_hash=?",
-                             (row["run_id"], head, ph)).fetchone()
+            find = lambda: db.execute("SELECT * FROM decisions WHERE run_id=? AND sha=? AND park_hash=?",  # noqa
+                                      (row["run_id"], head, ph)).fetchone()
+            old = find()
             if old is not None and old["state"] != "posting":
                 seen()
                 continue
@@ -462,28 +533,47 @@ class DecisionLoop:
                     self.out("%s: GitLab has no MR version for %s yet; asking next round" % (row["run_id"], head[:12]))
                     continue
             now = iso(utcnow())
-            if old is not None:
-                did = old["id"]
-                if probs:
-                    db.execute("UPDATE decisions SET state='invalid', updated=? WHERE id=?", (now, did))
-            else:
-                with self.ledger.lock:
+            with self.ledger.lock:
+                # looked up again, with the insert, as one step: two threads watching at once ask one question
+                posting = self.__dict__.setdefault("_posting", set())
+                old = find()
+                if old is not None and (old["state"] != "posting" or old["id"] in posting):
+                    continue                                   # asked meanwhile, or being asked by another thread
+                if old is not None:
+                    did = old["id"]
+                    if probs:
+                        db.execute("UPDATE decisions SET state='invalid', updated=? WHERE id=?", (now, did))
+                else:
                     did = "D-%d" % (db.execute("SELECT COUNT(*) FROM decisions").fetchone()[0] + 1)
-                    db.execute("INSERT INTO decisions(id,run_id,project,iid,sha,park_hash,kind,lean_request,state,"
-                               "created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                               (did, row["run_id"], row["project"], row["iid"], head, ph, kind,
-                                park.get("lean_request"), "invalid" if probs else "posting", now, now))
-            if probs:
-                self.gl.comment(row["project"], row["iid"], "%s 无法发出（%s）：\n%s" % (
-                    did, row["run_id"], "\n".join("- " + x for x in probs)))
-                seen()
-                continue
-            # a failed post leaves the row 'posting' and the head unseen: the next round posts it again
-            note = self.gl.comment(row["project"], row["iid"], question_text(did, row["run_id"], park, who, kind,
-                                                                             head, ph))
-            nid = int((note or {}).get("id") or 0)
-            db.execute("UPDATE decisions SET state='open', qnote_id=?, note_id=?, told_id=?, updated=? "
-                       "WHERE id=? AND state='posting'", (nid, nid, nid, iso(utcnow()), did))
+                    try:
+                        db.execute("INSERT INTO decisions(id,run_id,project,iid,sha,park_hash,kind,lean_request,"
+                                   "state,created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                                   (did, row["run_id"], row["project"], row["iid"], head, ph, kind,
+                                    park.get("lean_request"), "invalid" if probs else "posting", now, now))
+                    except sqlite3.IntegrityError as e:          # another process on this ledger asked it
+                        raise BrainError("%s: decision for %s not recorded: %s" % (row["run_id"], head[:12], e))
+                posting.add(did)
+            try:
+                if probs:
+                    self.gl.comment(row["project"], row["iid"], "%s 无法发出（%s）：\n%s" % (
+                        did, row["run_id"], "\n".join("- " + x for x in probs)))
+                    seen()
+                    continue
+                # a failed post leaves the row 'posting' and the head unseen: the next round posts it again
+                note = self.gl.comment(row["project"], row["iid"], question_text(did, row["run_id"], park, who,
+                                                                                 kind, head, ph))
+                try:
+                    nid = int((note or {}).get("id") or 0)
+                except (TypeError, ValueError):
+                    nid = 0
+                if nid <= 0:     # a decision is bound to its question note's id; without one nothing could count
+                    raise BrainError("%s: GitLab did not return the id of its question note; asked again next round"
+                                     % did)
+                db.execute("UPDATE decisions SET state='open', qnote_id=?, note_id=?, told_id=?, updated=? "
+                           "WHERE id=? AND state='posting'", (nid, nid, nid, iso(utcnow()), did))
+            finally:
+                with self.ledger.lock:
+                    posting.discard(did)
             seen()
             posted += 1
             self.out("asked %s for %s (%s)" % (did, row["run_id"], ", ".join(who)))
@@ -561,6 +651,8 @@ class DecisionLoop:
         v = {"schema": 1, "kind": "answer", "decision": d["id"], "run_id": d["run_id"], "project": d["project"],
              "mr_iid": d["iid"], "sha": d["sha"], "park_hash": d["park_hash"], "decision_kind": d["kind"],
              "choice": choice, "answerer": pseud, "issued_at": iso(utcnow()), "issuer": sign.PRINCIPAL}
+        if d["qnote_id"]:
+            v["question_note"] = int(d["qnote_id"])   # the question this answers: check_answer counts only that note
         if d["lean_request"]:
             v["lean_request"] = d["lean_request"]
         if review:
@@ -568,8 +660,9 @@ class DecisionLoop:
         if items:
             v["rejected_items"] = list(items)         # rejected one by one; the rest stand
         v["voucher_id"] = "V-" + sign.digest(v)[:10]
+        ref = "answer %s" % d["id"]
         try:
-            sig = self.signer.sign(v)
+            v, sig = self.sign_voucher(ref, v)
         except sign.SignerRefused as e:
             db.execute("UPDATE decisions SET state='refused', updated=? WHERE id=? AND state='answered'",
                        (iso(utcnow()), d["id"]))
@@ -583,11 +676,20 @@ class DecisionLoop:
                        "WHERE id=? AND state='answered'", (iso(utcnow()), d["id"]))
             self.out("%s: signer unavailable, the answer stays open: %s" % (d["id"], e))
             return False
-        write_json(os.path.join(self.cfg["vouchers_dir"], d["run_id"], v["voucher_id"] + ".json"),
-                   {"voucher": v, "sig": sig})
-        if self.cfg.get("publish_vouchers"):
-            self.publish(d["run_id"], v["voucher_id"])
-        db.execute("UPDATE decisions SET voucher_id=? WHERE id=?", (v["voucher_id"], d["id"]))
+        except Exception as e:  # noqa: BLE001 - e.g. the key file is not there: nothing signed, try again next round
+            self._reopen(d)
+            self._tell_not_signed(d)
+            raise BrainError("%s: the answer could not be signed this round (it stays open): %s" % (d["id"], e))
+        try:
+            write_json(os.path.join(self.cfg["vouchers_dir"], d["run_id"], v["voucher_id"] + ".json"),
+                       {"voucher": v, "sig": sig})
+            if self.cfg.get("publish_vouchers"):
+                self.publish(d["run_id"], v["voucher_id"])
+            db.execute("UPDATE decisions SET voucher_id=? WHERE id=?", (v["voucher_id"], d["id"]))
+        except Exception as e:  # noqa: BLE001 - not stored: the next round stores this same voucher
+            self._reopen(d)
+            raise BrainError("%s: the signed answer could not be stored this round (it stays open): %s" % (d["id"], e))
+        self.ledger.drop_pending_voucher(ref)
         msg = self.answer_message(d, choice, note, pseud, v["voucher_id"], items=items, review=review)
         try:
             self.kc.send(row["slot"], msg, v["voucher_id"])
@@ -602,6 +704,22 @@ class DecisionLoop:
                            d["run_id"], v["voucher_id"]))
         self.out("delivered %s=%s to %s" % (d["id"], choice, d["run_id"]))
         return True
+
+    def _reopen(self, d):
+        """Nothing reached the run: the decision is open again and its replies are looked at next round."""
+        self.ledger.db.execute("UPDATE decisions SET state='open', answer=NULL, answerer=NULL, updated=? "
+                               "WHERE id=? AND state='answered'", (iso(utcnow()), d["id"]))
+
+    def _tell_not_signed(self, d):
+        """Tell the MR once that an answer waits for the bridge's signature (no details: they are the bridge's)."""
+        db = self.ledger.db
+        if db.execute("UPDATE decisions SET sign_told=1 WHERE id=? AND sign_told IS NULL", (d["id"],)).rowcount:
+            try:
+                self.gl.comment(d["project"], d["iid"], "%s 收到了回答，但桥这一轮没能签名，回答还没有送回 run。桥修好后会自动"
+                                                        "送出，不用重新回答。" % d["id"])
+            except BrainError as e:
+                self.out("%s: could not tell the MR: %s" % (d["id"], e))
+        self.out("%s: the answer could not be signed; it stays open" % d["id"])
 
     @staticmethod
     def answer_message(d, choice, note, pseud, voucher_id, items=(), review=()) -> str:

@@ -48,7 +48,8 @@ def taken_numbers(repo, prefix) -> set:
         names = [l.split("\t", 1)[1] for l in out.splitlines() if "\t" in l]
     else:
         names = git_out(repo, "for-each-ref", "--format=%(refname)", CLAIM_PREFIX).splitlines()
-    taken = {int(m.group(1)) for m in (rx.search(n) for n in names) if m}
+    # a hand-made ref with more than 7 digits (or a leading zero) is not a key: it must not push the next key out
+    taken = {int(m.group(1)) for m in (rx.search(n) for n in names) if m and len(m.group(1)) <= 7}
     run_rx = re.compile(r"^runs/%s-([1-9][0-9]*)/" % re.escape(prefix))
     for tree in ("HEAD", "refs/remotes/origin/main"):
         p = git(repo, "ls-tree", "-r", "--name-only", tree, "--", "runs", check=False)
@@ -73,6 +74,9 @@ def _try_create(repo, key, sha) -> bool:
 def claim(repo, prefix, owner, title, key=None, retries=8, extra=None) -> dict:
     """Claim `key`, or the next free <prefix>-<n>. Returns the claim document. `extra`: intent fields (intents.py)."""
     if key:
+        if not re.match(r"^%s-[1-9][0-9]{0,6}$" % re.escape(prefix), str(key)):
+            raise BrainError("%r is not a requirement key for this repo: %s-<n>, n from 1 without leading zeros, "
+                             "at most 7 digits" % (key, prefix))
         doc = claim_doc(key, owner, title, extra)
         if not _try_create(repo, key, _commit(repo, doc)):
             existing = read(repo, key)

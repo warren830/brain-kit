@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -137,6 +138,11 @@ class SpoolSigner:
     def sign(self, voucher) -> str:
         if not isinstance(voucher, dict):
             raise SignerRefused(["only a JSON object is signed"])
+        if not os.path.isfile(self.allowed) or not os.access(self.allowed, os.R_OK):
+            # the bridge's own config, not the signing service: no signature could ever verify. A plain BrainError
+            # (nothing asked, nothing refused): the hand-over or answer is looked at again once it is fixed.
+            raise BrainError("bridge config: signer.allowed_signers %s is not a readable file: no signature can be "
+                             "checked" % self.allowed)
         rid = self.req_id(voucher)
         req = os.path.join(self.spool, "requests", rid + ".json")
         write_json(req, {"schema": 1, "req_id": rid, "kind": voucher.get("kind"), "created": iso(utcnow()),
@@ -174,20 +180,44 @@ def _signer_cfg(cfg) -> dict:
     return {"type": s} if isinstance(s, str) else dict(s) if isinstance(s, dict) else {"type": repr(s)}
 
 
+def _seconds(x) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
+
+
 def signer_problems(cfg) -> list:
-    """What is wrong with the signing part of a bridge config (`signing_key`, `signer`)."""
+    """What is wrong with the signing part of a bridge config (`signing_key`, `signer`). Files are not looked at here
+    (signer_file_problems)."""
     s = _signer_cfg(cfg)
     kind = s.get("type") or "key"
     if kind not in SIGNER_TYPES:
         return ["signer.type must be one of %s, not %s" % (SIGNER_TYPES, kind)]
     if kind == "key":
-        return [] if (s.get("key") or cfg.get("signing_key")) else ["signing_key is required (or a signer of type "
-                                                                    "spool)"]
+        key = s.get("key") or cfg.get("signing_key")
+        if not key:
+            return ["signing_key is required (or a signer of type spool)"]
+        return [] if isinstance(key, str) else ["signing_key must be a path"]
     p = ["signer.%s is required for a spool signer" % k for k in ("spool_dir", "allowed_signers") if not s.get(k)]
+    p += ["signer.%s must be a path" % k for k in ("spool_dir", "allowed_signers") if s.get(k)
+          and not isinstance(s[k], str)]
+    p += ["signer.%s must be a number of seconds > 0, not %r" % (k, s[k]) for k in ("timeout", "poll")
+          if k in s and not _seconds(s[k])]
+    if p:
+        return p
     if s.get("spool_dir") and cfg.get("spool_dir") and \
             os.path.realpath(s["spool_dir"]) == os.path.realpath(cfg["spool_dir"]):
         p.append("signer.spool_dir must not be the runner's spool_dir (runnerd reads its requests/)")
     return p
+
+
+def signer_file_problems(cfg) -> list:
+    """Files a bridge config's signer needs that are not there: a spool signer's allowed_signers (without it every
+    signature the service returns would look forged, and be taken for a refusal)."""
+    s = _signer_cfg(cfg)
+    if (s.get("type") or "key") == "spool" and isinstance(s.get("allowed_signers"), str) and s["allowed_signers"] \
+            and not os.path.isfile(s["allowed_signers"]):
+        return ["signer.allowed_signers %s does not exist (the signing service's public key, as an ssh "
+                "allowed_signers file)" % s["allowed_signers"]]
+    return []
 
 
 def signer_from_config(cfg):

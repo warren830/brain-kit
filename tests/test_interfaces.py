@@ -20,8 +20,9 @@ from tests.helpers import keypair, tmpdir  # noqa: E402
 
 HANDOFF_FIELDS = {"schema", "kind", "run_id", "project", "mr_iid", "sha", "branch", "owner", "key", "intent",
                   "brain_commit", "materials", "route", "issued_at", "expires_at", "issuer", "voucher_id"}
+# question_note (added after c9e59d1): the id of the question note the answer is bound to (check_answer counts only it)
 ANSWER_FIELDS = {"schema", "kind", "decision", "run_id", "project", "mr_iid", "sha", "park_hash", "decision_kind",
-                 "choice", "answerer", "issued_at", "issuer", "voucher_id"}
+                 "choice", "answerer", "issued_at", "issuer", "voucher_id", "question_note"}
 
 
 def fixture(test):

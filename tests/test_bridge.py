@@ -112,8 +112,10 @@ class BridgeTest(unittest.TestCase):
             return (200, p.stdout) if p.returncode == 0 else (404, {"message": "404"})
 
         def commit(m, qy, body):
-            ok = subprocess.run(["git", "-C", self.origin, "cat-file", "-e", m.group(1) + "^{commit}"]).returncode == 0
-            return (200, {"id": m.group(1)}) if ok else (404, {})
+            p = subprocess.run(["git", "-C", self.origin, "rev-list", "--parents", "-n", "1", m.group(1) + "^{commit}"],
+                               capture_output=True, text=True)
+            ids = p.stdout.split()
+            return (200, {"id": ids[0], "parent_ids": ids[1:]}) if p.returncode == 0 and ids else (404, {})
 
         def mrs(m, qy, body):
             label = qy.get("labels")

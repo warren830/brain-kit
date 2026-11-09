@@ -65,7 +65,15 @@ class HandoverIsTheLabelledCommit(unittest.TestCase):
         # what an outside signer calls (no label event passed in) finds the same
         probs, _ = t.bridge.verify(tb.P, t.bridge.kit(tb.P), t.mrs[5])
         self.assertTrue(any("was pushed" in p for p in probs), probs)
-        # alice looks at the MR and labels again: now she hands over that commit
+        # alice looks at the MR and labels again: that commit is still not the hand-over commit (it does not write
+        # run.json), so a label alone does not hand it over (S1)
+        t.events[5].append(t.ev("alice", "add"))
+        t.rejected_with("not the hand-over commit")
+        # she keeps it and runs `brain handoff` again: a hand-over commit on top, labelled after its push
+        h2 = t.push("runs/PAY-1/run.json", json.dumps(t.run_json(handoff={
+            "requested_at": "2026-11-09T02:00:00Z", "by": "alice", "local_head": pushed})))
+        t.mrs[5]["sha"] = h2
+        t.versions[5] = [{"id": 3, "head_commit_sha": h2, "created_at": tb.tick()}] + t.versions[5]
         t.events[5].append(t.ev("alice", "add"))
         self.assertEqual(t.bridge.process(tb.P, t.bridge.kit(tb.P), t.mrs[5]), "accepted", t.notes())
 

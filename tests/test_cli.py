@@ -13,6 +13,38 @@ from brainkit.common import load_json, write_json  # noqa: E402
 from tests.helpers import LEAN_SRC, commit_file, git_repo, keypair, sh, tmpdir  # noqa: E402
 
 
+FAKE_KIRO_CLI = """#!/bin/sh
+case "$1" in
+  --version) echo "kiro-cli 0.0.0-fake"; exit 0 ;;
+esac
+echo "fake kiro-cli: $* is not faked" >&2
+exit 1
+"""
+FAKE_KIROCREW = """#!/bin/sh
+case "$*" in
+  --version) echo "kirocrew 0.0.0-fake"; exit 0 ;;
+  "config get agent.acp_backend") echo "kas"; exit 0 ;;
+esac
+echo "fake kirocrew: $* is not faked" >&2
+exit 1
+"""
+
+
+def fake_tools(test):
+    """kiro-cli and kirocrew stand-ins first on PATH: doctor's results do not depend on this machine, and nothing
+    reaches a live KiroCrew."""
+    d = tmpdir(test)
+    for name, text in (("kiro-cli", FAKE_KIRO_CLI), ("kirocrew", FAKE_KIROCREW)):
+        p = os.path.join(d, name)
+        with open(p, "w") as f:
+            f.write(text)
+        os.chmod(p, 0o755)
+    old = os.environ.get("PATH", "")
+    os.environ["PATH"] = d + os.pathsep + old
+    test.addCleanup(os.environ.__setitem__, "PATH", old)
+    return d
+
+
 def brain(repo, *args):
     out, err = io.StringIO(), io.StringIO()
     cwd = os.getcwd()
@@ -34,6 +66,7 @@ class LocalFlow(unittest.TestCase):
         old_home = os.environ.get("HOME")
         os.environ["HOME"] = tmpdir(self)          # never read the developer's ~/.kiro, ~/.brain
         self.addCleanup(os.environ.__setitem__, "HOME", old_home)
+        fake_tools(self)                           # never run the developer's kiro-cli / kirocrew
         self.repo = git_repo(os.path.join(tmpdir(self), "proj"))
         commit_file(self.repo, "src/app.py", "print('hi')\n", "init")
         rc, out = brain(self.repo, "install", self.repo, "--lean", LEAN_SRC, "--team", "pay", "--prefix", "PAY")
@@ -47,8 +80,25 @@ class LocalFlow(unittest.TestCase):
         # fresh repo: Lean's hooks have not run in Kiro yet -> a warning, not a failure
         self.assertRegex(out, r"(OK|WARN) +AI-DLC Lean doctor")
         self.assertIn("forbidden tools: none", out)
+        self.assertIn("OK   kiro-cli kiro-cli 0.0.0-fake (not pinned)", out)      # the stand-ins, not this machine's
+        self.assertIn("OK   KiroCrew engine: kas", out)
         self.assertNotIn("FAIL", out)
         self.assertEqual(rc, 0)
+
+    def test_doctor_checks_the_crew_agent(self):
+        """With KiroCrew there, doctor looks at brain-dev.json: Lean's PreToolUse guard must see every tool."""
+        p = cli.crew_agent_path()
+        spec = load_json(cli.CREW_AGENT_SRC)
+        write_json(p, spec)
+        rc, out = brain(self.repo, "doctor", "--offline")
+        self.assertIn("OK   KiroCrew brain-dev carries Lean's 3 hooks", out)
+        spec["hooks"]["preToolUse"][0]["matcher"] = "read"
+        write_json(p, spec)
+        rc, out = brain(self.repo, "doctor", "--offline")
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL KiroCrew brain-dev.json lacks Lean's preToolUse hook(s)", out)
+        self.assertEqual(brain(self.repo, "crew-agent", "--force")[0], 0)
+        self.assertNotIn("FAIL", brain(self.repo, "doctor", "--offline")[1])
 
     def test_doctor_catches_wrong_model(self):
         p = os.path.join(self.repo, ".kiro", "agents", "brain-dev.md")

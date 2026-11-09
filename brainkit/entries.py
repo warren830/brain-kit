@@ -20,13 +20,12 @@ Archives only grow. People and AI never hand-edit them; these functions do.
 """
 from __future__ import annotations
 
-import datetime
 import hashlib
 import os
 import re
 import subprocess
 
-from .common import BrainError
+from .common import BrainError, utcnow
 
 FILES = {
     "PRODUCT": {"letter": "P", "side": "product", "types": ("principle", "decision", "model", "correction")},
@@ -69,7 +68,8 @@ ALLOWED_NAMES = MAIN_NAMES + ARCHIVE_NAMES + (PURGED_FILE,)
 
 
 def today() -> str:
-    return datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    """The UTC date (common.utcnow is timezone-aware: no deprecated naive utcnow)."""
+    return utcnow().strftime("%Y-%m-%d")
 
 
 def norm(text) -> str:

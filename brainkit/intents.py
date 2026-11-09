@@ -249,6 +249,15 @@ def _whoami(repo, cfg) -> str:
     return _me(repo, cfg)
 
 
+def key_problem(key, prefix):
+    """A key given by hand must be a requirement key every other command takes (JIRA_RE) with this repo's prefix:
+    <prefix>-<n>, n from 1, no leading zero, at most 7 digits."""
+    key = str(key)
+    if not JIRA_RE.match(key) or not key.startswith(prefix + "-"):
+        raise BrainError("%r is not a requirement key for this repo: %s-<n>, n from 1 without leading zeros, at most "
+                         "7 digits (req_prefix %s)" % (key, prefix, prefix))
+
+
 def add(repo, cfg, source, title, body, acs=None, refs=None, key=None, owner=None, extra=None) -> dict:
     """File an intent: claim a key with the intent fields. Returns the claim document plus "duplicate" (True when
     the same source, title and body were filed before: that claim is returned, nothing new is claimed) and
@@ -267,8 +276,8 @@ def add(repo, cfg, source, title, body, acs=None, refs=None, key=None, owner=Non
     owner = owner or _whoami(repo, cfg)
     if owner in cfg.get("bot_users", []):
         raise BrainError("%s is a bot account: bot accounts may not claim requirements" % owner)
-    if key and not str(key).startswith(cfg["req_prefix"] + "-"):
-        raise BrainError("keys in this repo start with %s- (req_prefix)" % cfg["req_prefix"])
+    if key:
+        key_problem(key, cfg["req_prefix"])
     h = digest(source, title, body)
     first = find(repo, h)
     if first:

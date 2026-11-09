@@ -73,8 +73,12 @@ class Eval(unittest.TestCase):
 
     def test_funnel(self):
         f = self.data["funnel"]
-        self.assertEqual(f["counts"], {"brain": 3, "check": 1, "agent": 2, "person": 8, "unknown": 1})
+        self.assertEqual(f["counts"], {"brain": 3, "check": 1, "agent": 2, "person": 6, "unknown": 1,
+                                       "unclassified": 2})
         self.assertEqual(f["total"], 15)
+        # Who "product" and "张三" are not the runner's vocabulary: listed where they are, never guessed or shown
+        self.assertEqual([(x["key"], x["id"]) for x in f["unclassified"]], [("PAY-2", "D-2"), ("PAY-2", "D-5")])
+        self.assertNotIn("张三", EV.report(self.data))
         self.assertEqual(sum(sum(v.values()) for v in f["weeks"].values()), 15)
         self.assertEqual(list(f["weeks"]), ["2026-W44", "2026-W45"])
         self.assertEqual(f["oracle_answers_excluded"], 1)
@@ -94,15 +98,18 @@ class Eval(unittest.TestCase):
         self.assertEqual(d["completed"], ["PAY-4"])
         self.assertEqual((d["delivery"]["value"], d["autonomy"]["value"], d["judgment"]["value"]),
                          ([1, 1], [1, 1], [3, 3]))
-        self.assertEqual(d["funnel"]["counts"], {"brain": 2, "check": 0, "agent": 1, "person": 2, "unknown": 0})
+        self.assertEqual(d["funnel"]["counts"], {"brain": 2, "check": 0, "agent": 1, "person": 2, "unknown": 0,
+                                                 "unclassified": 0})
         self.assertEqual(d["staleness"]["archived"], [])
         with self.assertRaises(BrainError):
             self.collect(since="last week")
 
     def test_pending_window_and_given_traces(self):
         d = self.collect(as_of="2026-11-10T00:00:00Z")
-        self.assertEqual((d["delivery"]["value"], d["delivery"]["pending"]), ([0, 1], ["PAY-4"]))
-        self.assertEqual(d["autonomy"]["value"], [0, 1])
+        # PAY-2 is already known wrong, but its 14 days are not over: it waits like PAY-4 does (N11)
+        self.assertEqual((d["delivery"]["value"], d["delivery"]["pending"], d["delivery"]["wrong_open"]),
+                         ([0, 0], ["PAY-4"], ["PAY-2"]))
+        self.assertEqual(d["autonomy"]["value"], [0, 0])
         ts = copy.deepcopy(self.data["traces"])
         t4 = next(t for t in ts if t["key"] == "PAY-4")
         t4["outcome"]["handed_over"]["value"] = False
@@ -122,7 +129,8 @@ class Eval(unittest.TestCase):
         rej = gs[0]
         self.assertIn(self.w.runs["bad"].v[3], rej["refs"])
         self.assertIn("被驳回", rej["title"])
-        self.assertIn("P-PAY-1-1 重复了 2 次", gs[2]["title"])
+        self.assertEqual(gs[2]["title"], "P-PAY-1-1 一再重复：改成 gate")          # no count in the title (N8)
+        self.assertIn("回来 2 次", gs[2]["body"])
         withdraw = [g["refs"][0] for g in gs if "撤回候选" in g["title"]]
         self.assertEqual(withdraw, ["P-PAY-1-1", "P-PAY-1-2", "P-PAY-1-3", "T-PAY-1-2"])
         self.assertEqual(len({g["id"] for g in gs}), len(gs))

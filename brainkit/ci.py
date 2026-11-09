@@ -140,6 +140,25 @@ def _blob(repo, rev, path):
     return p.stdout if p.returncode == 0 else None
 
 
+def changed_paths(repo, *revs, paths=()) -> list:
+    """Every path `git diff <revs>` changes, each as it is: no rename detection (a file moved out of a risk path is
+    a change of both its names) and NUL-separated (no C-quoting of odd names, nothing stripped)."""
+    cmd = ["git", "-C", repo, "diff", "--no-renames", "--no-ext-diff", "-z", "--name-only"] + list(revs)
+    if paths:
+        cmd += ["--"] + list(paths)
+    p = subprocess.run(cmd, capture_output=True)
+    if p.returncode != 0:
+        raise BrainError("git diff %s failed: %s" % (" ".join(revs), p.stderr.decode("utf-8", "replace").strip()))
+    return [x for x in p.stdout.decode("utf-8", "surrogateescape").split("\0") if x]
+
+
+def lean_hashes(data) -> set:
+    """sha256 hex of a file as Lean may have hashed it. Lean hashes the checked-out file; git stores the blob, which
+    may differ only in line ends (`eol=crlf` attributes, core.autocrlf): the blob, its LF form and its CRLF form."""
+    lf = data.replace(b"\r\n", b"\n")
+    return {hashlib.sha256(x).hexdigest() for x in (data, lf, lf.replace(b"\n", b"\r\n"))}
+
+
 def design_approval_covers(repo, voucher, design_path, risky) -> str:
     """'' when this DESIGN approval still covers the MR, else why not (see check_route)."""
     h = str(voucher.get("lean_request", "")).split(" ", 1)[-1].strip().lower()
@@ -147,14 +166,43 @@ def design_approval_covers(repo, voucher, design_path, risky) -> str:
     if not re.match(r"^[0-9a-f]{6,64}$", h) or not re.match(r"^[0-9a-f]{40}$", at):
         return "%s: not a DESIGN <hash> approval at a commit" % voucher.get("voucher_id", "?")
     now, then = _blob(repo, "HEAD", design_path), _blob(repo, at, design_path)
-    if now is not None and now == then and hashlib.sha256(now).hexdigest().startswith(h):
+    if now is not None and now == then and any(x.startswith(h) for x in lean_hashes(now)):
         return ""                                                  # a. the design is the file that was approved
-    after = git_out(repo, "-c", "core.quotepath=false", "diff", "--no-renames", "--name-only", at, "HEAD").splitlines()
+    after = changed_paths(repo, at, "HEAD")
     moved = sorted(set(after) & set(risky))
     if not moved:
         return ""                                                  # b. the risky code was all there when approved
     return ("%s approved DESIGN %s at %s; since then application-design.md is not that file and risk paths changed "
             "(%s)" % (voucher.get("voucher_id", "?"), h[:8], at[:12], ", ".join(moved[:5])))
+
+
+def _design_hash(v) -> str:
+    """The design a DESIGN answer is about: the first 8 hex digits Lean names (`lean request DESIGN` prints 8)."""
+    lr = str(v.get("lean_request", ""))
+    return lr[len("DESIGN "):].strip().lower()[:8] if lr.startswith("DESIGN ") else ""
+
+
+def _decision_number(v) -> int:
+    m = re.match(r"^D-([0-9]+)$", str(v.get("decision", "")))
+    return int(m.group(1)) if m else 0
+
+
+def latest_design_answers(repo, vouchers) -> list:
+    """The newest signed DESIGN answer for each design hash. Newest: asked at a later commit in this branch's history
+    (more commits behind it: a descendant always has more), then issued later, then the higher decision number."""
+    depth, best = {}, {}
+    for v in vouchers:
+        h = _design_hash(v)
+        if v.get("kind") != "answer" or not re.match(r"^[0-9a-f]{6,8}$", h):
+            continue
+        at = str(v.get("sha", ""))
+        if at not in depth:
+            p = git(repo, "rev-list", "--count", at, check=False) if re.match(r"^[0-9a-f]{40}$", at) else None
+            depth[at] = int(p.stdout.strip()) if p is not None and p.returncode == 0 else -1
+        key = (depth[at], str(v.get("issued_at", "")), _decision_number(v))
+        if h not in best or key > best[h][0]:
+            best[h] = (key, v)
+    return [v for _, v in best.values()]
 
 
 def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
@@ -166,7 +214,9 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
     An approval covers the design as it was approved, not what came after. The voucher names it twice: `sha`, the
     MR head the question was asked at (the file the approver could read), and the hash in lean_request, Lean's hash
     of application-design.md (`lean request DESIGN` prints the first 8 hex digits of the file's sha256; an approval
-    line matches when the file's sha256 starts with them). One approval is enough when either holds:
+    line matches when the file's sha256 starts with them; Lean hashes the checked-out file, so a CRLF checkout is
+    hashed as such: see lean_hashes). Per design hash the newest signed answer wins: a later rejection of the same
+    design withdraws an earlier approval (and a later approval restores it). One approval is enough when either holds:
       a. application-design.md at HEAD is the approved file: its sha256 starts with the voucher's hash, and its bytes
          equal the file at the voucher's commit (8 hex digits alone can be matched by a crafted file in minutes);
       b. no risk path that this MR changes was changed after the voucher's commit: the risky code was all there when
@@ -180,7 +230,7 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
         return []
     pats = [l.split("#", 1)[0].strip() for l in text.splitlines()]
     pats = [x for x in pats if x]
-    changed = [x for x in git_out(repo, "-c", "core.quotepath=false", "diff", "--name-only", base, "HEAD").splitlines()]
+    changed = changed_paths(repo, base, "HEAD")
     risky = sorted({f for f in changed if any(glob_match(f, x) for x in pats)})
     if not risky:
         return []
@@ -193,8 +243,7 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
     if skipped or not designed:
         return ["risk paths changed (%s) but application design was %s: this change needs the design stage"
                 % (shown, "skipped" if skipped else "not written")]
-    approvals = [v for v in vouchers if v.get("kind") == "answer" and v.get("choice") == "approve"
-                 and str(v.get("lean_request", "")).startswith("DESIGN ")]
+    approvals = [v for v in latest_design_answers(repo, vouchers) if v.get("choice") == "approve"]
     if not approvals:
         return ["risk paths changed (%s): no design approval signed by the bridge for %s (ask through the MR: "
                 "park.json with lean_request DESIGN ...)" % (shown, rec["key"])]
@@ -235,9 +284,7 @@ def check_run(repo, branch, env) -> list:
              if l.startswith("120000 ")]
     if links:
         probs.append("symlinks in the Brain (%s): the Brain must be real files" % ", ".join(links[:5]))
-    touched = git_out(repo, "-c", "core.quotePath=false", "diff", "--no-renames", "--name-only", "%s..HEAD" % base,
-                      "--", cfg["brain_dir"], "AGENTS.md").split("\n")
-    touched = [t for t in touched if t]
+    touched = changed_paths(repo, "%s..HEAD" % base, paths=(cfg["brain_dir"], "AGENTS.md"))
     if touched:
         probs.append("a run branch changed the Brain (%s): write brain-proposal blocks in decisions.md instead; "
                      "`brain reflect` turns them into a Brain MR for the file owners" % ", ".join(touched[:5]))

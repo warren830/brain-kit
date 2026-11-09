@@ -33,10 +33,36 @@ def _intents_add():
     return add if callable(add) else None
 
 
-def file_gaps(repo, cfg, gs, add, out=print) -> int:
+def _intents_filed(repo):
+    """The eval-gap intents filed so far (brainkit.intents.scan), or None when that module is not there."""
+    try:
+        from .. import intents
+        docs, _ = intents.scan(repo)
+    except Exception:  # noqa: BLE001  not installed, or broken: intents.add still dedupes what it can
+        return None
+    return [d for d in docs if isinstance(d, dict) and d.get("source") == "eval-gap"]
+
+
+def _title(t) -> str:
+    return " ".join(str(t or "").split())
+
+
+def file_gaps(repo, cfg, gs, add, out=print, existing=None) -> int:
+    """File each gap with intents.add (source eval-gap). `existing`: the eval-gap intents filed before. A gap's title
+    is its identity (kind + subject, no counts; evaluate._gap): one already filed under that title is reported as
+    "already filed" and not filed again, although its body (the counts) changed since. intents.add itself dedupes on
+    source + title + body only."""
+    filed = {}
+    for d in sorted(existing or [], key=lambda d: (str(d.get("created_at", "")), str(d.get("key", "")))):
+        if not (isinstance(d.get("closed"), dict) and d["closed"].get("duplicate_of")):
+            filed.setdefault(_title(d.get("title")), d)
     params = inspect.signature(add).parameters
     bad = 0
     for g in gs:
+        prior = filed.get(_title(g["title"]))
+        if prior:
+            out("already filed %s: %s" % (prior.get("key", "?"), g["title"]))
+            continue
         kw = {"acs": g["acs"], "refs": g["refs"], "key": None}   # key = the new intent's key: let it claim the next
         if "extra" in params:
             kw["extra"] = dict({"gap_kind": GAP_KIND[g["kind"]]}, **({"found_in": g["key"]} if g["key"] else {}))
@@ -46,6 +72,7 @@ def file_gaps(repo, cfg, gs, add, out=print) -> int:
             bad += 1
             out("not filed %s: %s" % (g["id"], e))
             continue
+        filed.setdefault(_title(g["title"]), doc or {})
         out("%s %s: %s" % ("already filed" if (doc or {}).get("duplicate") else "filed", (doc or {}).get("key", "?"),
                            g["title"]))
     return bad
@@ -65,7 +92,7 @@ def cmd_eval(a):
             if add is None:
                 print("brainkit.intents is not available: printing the gaps instead of filing them.")
             else:
-                return 1 if file_gaps(repo, cfg, gs, add) else 0
+                return 1 if file_gaps(repo, cfg, gs, add, existing=_intents_filed(repo)) else 0
         if not gs:
             print("没有要记的缺口。")
         for g in gs:

@@ -9,10 +9,14 @@ import json
 import os
 import sqlite3
 import threading
+from datetime import timedelta
 
-from ..common import iso, utcnow
+from ..common import BrainError, iso, utcnow
 
 OPEN_RUN_STATES = ("spooled", "ready", "dispatched", "send_unknown")
+# A run id taken for a hand-over whose contract is being signed (reserve_run): the requirement counts as having an
+# open run, so a second hand-over of it is refused while the first one is signed.
+RESERVED = "signing"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS handoffs (
@@ -26,7 +30,11 @@ CREATE TABLE IF NOT EXISTS runs (
   owner TEXT, voucher TEXT, last_sha TEXT,
   created TEXT NOT NULL, updated TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS runs_req ON runs(req);
+CREATE TABLE IF NOT EXISTS pending_vouchers (
+  ref TEXT PRIMARY KEY, voucher TEXT NOT NULL, created TEXT NOT NULL);
 """
+# pending_vouchers: the voucher last sent to a signer that did not answer in time, by what it is for (a hand-over
+# check, a decision). The next round asks for that same voucher, so a late signature is used, not left over.
 
 
 class _Rows:
@@ -119,15 +127,90 @@ class Ledger:
         return "RUN-%s-%d" % (req, n + 1)
 
     def open_run_for(self, req):
-        q = "SELECT * FROM runs WHERE req=? AND state IN (%s)" % ",".join("?" * len(OPEN_RUN_STATES))
-        return self.db.execute(q, (req,) + OPEN_RUN_STATES).fetchone()
+        """An open run of `req` (a reservation counts), or None."""
+        states = OPEN_RUN_STATES + (RESERVED,)
+        q = "SELECT * FROM runs WHERE req=? AND state IN (%s)" % ",".join("?" * len(states))
+        return self.db.execute(q, (req,) + states).fetchone()
+
+    @staticmethod
+    def is_reservation_for(row, project, iid, sha) -> bool:
+        """Is this open-run row the reservation of the hand-over (project, MR, head) being signed right now?"""
+        return row["state"] == RESERVED and (row["project"], int(row["iid"]), row["sha"]) == (project, int(iid), sha)
+
+    def reserve_run(self, req, project, iid, sha, stale_after=900):
+        """Take the next run id of `req` for this hand-over, as one step: None when `req` has an open run already.
+        A reservation older than `stale_after` seconds was left by a bridge that stopped while signing: dropped."""
+        now = utcnow()
+        with self.lock:
+            try:
+                self.db.execute("BEGIN IMMEDIATE")      # one step for other processes on this ledger file, too
+            except sqlite3.Error as e:
+                raise BrainError("ledger: could not reserve a run for %s: %s" % (req, e))
+            try:
+                self.db.execute("DELETE FROM runs WHERE req=? AND state=? AND updated<?",
+                                (req, RESERVED, iso(now - timedelta(seconds=stale_after))))
+                run_id = None
+                if self.open_run_for(req) is None:
+                    run_id = self.next_run_id(req)
+                    self.db.execute("INSERT INTO runs(run_id,project,req,iid,sha,voucher_id,state,created,updated) "
+                                    "VALUES (?,?,?,?,?,?,?,?,?)", (run_id, project, req, iid, sha, "", RESERVED,
+                                                                   iso(now), iso(now)))
+                self.db.execute("COMMIT")
+                return run_id
+            except BaseException as e:
+                try:
+                    self.db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                if isinstance(e, sqlite3.Error):
+                    raise BrainError("ledger: could not reserve a run for %s: %s" % (req, e))
+                raise
+
+    def release_run(self, run_id):
+        """Give a reserved run id back (its contract was not signed)."""
+        self.db.execute("DELETE FROM runs WHERE run_id=? AND state=?", (run_id, RESERVED))
 
     def add_run(self, run_id, project, req, iid, sha, voucher_id, paths=(), owner="", voucher=None):
+        """Record the run as 'spooled': its reservation (reserve_run) when there is one, else a new row."""
         now = iso(utcnow())
-        self.db.execute("INSERT INTO runs(run_id,project,req,iid,sha,voucher_id,state,paths,owner,voucher,created,"
-                        "updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (run_id, project, req, iid, sha, voucher_id, "spooled", json.dumps(list(paths)), owner,
-                         json.dumps(voucher or {}, ensure_ascii=False), now, now))
+        vals = (project, req, iid, sha, voucher_id, "spooled", json.dumps(list(paths)), owner,
+                json.dumps(voucher or {}, ensure_ascii=False))
+        try:
+            with self.lock:
+                if self.db.execute("UPDATE runs SET project=?,req=?,iid=?,sha=?,voucher_id=?,state=?,paths=?,owner=?,"
+                                   "voucher=?,updated=? WHERE run_id=? AND state=?",
+                                   vals + (now, run_id, RESERVED)).rowcount:
+                    return
+                self.db.execute("INSERT INTO runs(project,req,iid,sha,voucher_id,state,paths,owner,voucher,run_id,"
+                                "created,updated) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", vals + (run_id, now, now))
+        except sqlite3.IntegrityError as e:
+            raise BrainError("ledger: run %s is already recorded: %s" % (run_id, e))
+
+    # vouchers a signer has not answered for yet
+    def pending_voucher(self, ref, newer_than=3600):
+        """The voucher last asked for under `ref` within `newer_than` seconds, or None."""
+        row = self.db.execute("SELECT voucher, created FROM pending_vouchers WHERE ref=?", (ref,)).fetchone()
+        if row is None or row["created"] < iso(utcnow() - timedelta(seconds=newer_than)):
+            return None
+        try:
+            v = json.loads(row["voucher"])
+        except ValueError:
+            return None
+        return v if isinstance(v, dict) else None
+
+    def set_pending_voucher(self, ref, voucher):
+        now = utcnow()
+        with self.lock:
+            self.db.execute("DELETE FROM pending_vouchers WHERE created<?", (iso(now - timedelta(days=7)),))
+            old = self.db.execute("SELECT voucher FROM pending_vouchers WHERE ref=?", (ref,)).fetchone()
+            text = json.dumps(voucher, ensure_ascii=False, sort_keys=True)
+            if old is not None and old["voucher"] == text:
+                return                                  # the same request again: it keeps its age
+            self.db.execute("INSERT OR REPLACE INTO pending_vouchers(ref, voucher, created) VALUES (?,?,?)",
+                            (ref, text, iso(now)))
+
+    def drop_pending_voucher(self, ref):
+        self.db.execute("DELETE FROM pending_vouchers WHERE ref=?", (ref,))
 
     def set_run(self, run_id, frm, to, **fields) -> bool:
         sets = ", ".join(["state=?", "updated=?"] + ["%s=?" % k for k in fields])

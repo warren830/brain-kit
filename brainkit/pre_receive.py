@@ -61,7 +61,8 @@ def new_commits(old, new, default_branch, cwd=None) -> list:
 
 
 def _names(args, cwd):
-    p = _git("diff-tree", "-z", "--no-commit-id", "--name-only", *args, cwd=cwd)
+    # plumbing: no rename detection unless asked (diff.renames is not read); said anyway, a rename is two paths
+    p = _git("diff-tree", "-z", "--no-renames", "--no-commit-id", "--name-only", *args, cwd=cwd)
     if p.returncode != 0:
         raise RuntimeError("diff-tree failed: " + p.stderr.strip())
     return {x for x in p.stdout.split("\0") if x}
