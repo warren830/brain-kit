@@ -31,11 +31,12 @@ def branch(repo):
 
 
 def edit_status(repo, intent, status="Status: Construction app: step 1 of 3 done"):
+    """Fill in the hand-over note: Status and the first Next item (the template's are not a note)."""
     st = lean.state_path(repo, intent)
     with open(st, encoding="utf-8") as f:
         text = f.read()
     with open(st, "w", encoding="utf-8") as f:
-        f.write(text.replace(lean.TEMPLATE_STATUS, status))
+        f.write(text.replace(lean.TEMPLATE_STATUS, status).replace(lean.TEMPLATE_NEXT[0], "Write step 2 of 3"))
     sh("git", "-C", repo, "commit", "-q", "-am", "work")
 
 
@@ -402,6 +403,40 @@ class R1_27_NoPushSaysMaterialsAreNotPublished(Project):
         rc, out = brain(self.repo, "handoff", "--no-push")
         self.assertEqual(rc, 0, out)
         self.assertIn("Push ai/alice/PAY-1-refund and add label 'ai-handoff' to its MR", out)
+
+
+class R1_28_TemplateNext(Project):
+    def test_r1_28_template_next_is_not_a_hand_over_note(self):
+        rc, out = brain(self.repo, "start", "refund", "--key", "PAY-1")
+        self.assertEqual(rc, 0, out)
+        st = lean.state_path(self.repo, load_json(os.path.join(self.repo, "runs", "PAY-1", "run.json"))["intent"])
+        with open(st, encoding="utf-8") as f:
+            text = f.read()
+        with open(st, "w", encoding="utf-8") as f:
+            f.write(text.replace(lean.TEMPLATE_STATUS, "Status: Construction: done"))       # Status only
+        sh("git", "-C", self.repo, "commit", "-q", "-am", "status only")
+        with open(st, encoding="utf-8") as f:
+            probs = lean.handover_text_problems(f.read())
+        self.assertEqual(probs, ["Session notes' '### Next' is still Lean's template: write what the next session "
+                                 "does"])
+        rc, out = brain(self.repo, "handoff", "--no-push")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("is still Lean's template", out)
+        edit_status(self.repo, load_json(os.path.join(self.repo, "runs", "PAY-1", "run.json"))["intent"])
+        self.assertEqual(brain(self.repo, "handoff", "--no-push")[0], 0)
+
+    def test_r1_28_template_next_is_lean_s_own(self):
+        """TEMPLATE_NEXT is what the Lean brain-kit ships writes (its template, and `new --ideation`)."""
+        with open(os.path.join(LEAN_SRC, "kit", ".kiro", "aidlc-lean", "templates", "aidlc-state.md"),
+                  encoding="utf-8") as f:
+            self.assertEqual(lean.next_steps(f.read()), list(lean.TEMPLATE_NEXT[:2]))
+        rc, out = brain(self.repo, "start", "refund", "--key", "PAY-1")
+        lean.call(self.repo, "new", "idea", "--ideation")
+        idea = [d for d in os.listdir(os.path.join(self.repo, lean.DOCS)) if d.endswith("-idea")][0]
+        with open(lean.state_path(self.repo, idea), encoding="utf-8") as f:
+            self.assertEqual(lean.next_steps(f.read()), list(lean.TEMPLATE_NEXT[2:]))
+        self.assertEqual(lean.handover_text_problems("Status: x\n### Next\n1. %s\n2. own step\n"
+                                                     % lean.TEMPLATE_NEXT[1]), [])
 
 
 if __name__ == "__main__":

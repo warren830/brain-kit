@@ -73,7 +73,8 @@ def ready_to_hand_over(repo):
     with open(state, encoding="utf-8") as f:
         text = f.read()
     with open(state, "w", encoding="utf-8") as f:
-        f.write(text.replace(lean.TEMPLATE_STATUS, "Status: Construction app: step 1 of 3 done"))
+        f.write(text.replace(lean.TEMPLATE_STATUS, "Status: Construction app: step 1 of 3 done")
+                .replace(lean.TEMPLATE_NEXT[0], "Write step 2 of 3"))
     tm.commit_all(repo, "work")
     return rec
 

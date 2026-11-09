@@ -18,6 +18,19 @@ SCRIPT = os.path.join(".kiro", "aidlc-lean", "aidlc_lean.py")
 DOCS = "aidlc-docs"
 CONFIG = DOCS + "/lean.json"
 TEMPLATE_STATUS = "Status: Inception: starting"
+# The '### Next' items a new intent's aidlc-state.md starts with: Lean's templates/aidlc-state.md (the same since
+# 0.2.0) and, for `lean new --ideation`, IDEATION_NEXT in aidlc_lean.py. A note whose Next items are all still
+# these has not been filled in.
+TEMPLATE_NEXT = (
+    "Read the code the change touches. Brownfield: `lean stage start reverse-engineering`; greenfield: "
+    "`lean stage skip reverse-engineering --reason \"greenfield\"`.",
+    "Ask the clarifying questions in one batch, then fill in inception/requirements/requirements.md "
+    "(skill aidlc-lean-inception).",
+    "Fill in ideation/intent-capture/intent-statement.md with the product owner (skill aidlc-lean-ideation), then "
+    "`lean stage done intent-capture --note ...`.",
+    "Scope Definition and Approval Handoff are required, the other Ideation stages optional; then `lean request "
+    "IDEATION` and wait for the approval before Inception.",
+)
 # Lean's DEFAULT_CONFIG fingerprint_exclude (aidlc_lean.py). A lean.json that sets the key replaces this list.
 DEFAULT_FINGERPRINT_EXCLUDE = (DOCS + "/**", ".kiro/**")
 
@@ -162,6 +175,16 @@ def handover_text_problems(text: str, team=None) -> list:
     probs = []
     if TEMPLATE_STATUS in text:
         probs.append("Session notes still say '%s': update Status" % TEMPLATE_STATUS)
-    if not next_steps(text):
+    steps = next_steps(text)
+    if not steps:
         probs.append("Session notes have no '### Next' items")
+    elif all(_same_text(s) in _TEMPLATE_NEXT for s in steps):
+        probs.append("Session notes' '### Next' is still Lean's template: write what the next session does")
     return probs
+
+
+def _same_text(s) -> str:
+    return " ".join(str(s).split())
+
+
+_TEMPLATE_NEXT = frozenset(_same_text(s) for s in TEMPLATE_NEXT)

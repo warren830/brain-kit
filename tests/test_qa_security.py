@@ -217,7 +217,8 @@ class HandoffLabelsWhatItPushed(unittest.TestCase):
         with open(state) as f:
             text = f.read()
         with open(state, "w") as f:
-            f.write(text.replace(lean.TEMPLATE_STATUS, "Status: Construction app: step 1 of 3 done"))
+            f.write(text.replace(lean.TEMPLATE_STATUS, "Status: Construction app: step 1 of 3 done")
+                    .replace(lean.TEMPLATE_NEXT[0], "Write step 2 of 3"))
         sh("git", "-C", r, "commit", "-q", "-am", "work")
         self.world = World(self.origin)
         self.fake = self.world.fake()
