@@ -37,7 +37,7 @@ import sys
 import time
 
 from . import __version__, brainlint, claims, config, entries, lean, mrdesc, reflect, runrec, usage
-from .common import (BrainError, JIRA_RE, SLUG_RE, USER_RE, branch_name, git, git_out, iso, load_json,
+from .common import (BrainError, JIRA_RE, SLUG_RE, USER_RE, branch_name, git, git_net, git_out, iso, load_json,
                      parse_branch, repo_root, run, utcnow, write_json)
 from .intake import package as intake
 from .rest import GitLab, HttpError, Jira, jira_user_id, read_token
@@ -224,7 +224,10 @@ def cmd_install(a):
     if not os.path.exists(os.path.join(repo, "AGENTS.md")):
         shutil.copyfile(os.path.join(TEMPLATES, "AGENTS.md"), os.path.join(repo, "AGENTS.md"))
     gi = os.path.join(repo, ".gitignore")
-    have = open(gi, encoding="utf-8").read().splitlines() if os.path.exists(gi) else []
+    have = []
+    if os.path.exists(gi):
+        with open(gi, encoding="utf-8") as f:
+            have = f.read().splitlines()
     with open(gi, "a", encoding="utf-8") as f:
         for line in GITIGNORE_LINES:
             if line not in have:
@@ -694,7 +697,18 @@ def publish_materials(store, rec) -> list:
     if git(store, "diff", "--cached", "--quiet", check=False).returncode != 0:
         git(store, "commit", "-q", "-m", "materials for %s" % rec["key"])
     if git(store, "remote", "get-url", "origin", check=False).returncode == 0:
-        git(store, "push", "-q", "origin", "HEAD")
+        # someone else may have published since this clone last pulled: take theirs first (each package is its own
+        # folder, so a rebase does not meet a conflict), then push; a push that loses a race is tried once more
+        branch = git_out(store, "rev-parse", "--abbrev-ref", "HEAD")
+        for attempt in (1, 2):
+            git_net(store, "pull", "-q", "--rebase", "origin", branch, check=False)    # fails on a first publish
+            gdir = git_out(store, "rev-parse", "--absolute-git-dir")
+            if any(os.path.isdir(os.path.join(gdir, d)) for d in ("rebase-merge", "rebase-apply")):
+                git(store, "rebase", "--abort", check=False)
+                raise BrainError("intake store %s: the materials do not rebase onto origin/%s; sort it out in that "
+                                 "clone and run this again" % (store, branch))
+            if git_net(store, "push", "-q", "origin", "HEAD", check=attempt == 2).returncode == 0:
+                break
     else:
         warn.append("intake store has no origin: packages are committed locally only")
     return warn

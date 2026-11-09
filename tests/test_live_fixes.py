@@ -13,7 +13,7 @@ from brainkit import cli, rest  # noqa: E402
 from brainkit.bridge import handoff  # noqa: E402
 from brainkit.common import BrainError  # noqa: E402
 from tests import test_bridge as tb  # noqa: E402
-from tests.helpers import commit_file, git_repo, sh, tmpdir  # noqa: E402
+from tests.helpers import commit_file, git_repo, no_hooks_config, sh, tmpdir  # noqa: E402
 
 
 class EmptyIdentityIsAPerson(unittest.TestCase):
@@ -159,6 +159,40 @@ class GitLabEditSignalAsMeasured(unittest.TestCase):
         self.assertEqual(d.edit_state(self.note(emoji), {"last_edited_at": emoji, "last_edited_by": "mallory"}), "edited")
         self.assertEqual(d.edit_state(self.note(emoji), {"last_edited_at": emoji, "last_edited_by": "dave"}), "original")
         self.assertEqual(d.edit_state(self.note(emoji), None), "unknown")
+
+
+class PublishPullsFirst(unittest.TestCase):
+    """d4 round 3 (minor): `brain handoff` pushed the intake clone without pulling, so a second person's publish was
+    refused once anyone else had published since their clone last pulled."""
+
+    def clone(self, bare, path):
+        sh("git", "clone", "-q", bare, path)
+        with open(os.path.join(path, ".git", "config"), "a", encoding="utf-8") as f:
+            f.write("[user]\n\tname = t\n\temail = t@example.com\n[commit]\n\tgpgsign = false\n" + no_hooks_config(path))
+        return path
+
+    def package(self, store, name):
+        import json
+        from brainkit.intake import package as intake
+        pdir = os.path.join(store, "packages", name)
+        os.makedirs(pdir)
+        with open(os.path.join(pdir, "manifest.json"), "w", encoding="utf-8") as f:
+            json.dump({"package": name, "segments": []}, f)
+        return {"key": "OMS-%s" % name[-1], "materials": [{"package": name,
+                                                           "manifest_sha256": intake.manifest_digest(pdir)}]}
+
+    def test_a_stale_clone_still_publishes(self):
+        d = tmpdir(self)
+        seed = git_repo(os.path.join(d, "seed"))
+        commit_file(seed, "README.md", "intake\n")
+        bare = os.path.join(d, "intake.git")
+        sh("git", "clone", "-q", "--bare", seed, bare)
+        a, b = self.clone(bare, os.path.join(d, "a")), self.clone(bare, os.path.join(d, "b"))
+        self.assertEqual(cli.publish_materials(a, self.package(a, "PKG-1")), [])
+        self.assertEqual(cli.publish_materials(b, self.package(b, "PKG-2")), [])      # b never pulled a's commit
+        files = sh("git", "--git-dir", bare, "ls-tree", "-r", "--name-only", "main").stdout.split()
+        self.assertIn("packages/PKG-1/manifest.json", files)
+        self.assertIn("packages/PKG-2/manifest.json", files)
 
 
 if __name__ == "__main__":
