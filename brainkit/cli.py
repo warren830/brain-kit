@@ -955,6 +955,22 @@ def _risk_matches(path, pats, prefix=False) -> bool:
     return any(ci.glob_match(c, x) for c in cands for x in pats)
 
 
+def allowed_signers_file() -> str:
+    """The bridge's public key(s) for checking signed vouchers on this machine: $BRAIN_ALLOWED_SIGNERS, else the
+    kit's own deploy/allowed_signers (the file brain-ci pins) once it holds a key. '' when there is neither."""
+    env = os.environ.get("BRAIN_ALLOWED_SIGNERS") or ""
+    if env:
+        return env
+    p = os.path.join(KIT_ROOT, "deploy", "allowed_signers")
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            if any(line.strip() and not line.lstrip().startswith("#") for line in f):
+                return p
+    except OSError:
+        pass
+    return ""
+
+
 def handoff_risk_warnings(repo, cfg, rec) -> list:
     """[] or what the owner (and the hand-over note) must know: this run changes, or plans to change (run.json
     expected_paths), files under gates/risk-paths and no DESIGN approval signed by the bridge covers them yet. brain-ci
@@ -976,7 +992,8 @@ def handoff_risk_warnings(repo, cfg, rec) -> list:
     planned = [p for p in rec.get("expected_paths") or [] if isinstance(p, str) and _risk_matches(p, pats, True)]
     if not changed and not planned:
         return []
-    vdir, signers = default_vouchers(repo), os.environ.get("BRAIN_ALLOWED_SIGNERS") or ""
+    vdir, signers = default_vouchers(repo), allowed_signers_file()
+    unchecked = ""          # why this machine could not tell whether a bridge-signed DESIGN approval covers them
     if changed and vdir and signers and os.path.isfile(signers):
         design = "%s/%s/inception/application-design/application-design.md" % (lean.DOCS, rec["intent"])
         try:
@@ -985,14 +1002,23 @@ def handoff_risk_warnings(repo, cfg, rec) -> list:
             if any(not ci.design_approval_covers(repo, v, design, changed) for v in approvals):
                 return []
         except (BrainError, OSError, ValueError) as e:
-            print("WARN: bridge-signed DESIGN approvals not checked here (%s)" % e)
+            unchecked = str(e)
+    elif changed and vdir:
+        unchecked = ("no bridge public key here: set BRAIN_ALLOWED_SIGNERS to the bridge's allowed_signers file, or "
+                     "put the key in the kit's deploy/allowed_signers" if not signers else
+                     "BRAIN_ALLOWED_SIGNERS=%s is not a file" % signers)
     shown = ", ".join((changed or planned)[:5])
-    out = ["this run %s risk paths (%s; %s) and no DESIGN approval signed by the bridge covers %s yet: brain-ci "
-           "check-run will fail the MR until one does. A DESIGN approved in your own Lean chat does not count. The "
-           "runner asks for it through the bridge (lean request DESIGN, then park.json with lean_request DESIGN) "
-           "before it writes more code." % ("changes" if changed else "plans to change (run.json expected_paths)",
-                                            shown, cfg["risk_paths_file"], "them" if len(changed or planned) > 1
-                                            else "it")]
+    it = "them" if len(changed or planned) > 1 else "it"
+    what = "changes" if changed else "plans to change (run.json expected_paths)"
+    if unchecked:
+        head = ("this run %s risk paths (%s; %s) and whether a DESIGN approval signed by the bridge covers %s was not "
+                "checked here (%s): brain-ci check-run fails the MR unless one does." % (
+                    what, shown, cfg["risk_paths_file"], it, unchecked))
+    else:
+        head = ("this run %s risk paths (%s; %s) and no DESIGN approval signed by the bridge covers %s yet: brain-ci "
+                "check-run will fail the MR until one does." % (what, shown, cfg["risk_paths_file"], it))
+    out = [head + " A DESIGN approved in your own Lean chat does not count. The runner asks for it through the bridge "
+           "(lean request DESIGN, then park.json with lean_request DESIGN) before it writes more code."]
     note = lean.state_path(repo, rec["intent"])
     steps = []
     if os.path.isfile(note):
@@ -1014,7 +1040,7 @@ def handoff_description(repo, cfg, key):
     md = mrdesc.md_path(cfg, key)
     try:
         text = mrdesc.render(mrdesc.build(repo, cfg, key, vouchers_dir=default_vouchers(repo),
-                                          allowed_signers=os.environ.get("BRAIN_ALLOWED_SIGNERS") or None))
+                                          allowed_signers=allowed_signers_file() or None))
         mrdesc.write(repo, cfg, key, text)
         git(repo, "add", "--", md)
         if git(repo, "diff", "--cached", "--quiet", "--", md, check=False).returncode != 0:
@@ -1163,7 +1189,7 @@ def _child_mr(repo, cfg, a, br, b, rec, me):
     try:
         from .commands.trace_cmd import default_vouchers
         desc = mrdesc.render(mrdesc.build(repo, cfg, rec["key"], vouchers_dir=default_vouchers(repo),
-                                          allowed_signers=os.environ.get("BRAIN_ALLOWED_SIGNERS") or None))
+                                          allowed_signers=allowed_signers_file() or None))
         mrdesc.write(repo, cfg, rec["key"], desc)
         git(repo, "add", "--", md)
     except Exception as e:  # noqa: BLE001  the description helps the reviewer; it does not hold up the MR

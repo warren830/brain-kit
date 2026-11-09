@@ -285,5 +285,74 @@ class CommentLostOnce(unittest.TestCase):
         self.assertTrue(any("AI 已接手" in b for b in bodies), bodies)
 
 
+@unittest.skipUnless(os.path.exists(os.path.join(LEAN_SRC, "install.sh")), "AI-DLC Lean checkout not found")
+class SignedDesignOnTheDevMachine(_Flow):
+    """R1-14: `brain handoff` said no bridge-signed DESIGN approval covered the risk paths although the intake store
+    held one, unless BRAIN_ALLOWED_SIGNERS was set (no step for a developer's machine sets it). Now it also takes
+    the kit's own deploy/allowed_signers (the key brain-ci pins), and says "not checked" when it has no key."""
+
+    def setUp(self):
+        _Flow.setUp(self)
+        import hashlib
+        from brainkit import cli, sign
+        from brainkit.common import write_json
+        from tests.helpers import commit_file, keypair
+        self.cli = cli
+        sh("git", "-C", self.repo, "switch", "-q", "main")
+        commit_file(self.repo, "gates/risk-paths", "src/pay/**\n", "risk paths")
+        rec = self.started()
+        d = os.path.join(self.repo, lean.DOCS, rec["intent"], "inception", "application-design")
+        os.makedirs(d, exist_ok=True)
+        design = os.path.join(d, "application-design.md")
+        with open(design, "w", encoding="utf-8") as f:
+            f.write("# Application Design: refund\n\n## Components and responsibilities\n- refunds api in src/pay\n")
+        sh("git", "-C", self.repo, "add", "-A")
+        sh("git", "-C", self.repo, "commit", "-q", "-m", "design")
+        at = sh("git", "-C", self.repo, "rev-parse", "HEAD").stdout.strip()
+        with open(design, "rb") as f:
+            h8 = hashlib.sha256(f.read()).hexdigest()[:8]
+        self.key, self.allowed = keypair(tmpdir(self))
+        v = {"kind": "answer", "voucher_id": "V-0123456789", "run_id": "RUN-PAY-1-1", "decision": "D-1",
+             "choice": "approve", "lean_request": "DESIGN " + h8, "sha": at, "issued_at": "2026-11-09T10:00:00Z",
+             "key": "PAY-1"}
+        write_json(os.path.join(os.environ["HOME"], ".brain", "intake", "vouchers", "RUN-PAY-1-1",
+                                "V-0123456789.json"), {"voucher": v, "sig": sign.sign(v, self.key)})
+        commit_file(self.repo, "src/pay/refund.py", "x = 1\n", "refund code (risk path)")
+        self.env = os.environ.pop("BRAIN_ALLOWED_SIGNERS", None)
+        self.addCleanup(lambda: os.environ.__setitem__("BRAIN_ALLOWED_SIGNERS", self.env) if self.env else None)
+        self.kit_root = cli.KIT_ROOT
+        self.addCleanup(setattr, cli, "KIT_ROOT", self.kit_root)
+
+    def kit_key(self, text):
+        root = tmpdir(self)
+        os.makedirs(os.path.join(root, "deploy"))
+        with open(os.path.join(root, "deploy", "allowed_signers"), "w", encoding="utf-8") as f:
+            f.write(text)
+        self.cli.KIT_ROOT = root
+
+    def warnings(self):
+        rc, out = tc.brain(self.repo, "handoff", "--no-push")
+        return [line for line in out.splitlines() if "risk paths" in line]
+
+    def test_no_key_says_not_checked(self):
+        self.kit_key("# Put the bridge public key here\n")         # the kit as shipped: a comment, no key
+        w = self.warnings()
+        self.assertTrue(w, "no risk-path warning")
+        self.assertIn("was not checked here", w[0])
+        self.assertIn("BRAIN_ALLOWED_SIGNERS", w[0])
+        self.assertNotIn("covers it yet", w[0])
+
+    def test_the_kit_s_pinned_key_is_used(self):
+        with open(self.allowed, encoding="utf-8") as f:
+            self.kit_key("# the bridge\n" + f.read())
+        self.assertEqual(self.warnings(), [])
+
+    def test_the_variable_still_wins(self):
+        self.kit_key("# Put the bridge public key here\n")
+        os.environ["BRAIN_ALLOWED_SIGNERS"] = self.allowed
+        self.addCleanup(os.environ.pop, "BRAIN_ALLOWED_SIGNERS", None)
+        self.assertEqual(self.warnings(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
