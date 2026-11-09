@@ -9,6 +9,7 @@ adapter's park.json allowance and the bridge's park.json questions. Each class n
          still the previous commit's); the pipeline then failed, and the product's approve reached the run as RELEASE.
   R1-10  the park.json allowance took one spelling only: ./runs/<KEY>/park.json, runs//..., runs/<KEY>/./park.json and
          an absolute path through a symlinked folder (/tmp for /private/tmp) went to Lean, which blocks them as code.
+  R1-11  park.json refs given as a string passed validate_park, and the question showed it one character at a time.
 """
 import importlib.util
 import json
@@ -291,6 +292,39 @@ class R110ParkJsonSpelling(unittest.TestCase):
         code = hook("./src/app.py")                      # control: Lean still gates the code
         self.assertEqual(code.returncode, 2)
         self.assertIn("[AI-DLC Lean] blocked", code.stderr)
+
+
+# ---------- R1-11: refs is a list of strings ----------
+
+class R111RefsAreAList(unittest.TestCase):
+    PARK = {"schema": 1, "status": "waiting", "kind": "clarify", "question": "退款按自然日还是交易日？",
+            "options": [{"id": "A", "text": "自然日"}, {"id": "B", "text": "交易日"}]}
+
+    def test_only_a_list_of_strings(self):
+        for refs in ("D01#S003, AC-2", "", ["D01#S003", 7], {"AC-2": "D01#S003"}):
+            probs = decisions.validate_park(dict(self.PARK, refs=refs))
+            self.assertTrue(any(x.startswith("refs must be a list of strings") for x in probs), (refs, probs))
+        for refs in (["D01#S003", "AC-2"], []):
+            self.assertEqual(decisions.validate_park(dict(self.PARK, refs=refs)), [], refs)
+        self.assertEqual(decisions.validate_park(self.PARK), [])
+
+    def test_the_question_names_each_ref(self):
+        q = decisions.question_text("D-1", RUN, dict(self.PARK, refs=["D01#S003", "AC-2"]), ["alice"], "clarify",
+                                    "a" * 40, "b" * 64)
+        self.assertIn("依据：D01#S003, AC-2", q)
+        q = decisions.question_text("D-1", RUN, dict(self.PARK, refs="D01#S003"), ["alice"], "clarify", "a" * 40,
+                                    "b" * 64)
+        self.assertNotIn("依据", q)                       # never shown a character at a time
+
+    @unittest.skipUnless(sign.available(), "ssh-keygen not found")
+    def test_a_string_is_not_asked_and_the_run_is_told(self):
+        t = r3.fixture(self)
+        t.dispatched()
+        t.park(refs="D01#S003, AC-2")
+        self.assertEqual(t.bridge.watch(), 0)
+        self.assertEqual(r3.notes(t, start="**D-"), [])
+        self.assertIn("refs must be a list of strings", r3.notes(t, start="D-1 无法发出")[0])
+        self.assertTrue(r3.to_run(t)[0].startswith("问题没发出："))
 
 
 if __name__ == "__main__":

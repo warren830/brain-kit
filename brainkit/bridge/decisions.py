@@ -163,7 +163,7 @@ def validate_park(park) -> list:
         if any(len(str(o.get("text", ""))) > 500 for o in opts if isinstance(o, dict)):
             p.append("option text max 500 characters")
     refs = park.get("refs")
-    if refs is not None and not isinstance(refs, (list, str)):
+    if refs is not None and (not isinstance(refs, list) or not all(isinstance(x, str) for x in refs)):
         p.append("refs must be a list of strings, such as [\"D01#S003\", \"AC-2\"]")
     lr = park.get("lean_request")
     if lr is not None and not LEAN_REQ_RE.match(str(lr)):
@@ -243,7 +243,7 @@ def question_text(did, run_id, park, who, kind, sha, park_hash) -> str:
         body.append("推荐：%s" % park["recommend"])
     if park.get("lean_request"):
         body.append("审批：%s" % park["lean_request"])
-    if park.get("refs"):
+    if park.get("refs") and isinstance(park["refs"], list):
         body.append("依据：%s" % ", ".join(str(x) for x in park["refs"][:10]))
     lines.append(_block("\n".join(body)))
     items = park.get("review_items") or []
