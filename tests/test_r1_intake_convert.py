@@ -313,5 +313,49 @@ class R1_54NothingDroppedSilently(unittest.TestCase):
         self.assertTrue(any("缺页" in n for n in convert.convert(p2).notes))   # a sheet whose part is missing
 
 
+class R1_57WhiteOnDarkFill(unittest.TestCase):
+    """White text with a fill behind it (cell, table, table-style header row, paragraph, run shading or highlight)
+    is visible; white text on the page and <w:vanish/> stay hidden; <w:vanish w:val="0"/> is not hidden."""
+
+    def test_header_shading_is_not_hiding(self):
+        white = '<w:color w:val="FFFFFF"/>'
+
+        def cell(text, tcpr="", rpr=white):
+            return '<w:tc>%s%s</w:tc>' % ("<w:tcPr>%s</w:tcPr>" % tcpr if tcpr else "", wp(text, rpr))
+
+        dark = '<w:shd w:val="clear" w:color="auto" w:fill="1F4E79"/>'
+        direct = ("<w:tbl><w:tr>%s%s</w:tr><w:tr>%s%s</w:tr></w:tbl>"
+                  % (cell("任务", dark), cell("修订人", dark), cell("退款接口", rpr=""), cell("张伟", rpr="")))
+        styled = ('<w:tbl><w:tblPr><w:tblStyle w:val="Grid4"/><w:tblLook w:val="04A0"/></w:tblPr><w:tr>%s%s</w:tr>'
+                  '<w:tr>%s%s</w:tr></w:tbl>' % (cell("任务"), cell("负责人"), cell("对账"), cell("WHITE-BODY-CELL")))
+        styles = ('<?xml version="1.0"?><w:styles %s><w:style w:type="table" w:styleId="Grid4"><w:tblStylePr '
+                  'w:type="firstRow"><w:tcPr><w:shd w:val="clear" w:color="auto" w:fill="4472C4"/></w:tcPr>'
+                  '</w:tblStylePr></w:style><w:style w:type="paragraph" w:styleId="WhiteHead"><w:rPr>%s</w:rPr>'
+                  '</w:style></w:styles>') % (W, white)
+        body = (direct + styled +
+                '<w:p><w:pPr><w:shd w:val="clear" w:fill="000000"/></w:pPr><w:r><w:rPr>%s</w:rPr><w:t>黑底段落白字</w:t>'
+                '</w:r></w:p>' % white + wp("高亮白字", white + '<w:highlight w:val="darkBlue"/>') +
+                '<w:p><w:pPr><w:pStyle w:val="WhiteHead"/><w:shd w:val="clear" w:fill="1F4E79"/></w:pPr><w:r>'
+                '<w:t>样式白字深底</w:t></w:r></w:p>' + wp("WHITE-ON-PAGE", white) +
+                '<w:p><w:pPr><w:pStyle w:val="WhiteHead"/></w:pPr><w:r><w:t>WHITE-STYLE-ON-PAGE</w:t></w:r></w:p>' +
+                wp("VANISH", "<w:vanish/>") + wp("不隐藏", '<w:vanish w:val="0"/>'))
+        d = tmpdir(self)
+        src = os.path.join(d, "src")
+        os.makedirs(src)
+        doc = convert.convert(docx(os.path.join(src, "分工.docx"), body, [("word/styles.xml", styles)]))
+        self.assertIn("| 任务 | 修订人 |\n|---|---|\n| 退款接口 | 张伟 |", doc.text)
+        self.assertIn("| 任务 | 负责人 |", doc.text)
+        for shown in ("黑底段落白字", "高亮白字", "样式白字深底", "不隐藏"):
+            self.assertIn(shown, doc.text)
+        hidden = "\n".join(t for _, t in doc.hidden)
+        for h in ("WHITE-BODY-CELL", "WHITE-ON-PAGE", "WHITE-STYLE-ON-PAGE", "VANISH"):
+            self.assertNotIn(h, doc.text)
+            self.assertIn(h, hidden)
+        rep, store = build(src)
+        blob = "\n".join(package_text(store, rep).values())
+        self.assertNotIn("张伟", blob)                       # the 修订人 column keeps its header, so it is masked
+        self.assertIn("person×1", rep["findings"][0])
+
+
 if __name__ == "__main__":
     unittest.main()

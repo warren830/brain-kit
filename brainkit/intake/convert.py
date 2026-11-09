@@ -749,42 +749,126 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
     return d
 
 
-def _w_hidden(rpr):
-    if rpr is None:
+def _w_on(el) -> bool:
+    """A Word on/off property is on: present, and no w:val="0" / "false" / "off"."""
+    return el is not None and (el.get(_q("w", "val")) or "true").lower() not in ("0", "false", "off")
+
+
+def _w_paints(shd) -> bool:
+    """A w:shd paints a colour behind the text (a fill, or a solid pattern, that is not white)."""
+    if shd is None or (shd.get(_q("w", "val")) or "").lower() == "nil":
         return False
-    if rpr.find(_q("w", "vanish")) is not None or rpr.find(_q("w", "specVanish")) is not None:
+    fill = shd.get(_q("w", "fill")) or ""
+    if re.fullmatch(r"[0-9A-Fa-f]{6}", fill) and not _near_white(fill):
         return True
+    if (shd.get(_q("w", "val")) or "").lower() == "solid":
+        colour = shd.get(_q("w", "color")) or "auto"
+        return colour.lower() == "auto" or not (re.fullmatch(r"[0-9A-Fa-f]{6}", colour) and _near_white(colour))
+    theme = shd.get(_q("w", "themeFill"))
+    return fill.lower() in ("", "auto") and bool(theme) and theme not in ("background1", "light1")
+
+
+def _w_rpr(rpr) -> dict:
+    """The look of a w:rPr, only what it sets: vanish (hidden), tiny (under 4pt), white (white text), paints (a
+    shading or highlight behind the text)."""
+    out = {}
+    if rpr is None:
+        return out
+    for tag in ("vanish", "specVanish"):
+        if rpr.find(_q("w", tag)) is not None:
+            out["vanish"] = out.get("vanish", False) or _w_on(rpr.find(_q("w", tag)))
+    sz = _int(_w_val(rpr, _q("w", "sz")))
+    if sz is not None:
+        out["tiny"] = sz < 8                             # half-points: under 4pt
     color = rpr.find(_q("w", "color"))
-    if color is not None and (color.get(_q("w", "val")) or "").upper() in ("FFFFFF", "FFFFFE"):
-        return True
-    sz = rpr.find(_q("w", "sz"))
-    try:
-        if sz is not None and int(sz.get(_q("w", "val"), "24")) < 8:  # half-points: < 4pt
-            return True
-    except ValueError:
-        pass
-    return False
-
-
-def _w_hidden_styles(z):
-    root = _xml(z, "word/styles.xml")
-    out = set()
-    for st in (root.iter(_q("w", "style")) if root is not None else []):
-        if _w_hidden(st.find(_q("w", "rPr"))):
-            out.add(st.get(_q("w", "styleId")))
+    if color is not None:
+        val = color.get(_q("w", "val")) or ""
+        out["white"] = (_near_white(val) if re.fullmatch(r"[0-9A-Fa-f]{6}", val) else
+                        val.lower() != "auto" and color.get(_q("w", "themeColor")) in ("background1", "light1"))
+    hl, shd = rpr.find(_q("w", "highlight")), rpr.find(_q("w", "shd"))
+    if hl is not None or shd is not None:
+        out["paints"] = ((hl is not None and (hl.get(_q("w", "val")) or "none").lower() not in ("none", "white"))
+                         or _w_paints(shd))
     return out
 
 
-def _w_paragraph(p, d, where, hidden_styles=frozenset()):
-    style = p.find("%s/%s" % (_q("w", "pPr"), _q("w", "pStyle")))
-    sv = (style.get(_q("w", "val")) if style is not None else "") or ""
-    para_hidden = sv in hidden_styles  # paragraph style that hides its text
+class _WStyles:
+    """word/styles.xml: the run look and the paragraph / table shading of a style, through its basedOn chain."""
+
+    def __init__(self, z):
+        root = _xml(z, "word/styles.xml")
+        found = root.iter(_q("w", "style")) if root is not None else []
+        self.by_id = {st.get(_q("w", "styleId")): st for st in found}
+
+    def chain(self, sid):
+        seen = []
+        while sid in self.by_id and sid not in seen and len(seen) < 20:
+            seen.append(sid)
+            based = self.by_id[sid].find(_q("w", "basedOn"))
+            sid = based.get(_q("w", "val")) if based is not None else None
+        return [self.by_id[x] for x in reversed(seen)]       # the base first
+
+    def rpr(self, sid) -> dict:
+        out = {}
+        for st in self.chain(sid):
+            out.update(_w_rpr(st.find(_q("w", "rPr"))))
+        return out
+
+    def paints(self, sid, path) -> bool:
+        """The last style in the chain that sets the shading at this path paints."""
+        res = False
+        for st in self.chain(sid):
+            shd = st.find(path)
+            if shd is not None:
+                res = _w_paints(shd)
+        return res
+
+    def first_row_paints(self, sid) -> bool:
+        res = False
+        for st in self.chain(sid):
+            for cond in st.findall(_q("w", "tblStylePr")):
+                shd = cond.find("%s/%s" % (_q("w", "tcPr"), _q("w", "shd")))
+                if cond.get(_q("w", "type")) == "firstRow" and shd is not None:
+                    res = _w_paints(shd)
+        return res
+
+
+def _w_first_row_on(tpr) -> bool:
+    """The table turns on its style's header-row look (w:firstRow, or bit 0x20 of an older w:val; on when unset)."""
+    look = tpr.find(_q("w", "tblLook")) if tpr is not None else None
+    if look is None:
+        return True
+    if look.get(_q("w", "firstRow")) is not None:
+        return look.get(_q("w", "firstRow")).lower() in ("1", "true", "on")
+    try:
+        return bool(int(look.get(_q("w", "val")) or "20", 16) & 0x20)
+    except ValueError:
+        return True
+
+
+def _w_val(el, path):
+    x = el.find(path)
+    return x.get(_q("w", "val")) if x is not None else None
+
+
+def _w_paragraph(p, d, where, styles, painted=False):
+    """The visible text of a paragraph (hidden runs go to d.hidden). A run is hidden when it vanishes, is under 4pt,
+    or is white with nothing coloured behind it: no shading or highlight on the run, the paragraph, its cell or
+    table (painted). White text on a dark header fill is a header, not hidden text."""
+    sv = _w_val(p, "%s/%s" % (_q("w", "pPr"), _q("w", "pStyle"))) or ""
+    pstyle = styles.rpr(sv) if sv else {}
+    painted = (painted or _w_paints(p.find("%s/%s" % (_q("w", "pPr"), _q("w", "shd"))))
+               or (bool(sv) and styles.paints(sv, "%s/%s" % (_q("w", "pPr"), _q("w", "shd")))))
     vis, hid = [], []
     for r in p.iter(_q("w", "r")):
         rpr = r.find(_q("w", "rPr"))
-        rstyle = rpr.find(_q("w", "rStyle")) if rpr is not None else None
-        styled = rstyle is not None and rstyle.get(_q("w", "val")) in hidden_styles
-        target = hid if (para_hidden or styled or _w_hidden(rpr)) else vis
+        look = dict(pstyle)
+        rs = _w_val(rpr, _q("w", "rStyle")) if rpr is not None else None
+        if rs:
+            look.update(styles.rpr(rs))
+        look.update(_w_rpr(rpr))
+        unseen = look.get("vanish") or look.get("tiny") or (look.get("white") and not (painted or look.get("paints")))
+        target = hid if unseen else vis
         for node in r:
             if node.tag == _q("w", "t"):
                 target.append(node.text or "")
@@ -828,19 +912,27 @@ def convert_docx(path, name) -> Doc:
     if root is None:
         raise Refused("不是有效的 docx（没有 document.xml）")
     body = root.find(_q("w", "body"))
-    hs = _w_hidden_styles(z)
+    styles = _WStyles(z)
     out = []
     for i, el in enumerate(_w_items(body, (_q("w", "p"), _q("w", "tbl")))):
         if el.tag == _q("w", "p"):
-            t = _w_paragraph(el, d, "Word 隐藏文字（第 %d 段）" % (i + 1), hs)
+            t = _w_paragraph(el, d, "Word 隐藏文字（第 %d 段）" % (i + 1), styles)
             if t:
                 out.append(t)
         else:
             rows = []
-            for tr in _w_items(el, (_q("w", "tr"),)):
+            tpr = el.find(_q("w", "tblPr"))
+            ts = _w_val(tpr, _q("w", "tblStyle")) if tpr is not None else None
+            table_paints = (_w_paints(tpr.find(_q("w", "shd")) if tpr is not None else None)
+                            or bool(ts) and (styles.paints(ts, "%s/%s" % (_q("w", "tblPr"), _q("w", "shd")))
+                                             or styles.paints(ts, "%s/%s" % (_q("w", "tcPr"), _q("w", "shd")))))
+            head_paints = bool(ts) and _w_first_row_on(tpr) and styles.first_row_paints(ts)
+            for k, tr in enumerate(_w_items(el, (_q("w", "tr"),))):
                 cells = []
                 for tc in _w_items(tr, (_q("w", "tc"),)):
-                    ps = [_w_paragraph(p, d, "Word 表格隐藏文字", hs) for p in tc.iter(_q("w", "p"))]
+                    painted = (table_paints or (k == 0 and head_paints)
+                               or _w_paints(tc.find("%s/%s" % (_q("w", "tcPr"), _q("w", "shd")))))
+                    ps = [_w_paragraph(p, d, "Word 表格隐藏文字", styles, painted) for p in tc.iter(_q("w", "p"))]
                     cells.append(" ".join(x for x in ps if x))
                 rows.append(cells)
             if rows:
