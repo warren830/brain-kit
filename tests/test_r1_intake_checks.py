@@ -139,5 +139,34 @@ class R1_52AmountForms(Base):
         self.assertIn("- 欧洲站：[金额-1] / 单", text)
 
 
+
+class R1_59NameColumns(Base):
+    """Names under 处理人 / 对接人 / 跟进人 / 提出人 / 值班人 / 经办人 / Assignee / Reporter columns were not masked (the same
+    words as a label, 处理人：张伟, were)."""
+
+    def people(self, text):
+        return sorted(h.value for h in checks.scan(text) if h.cat == "pii" and h.kind == "person")
+
+    def test_columns(self):
+        t = ("| 时间 | 问题 | 处理人 | 对接人 | 跟进人 | 提出人 | 值班人 | 经办人 |\n|---|---|---|---|---|---|---|---|\n"
+             "| 10-01 | 退款超时 | 张伟 | 李娜 | 王芳 | 陈静 | 刘洋 | 赵磊 |\n")
+        self.assertEqual(self.people(t), sorted(["张伟", "李娜", "王芳", "陈静", "刘洋", "赵磊"]))
+        t = ("| Key | Summary | Assignee | Reporter | Assigned to | Reported by |\n|---|---|---|---|---|---|\n"
+             "| PAY-12 | Refund timeout | Alice Wang | Peter Chan | Bob Lee | Carol King |\n")
+        self.assertEqual(self.people(t), sorted(["Alice Wang", "Peter Chan", "Bob Lee", "Carol King"]))
+        # still not people: a field table, a summary column, a role or a team in a person column
+        self.assertEqual(self.people("| Name | Type |\n|---|---|\n| Refund Status | string |\n"), [])
+        self.assertEqual(self.people("| 事项 | 处理人 |\n|---|---|\n| 对账 | 支付组 |\n"), [])
+
+    def test_masked_in_the_package(self):
+        self.file("故障复盘.md", "# 故障复盘\n\n| 时间 | 问题 | 处理人 | 对接人 |\n|---|---|---|---|\n| 10-01 | 退款超时 | 张伟 | 李娜 |\n")
+        self.file("jira-export.md", "# Jira export\n\n| Key | Summary | Assignee | Reporter |\n|---|---|---|---|\n"
+                  "| PAY-12 | Refund timeout | Alice Wang | Peter Chan |\n")
+        text = self.package_text(self.build())
+        for raw in ("张伟", "李娜", "Alice Wang", "Peter Chan"):
+            self.assertNotIn(raw, text)
+        self.assertIn("| PAY-12 | Refund timeout | [人名-", text)
+
+
 if __name__ == "__main__":
     unittest.main()

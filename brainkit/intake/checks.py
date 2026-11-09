@@ -31,9 +31,6 @@ PHONE_HK_CONTEXT_RE = re.compile(r"(?i)(電話|电话|手機|手机|聯絡|联�
 EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+")
 CARD_RE = re.compile(r"(?<![0-9])(?:[0-9][ -]?){14,18}[0-9](?![0-9])")
 MENTION_RE = re.compile(r"@([A-Z][a-zA-Z]+(?:[  ]+[A-Z][A-Za-z]+){0,3}|[一-鿿]{2,4})")
-NAME_COL_RE = re.compile(r"修[訂订]人|負責人|负责人|聯絡人|联系人|聯繫人|姓名|客[戶户]名稱|客户名称|審批人|审批人|申請人|申请人"
-                         r"|^\s*(owner|contact|contact name|customer name|client name|approver|reviewer|author"
-                         r"|prepared by|approved by)\s*$", re.I)
 # a cell that looks like a person: 2-4 CJK chars, or 1-4 capitalised Latin words (optionally @-mentioned)
 NAME_VALUE_RE = re.compile(r"^@?(?:[一-鿿]{2,4}|[A-Z][a-z]+(?:[ .-]+[A-Z][A-Za-z]+){0,3}|[A-Z][a-z]+ [A-Z]{2,})$")
 
@@ -88,6 +85,11 @@ LATIN_FIELD_LABELS = (r"owner|assignee|reporter|on[- ]?call|contact(?:[ \t]+pers
 LATIN_BY_LABELS = (r"assigned[ \t]+to|reported[ \t]+by|approved[ \t]+by|reviewed[ \t]+by|prepared[ \t]+by"
                    r"|written[ \t]+by|raised[ \t]+by|requested[ \t]+by|filed[ \t]+by|opened[ \t]+by|escalated[ \t]+to"
                    r"|handled[ \t]+by|acknowledged[ \t]+by|resolved[ \t]+by|fixed[ \t]+by")
+# a table column of people: headed by one of the labels above (负责人, 处理人, 对接人, Assignee, Reporter, Reported by
+# ...) or by a name column (姓名, 客户名称, Customer name). One list for both: a word that names a person after a
+# label names the people in a column too.
+NAME_COL_RE = re.compile(r"%s|姓名|客[戶户]名稱|客户名称|^\s*(?:%s|%s|contact[ \t]+name|customer[ \t]+name"
+                         r"|client[ \t]+name)\s*$" % (CJK_LABELS, LATIN_FIELD_LABELS, LATIN_BY_LABELS), re.I)
 _LATIN_WORD = r"[A-Z][a-z]+(?:['’-][A-Za-z]+)?"
 LATIN_LABEL_NAME_RE = re.compile(
     r"(?i:\b(?:(?P<field>%s)\b[ \t]*[:：=]|(?P<by>%s)\b[ \t]*[:：=]?))[ \t]*@?"
