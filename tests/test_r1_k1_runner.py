@@ -7,6 +7,8 @@ adapter's park.json allowance and the bridge's park.json questions. Each class n
          workspace.
   R1-04  the acceptance question went out while the head's own pipeline was not on the MR yet (head_pipeline null, or
          still the previous commit's); the pipeline then failed, and the product's approve reached the run as RELEASE.
+  R1-10  the park.json allowance took one spelling only: ./runs/<KEY>/park.json, runs//..., runs/<KEY>/./park.json and
+         an absolute path through a symlinked folder (/tmp for /private/tmp) went to Lean, which blocks them as code.
 """
 import importlib.util
 import json
@@ -223,6 +225,72 @@ class R104AcceptanceWaitsForTheHeadsPipeline(unittest.TestCase):
         self.assertEqual(len(told()), 1)
         self.assertIn(head[:12], told()[0])
         self.assertEqual((r4.asked(t), r4.ci_notices(t)), ([], []))
+
+
+# ---------- R1-10: every spelling of the run's own park.json ----------
+
+def load_adapter():
+    spec = importlib.util.spec_from_file_location("brain_lean_hook_r1", ADAPTER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class R110ParkJsonSpelling(unittest.TestCase):
+    def setUp(self):
+        self.lh = load_adapter()
+        d = tmpdir(self)
+        self.root = git_repo(os.path.join(d, "ws"))
+        commit_file(self.root, "src/app.py", "print('hi')\n")
+        sh("git", "-C", self.root, "switch", "-q", "-c", BR)
+        write_json(os.path.join(self.root, "runs", "PAY-1", "run.json"), {"key": "PAY-1", "branch": BR})
+        self.via = os.path.join(d, "via")                # a symlinked folder above the workspace (/tmp, say)
+        os.symlink(self.root, self.via)
+
+    def allowed(self, path, **tin):
+        return self.lh.park_target(self.root, {"tool_name": "fs_write", "tool_input": dict(
+            {"command": "create", "path": path, "file_text": "{}"}, **tin)})
+
+    def test_every_spelling_of_this_runs_park_json(self):
+        r, v = self.root, self.via
+        for p in ("runs/PAY-1/park.json", "./runs/PAY-1/park.json", "runs//PAY-1/park.json", "runs/PAY-1/./park.json",
+                  r + "/runs/PAY-1/park.json", r + "/./runs//PAY-1/park.json", v + "/runs/PAY-1/park.json",
+                  v + "//runs/PAY-1/./park.json"):
+            self.assertTrue(self.allowed(p), p)
+
+    def test_nothing_else(self):
+        r, v = self.root, self.via
+        os.symlink(r, os.path.join(r, "loop"))           # a symlink inside the workspace, to the workspace
+        outside = os.path.join(tmpdir(self), "runs", "PAY-1", "park.json")
+        for p in ("runs/PAY-1/../PAY-1/park.json", "src/../runs/PAY-1/park.json", v + "/../via/runs/PAY-1/park.json",
+                  "runs/PAY-1/park.json/", "runs/PAY-1/park.json/.", "./runs/PAY-1/", "loop/runs/PAY-1/park.json",
+                  r + "/loop/runs/PAY-1/park.json", "./runs/PAY-2/park.json", "./runs/PAY-1/run.json",
+                  "/runs/PAY-1/park.json", outside, "src/app.py"):
+            self.assertFalse(self.allowed(p), p)
+        self.assertFalse(self.allowed("./runs/PAY-1/park.json", file_path="runs/PAY-1/park.json"))  # two spellings
+        # runs/<KEY>/ symlinked elsewhere: refused however it is spelled
+        os.rename(os.path.join(r, "runs", "PAY-1"), os.path.join(r, "src", "PAY-1"))
+        os.symlink(os.path.join("..", "src", "PAY-1"), os.path.join(r, "runs", "PAY-1"))
+        for p in ("runs/PAY-1/park.json", "./runs/PAY-1/park.json", v + "/runs/PAY-1/park.json"):
+            self.assertFalse(self.allowed(p), p)
+
+    @unittest.skipUnless(HAS_LEAN, "AI-DLC Lean checkout not found")
+    def test_through_the_hook_from_a_workspace_opened_through_a_symlink(self):
+        d, repo = r3r.lean_repo(self)
+        via = os.path.join(tmpdir(self), "via")
+        os.symlink(repo, via)
+
+        def hook(path):
+            payload = {"tool_name": "fs_write", "session_id": "s1", "cwd": via, "hook_event_name": "PreToolUse",
+                       "tool_input": {"command": "create", "path": path, "file_text": "{\"schema\": 1}"}}
+            return subprocess.run([sys.executable, ".kiro/brain/lean-hook.py", "PreToolUse"], cwd=via, text=True,
+                                  capture_output=True, input=json.dumps(payload))
+        for p in ("./runs/PAY-1/park.json", "runs//PAY-1/park.json", via + "/runs/PAY-1/park.json"):
+            r = hook(p)
+            self.assertEqual(r.returncode, 0, "%s: %s" % (p, r.stderr.strip()[:300]))
+        code = hook("./src/app.py")                      # control: Lean still gates the code
+        self.assertEqual(code.returncode, 2)
+        self.assertIn("[AI-DLC Lean] blocked", code.stderr)
 
 
 if __name__ == "__main__":
