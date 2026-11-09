@@ -468,6 +468,16 @@ class R1_58Big5(unittest.TestCase):
             self.assertNotIn(raw, blob)
         self.assertIn("phone×1", [f for f in rep["findings"] if "big5.txt" in f][0])
 
+    def test_short_markings(self):
+        """A misread of Big5 as GB is full of kana, Greek, Cyrillic: a short marking line is read right too."""
+        d = tmpdir(self)
+        for k, line in enumerate(("機密文件", "本文件屬機密", "僅供內部使用", "密級：機密")):
+            p = write(os.path.join(d, "%d.txt" % k), line.encode("big5"), "wb")
+            self.assertIn(line, convert.convert(p).text)
+        for k, line in enumerate(("机密文件", "仅供内部使用", "需求", "上限 100 元")):
+            p = write(os.path.join(d, "gb%d.txt" % k), line.encode("gb18030"), "wb")
+            self.assertIn(line, convert.convert(p).text)
+
 
 class R1_61MarkingsOnEverySheet(unittest.TestCase):
     """Gate 2 reads each sheet's head and tail (a hidden sheet marked 绝密, a 机密 sheet in the middle of a long

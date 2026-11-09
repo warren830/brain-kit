@@ -311,19 +311,26 @@ def decode_text(data: bytes) -> str:
 
 
 def _cjk_plausible(text, sample=20000) -> float:
-    """The share of the Chinese characters (and private-use ones) in the first `sample` of them that are common: in
-    GB2312 level 1 or Big5's frequent set. Big5 read as GB18030, or GB read as Big5, gives many rare and
-    private-use characters (Big5 punctuation becomes private use in GB18030)."""
+    """The share of the Chinese characters (and private-use, kana, Greek, Cyrillic ... ones) in the first `sample` of
+    them that are common: in GB2312 level 1 or Big5's frequent set. Big5 read as GB18030, or GB read as Big5, gives
+    many rare, private-use and kana characters (Big5 punctuation becomes private use in GB18030)."""
     good = seen = 0
     for c in text:
         o = ord(c)
-        if not (0x4E00 <= o <= 0x9FFF or 0xE000 <= o <= 0xF8FF or 0x3400 <= o <= 0x4DBF or o >= 0x20000):
+        if MISREAD_RE.match(c):                      # kana, Greek, Cyrillic, bopomofo, box drawing: a misread
+            seen += 1
+        elif 0x4E00 <= o <= 0x9FFF or 0xE000 <= o <= 0xF8FF or 0x3400 <= o <= 0x4DBF or o >= 0x20000:
+            seen += 1
+            good += _common_hanzi(c)
+        else:
             continue
-        seen += 1
-        good += _common_hanzi(c)
         if seen >= sample:
             break
     return good / seen if seen else 0.0
+
+
+# what a Big5 text read as GB18030 (or the other way) is full of, and a Chinese requirement hardly has
+MISREAD_RE = re.compile("[\u0370-\u04ff\u2500-\u257f\u3041-\u30ff\u3105-\u312f]")
 
 
 def _common_hanzi(c) -> bool:
