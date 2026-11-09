@@ -1050,15 +1050,43 @@ def _stage(repo, n, path):
     return p.stdout if p.returncode == 0 else None
 
 
+UNMERGED = ("DD", "AU", "UD", "UA", "DU", "AA", "UU")      # git status --porcelain: a path git has not merged
+MARKER_RE = re.compile(r"(?m)^(?:<{7}|>{7})(?: |$)")
+
+
+def _unfinished_merge(repo) -> tuple:
+    """(MERGE_HEAD is set, [paths git still has unmerged]) here."""
+    rows = git(repo, "status", "--porcelain", "--untracked-files=no").stdout.split("\n")
+    merging = git(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0
+    return merging, [l[3:] for l in rows if l[:2] in UNMERGED]
+
+
+def _marked(repo, path) -> bool:
+    """The file has conflict markers (<<<<<<< or >>>>>>> at a line start)."""
+    try:
+        with open(os.path.join(repo, path), encoding="utf-8", errors="replace") as f:
+            return MARKER_RE.search(f.read()) is not None
+    except OSError:
+        return False
+
+
 def sync(repo, cfg, src=None, me=None) -> int:
     """Merge `src` (default: this child run's target branch, fetched) into the run branch checked out here. A
     conflict in Lean's own files is resolved: aidlc-state.md (merge_state, then `lean status` writes the region
     again), build-and-test-summary.md (ours: the next `lean verify` writes it). Anything else, a Lean ledger file
-    included, is left for the person. Exit 0 when merged, 1 when conflicts are left."""
+    included, is left for the person. Exit 0 when merged, 1 when conflicts are left. A merge left unfinished here
+    (MERGE_HEAD, unmerged paths) is refused, and a file with conflict markers is never committed for you."""
     from .cli import _current
     br, b, rp, rec = _current(repo, cfg)
     if me and rec["owner"] != me:
         raise BrainError("this run belongs to %s" % rec["owner"])
+    merging, unmerged = _unfinished_merge(repo)
+    if merging or unmerged:
+        # what an earlier sync left: committing it now would commit the conflict markers
+        raise BrainError("the last merge here is not finished (%s): resolve the conflicts by hand, `git add` the files "
+                         "and `git commit` (or undo it: `git merge --abort`), then `brain sync` again. Nothing was "
+                         "committed" % "; ".join((["MERGE_HEAD is set"] if merging else []) +
+                                                 (["unmerged: " + ", ".join(unmerged[:10])] if unmerged else [])))
     if src is None:
         target = rec.get("target_branch")
         if not target:
@@ -1081,6 +1109,10 @@ def sync(repo, cfg, src=None, me=None) -> int:
         # Lean writes its ledger and aidlc-state.md all the time (hooks, `lean status`): those are committed for you
         if not all(x == state_doc or x.startswith(lean.DOCS + "/audit/") for x in dirty):
             raise BrainError("commit or stash your changes first:\n  " + "\n  ".join(dirty[:10]))
+        marked = [x for x in dirty if _marked(repo, x)]
+        if marked:
+            raise BrainError("%s %s conflict markers (<<<<<<< / >>>>>>>): resolve them by hand first. Nothing was "
+                             "committed" % (", ".join(marked), "has" if len(marked) == 1 else "have"))
         git(repo, "add", "--", *dirty)
         git(repo, "commit", "-q", "-m", "%s: Lean records before merging %s" % (b["key"], src))
     p = git(repo, "merge", "--no-edit", src, check=False)
@@ -1125,6 +1157,13 @@ def sync(repo, cfg, src=None, me=None) -> int:
         print("Resolve them, `git add` them, then `git commit`; `lean status` writes Lean's progress again.")
         return 1
     _refresh_state(repo, rec["intent"], state_doc, None)
+    marked = [x for x in conflicted if _marked(repo, x)]
+    if marked:                                    # markers that came with a side: never committed for you
+        print("Merged %s with conflicts left for you:" % src)
+        for x in marked:
+            print("  %s: has conflict markers (<<<<<<< / >>>>>>>)" % x)
+        print("Resolve them, `git add` them, then `git commit`; `lean status` writes Lean's progress again.")
+        return 1
     git(repo, "commit", "-q", "--no-edit")
     print("Merged %s into %s; Lean's generated files were resolved (aidlc-state.md written again from the merged "
           "ledger)." % (src, br))
