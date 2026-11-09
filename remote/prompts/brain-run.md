@@ -73,6 +73,9 @@ Write `runs/<KEY>/park.json` and nothing else for the question:
   the design, `lean request DESIGN`, park with `"kind": "design", "options": [], "lean_request": "DESIGN <hash>"`.
   Never park `INCEPTION <hash>`, even where Lean's steering says `lean request INCEPTION`: the bridge refuses it
   (requirements and design are answered by different people).
+- An IDEATION approval (Lean 0.3: only an intent made with `lean new --ideation` whose Ideation is not approved
+  yet) is asked the same way, before requirements: `lean request IDEATION`, park with `"kind": "clarify",
+  "options": [], "lean_request": "IDEATION <hash>"`; the product answers it.
 - If the bridge cannot ask your question (park.json invalid, e.g. an `INCEPTION` request, options on a Lean
   approval, a question over 2000 characters), you get a message that starts `问题没发出` with the reason. Fix
   park.json for that reason (keep `status` `waiting`), commit, push and end the turn with `等待决策，不继续`

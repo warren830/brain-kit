@@ -31,7 +31,7 @@ DEFAULTS = {
     "review_model": "kimi-k3",
     "allowed_models": ["claude-opus-5.5", "kimi-k3"],
     "forbidden_tools": ["web_search", "web_fetch", "search_chat_history", "get_chat_session", "list_sessions"],
-    "pins": {"kiro-cli": "", "kirocrew": "", "lean": "0.2"},
+    "pins": {"kiro-cli": "", "kirocrew": "", "lean": "0.3"},
     "jira": {"base": "", "api": "2"},
     "gitlab": {"base": "", "project": ""},
     # tracker "none": requirement keys <req_prefix>-<n> and claims are git branches claim/<KEY> (no Jira needed)
@@ -41,7 +41,7 @@ DEFAULTS = {
     # GitLab users (security / data owners) who may approve a Brain purge; empty: purges are refused
     "purge_approvers": [],
     # who may answer each kind of decision (owner = the run's owner; other names are roles in brain-authz)
-    "decision_roles": {"clarify": ["owner", "product"], "requirements": ["product"], "design": ["builder"],
+    "decision_roles": {"clarify": ["owner", "product"], "ideation": ["product"], "requirements": ["product"], "design": ["builder"],
                        "plan": ["builder"],
                        "acceptance": ["product"], "action": ["security"], "other": ["owner"]},
     "intake": {

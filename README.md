@@ -2,7 +2,7 @@
 
 每个人在自己电脑上开发需求，开发到一半，交给团队运行机（一台 KiroCrew）接着跑完后半程：评审、修 CI、出证据、交付。两边读同一份 Brain。需要人拍板时，运行机在 MR 上提问，人回一行字就行。
 
-- **中间的开发**直接用 AI-DLC Lean v0.2（另一个仓库）。brain-kit 只调用 Lean 的命令、读它的记录，不改 Lean 本身。
+- **中间的开发**直接用 AI-DLC Lean v0.3（另一个仓库，子模块 `vendor/aidlc-lean`）。brain-kit 只调用 Lean 的命令、读它的记录，不改 Lean 本身。
 - **不接 Jira 也能用**（`tracker: none`）：需求号由 git 认领分支分配，问答走 GitLab MR 评论。要接 Jira 时，改成 `tracker: jira`。
 - **需求可以直接交文档**：飞书 / Lark 导出的文件夹、md、docx、xlsx、pptx、html、txt 都行；PDF 需要装 MarkItDown。文档先过五道关，打码后打成材料包。原件不进任何仓库。
 - 只用 Python 标准库（3.8 以上）、git 和 `ssh-keygen`。签名用 Ed25519（`ssh-keygen -Y`）。
@@ -148,7 +148,7 @@ brain-kit/bin/brain install <项目目录> --lean <AI-DLC Lean 的 checkout 目�
 ## 谁能回答哪类问题
 
 - 由 main 上的 `decision_roles` 和 brain-authz 里的 `roles` 决定，不看 run 在 park.json 里怎么写。
-- Lean 的审批按审批类型认人：REQUIREMENTS 和 RELEASE 归产品，DESIGN 和 PLAN 归 Builder。
+- Lean 的审批按审批类型认人：IDEATION、REQUIREMENTS 和 RELEASE 归产品，DESIGN 和 PLAN 归 Builder。
 - 不接受合在一起的 INCEPTION 审批，需求和设计要分开批。
 
 ## 哪些算真门，哪些只是护栏

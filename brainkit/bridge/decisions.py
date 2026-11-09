@@ -49,10 +49,11 @@ from ..rest import HttpError, gl_time, head_pushed_at
 from .delivery import Delivery, one_line
 
 KINDS = ("clarify", "design", "plan", "acceptance", "action", "other")
-LEAN_KINDS = ("REQUIREMENTS", "DESIGN", "PLAN", "RELEASE")   # INCEPTION: ask REQUIREMENTS and DESIGN separately
+LEAN_KINDS = ("IDEATION", "REQUIREMENTS", "DESIGN", "PLAN", "RELEASE")   # INCEPTION: ask REQUIREMENTS and DESIGN
+# separately. IDEATION (Lean 0.3): only an intent made with `lean new --ideation`; the product answers it.
 # A Lean approval is answered by the people for that approval, whatever kind the run wrote in park.json.
-LEAN_KIND_ROLE = {"REQUIREMENTS": "requirements", "DESIGN": "design", "PLAN": "plan", "RELEASE": "acceptance"}
-DEFAULT_ROLES = {"clarify": ["owner", "product"], "requirements": ["product"], "design": ["builder"],
+LEAN_KIND_ROLE = {"IDEATION": "ideation", "REQUIREMENTS": "requirements", "DESIGN": "design", "PLAN": "plan", "RELEASE": "acceptance"}
+DEFAULT_ROLES = {"clarify": ["owner", "product"], "ideation": ["product"], "requirements": ["product"], "design": ["builder"],
                  "plan": ["builder"], "acceptance": ["product"], "action": ["security"], "other": ["owner"]}
 ANSWER_RE = re.compile(r"^\s*(?:answer|答|回答)\s+(D-[1-9][0-9]*)\s+([A-H]|approve|reject)\b[ \t:：-]*(.*)$", re.I)
 LEAN_REQ_RE = re.compile(r"^(%s) ([0-9a-f]{6,64})$" % "|".join(LEAN_KINDS))
@@ -224,7 +225,7 @@ def allowed_people(kit, kind, owner, roles) -> set:
 def question_text(did, run_id, park, who, kind, sha, park_hash) -> str:
     """The question note for park.json. The first line binds it: decision id, run, the commit the question was asked
     at and park.json's sha256 (12 hex each), and who may answer."""
-    label = {"requirements": "需求批准"}.get(kind, KIND_LABEL.get(kind, kind))
+    label = {"requirements": "需求批准", "ideation": "构想批准"}.get(kind, KIND_LABEL.get(kind, kind))
     lines = ["**%s · %s · %s** · 提交 %s · park %s · 需要 %s 回答" % (
         did, label, run_id, sha[:12], park_hash[:12], "、".join("@" + u for u in who))]
     body = [park["question"]]
@@ -828,7 +829,7 @@ class DecisionLoop(Delivery):
 
     def _tell_nobody(self, row, head, ph, kind):
         key = "nobody:%s:%s" % (row["run_id"], ph[:16])
-        label = {"requirements": "需求批准"}.get(kind, KIND_LABEL.get(kind, kind))
+        label = {"requirements": "需求批准", "ideation": "构想批准"}.get(kind, KIND_LABEL.get(kind, kind))
         self.tell_mr_once(key, row["project"], row["iid"], "%s 的问题（提交 %s 的 park.json）现在发不出：没有人被配置为可以"
                           "回答「%s」类决策（kit.json decision_roles / brain-authz roles）。配好以后桥会自动发出这个问题。"
                           % (row["run_id"], head[:12], label), run_id=row["run_id"])

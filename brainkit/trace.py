@@ -54,7 +54,7 @@ from .common import BrainError, JIRA_RE, USER_RE, git, iso, utcnow
 SCHEMA = 1
 WINDOW_DAYS = 14
 STAGE_STATE = {"STAGE_STARTED": "started", "STAGE_COMPLETED": "done", "STAGE_SKIPPED": "skipped"}
-LEAN_APPROVALS = ("REQUIREMENTS", "DESIGN", "INCEPTION", "PLAN", "RELEASE")
+LEAN_APPROVALS = ("IDEATION", "REQUIREMENTS", "DESIGN", "INCEPTION", "PLAN", "RELEASE")
 ACCEPT_WHAT = ("RELEASE", "acceptance")
 VOUCHER_RE = re.compile(r"(?<![0-9A-Za-z])V-[0-9a-f]{10}(?![0-9a-f])")
 PSEUD_RE = re.compile(r"(?<![0-9A-Za-z])P-[0-9A-F]{4}(?![0-9A-Za-z])")

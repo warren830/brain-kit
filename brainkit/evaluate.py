@@ -40,14 +40,15 @@ import urllib.parse
 from . import brainlint, entries as E, trace as T, usage
 from .common import BrainError, JIRA_RE, parse_branch, utcnow
 
-REQUIRED = {"REQUIREMENTS", "DESIGN", "INCEPTION", "PLAN", "RELEASE", "requirements", "design", "plan", "acceptance"}
+REQUIRED = {"IDEATION", "REQUIREMENTS", "DESIGN", "INCEPTION", "PLAN", "RELEASE", "ideation", "requirements",
+            "design", "plan", "acceptance"}
 CATEGORIES = ("brain", "check", "agent", "person", "unknown", "unclassified")
 CAT_LABEL = {"brain": "Brain 条目（引用）", "check": "确定性检查", "agent": "agent 自己定（权限内）", "person": "人",
              "unknown": "看不出（Who 空着）", "unclassified": "没归类（Who 不是规定的写法）"}
 # a local Lean rejection has no voucher to cite: the decisions.md rows of the rejected stage, from that day on,
 # are the ones that can record it. Lean's approvals and the stages they cover (aidlc_lean.py, "Stages in order"):
 # INCEPTION = requirements + application-design, PLAN = code-generation; Stage cells name the stage
-STAGE_WORDS = {"REQUIREMENTS": ("requirement",), "DESIGN": ("design",),
+STAGE_WORDS = {"IDEATION": ("ideation", "intent", "scope", "构想"), "REQUIREMENTS": ("requirement",), "DESIGN": ("design",),
                "INCEPTION": ("inception", "requirement", "design"), "PLAN": ("plan", "code"),
                "RELEASE": ("release", "acceptance", "验收")}
 WHO_WORDS = "agent / brain <条目号> / check / <化名> <凭证号> / owner（本地半程，负责人在对话里答的）"

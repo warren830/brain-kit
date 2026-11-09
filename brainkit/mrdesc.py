@@ -45,6 +45,11 @@ MR_FILE = "MR.md"
 # a reply line the bridge reads as an answer (bridge.decisions.ANSWER_RE starts like this): inert() quotes it
 ANSWER_LINE_RE = re.compile(r"(?i)^\s*(?:answer|答|回答)\s+D-[0-9]")
 REQ_DOC = "inception/requirements/requirements.md"
+# Lean 0.3 Ideation (only with `lean new --ideation`): IDEATION covers the Ideation documents; the hand-off brief
+# is always among them
+IDEATION_DOC = "ideation/approval-handoff/initiative-brief.md"
+IDEATION_IDS = ("intent-capture", "market-research", "feasibility", "scope-definition", "team-formation",
+                "rough-mockups", "approval-handoff")
 DESIGN_DOC = "inception/application-design/application-design.md"
 PLANS_DIR = "construction/plans"
 SUMMARY_DOC = "construction/build-and-test/build-and-test-summary.md"
@@ -52,15 +57,21 @@ REVIEW_DOC = "construction/build-and-test/review.md"
 RELEASE_DOC = "operations/release.md"
 DECISIONS_DOC = "decisions.md"
 LEAN_EXCLUDE = list(lean.DEFAULT_FINGERPRINT_EXCLUDE)     # Lean's default fingerprint_exclude
-STAGE_NAMES = {"reverse-engineering": "逆向工程", "requirements": "需求分析", "user-stories": "用户故事",
+STAGE_NAMES = {"intent-capture": "意图捕获", "market-research": "市场调研", "feasibility": "可行性评估",
+               "scope-definition": "范围定义", "team-formation": "团队组建", "rough-mockups": "草图原型",
+               "approval-handoff": "审批交接", "ci-pipeline": "CI 流水线", "deployment-pipeline": "部署流水线",
+               "environment-provisioning": "环境准备", "deployment-execution": "部署执行",
+               "observability-setup": "可观测性", "incident-response": "故障响应",
+               "performance-validation": "性能验证", "feedback-optimization": "反馈优化",
+               "reverse-engineering": "逆向工程", "requirements": "需求分析", "user-stories": "用户故事",
                "application-design": "应用设计", "units": "拆分单元", "functional-design": "功能设计",
                "nfr-design": "非功能设计", "infrastructure-design": "基础设施设计", "code-generation": "代码生成",
                "build-and-test": "构建测试", "release": "发布"}
 STAGE_STATE = {"STAGE_STARTED": "进行中", "STAGE_COMPLETED": "做完", "STAGE_SKIPPED": "跳过"}
 KIND_LABEL = {"clarify": "澄清", "design": "设计", "plan": "计划", "acceptance": "验收", "action": "危险动作",
               "other": "其他"}
-APPROVER = {"REQUIREMENTS": "产品", "DESIGN": "Builder", "PLAN": "Builder", "RELEASE": "产品"}
-MISSING_DOC = {"REQUIREMENTS": "还没有 requirements.md", "DESIGN": "还没写 application-design.md",
+APPROVER = {"IDEATION": "产品", "REQUIREMENTS": "产品", "DESIGN": "Builder", "PLAN": "Builder", "RELEASE": "产品"}
+MISSING_DOC = {"IDEATION": "还没写构想文档（initiative-brief.md）", "REQUIREMENTS": "还没有 requirements.md", "DESIGN": "还没写 application-design.md",
                "PLAN": "还没有代码生成计划", "RELEASE": "还没跑 lean release"}
 LIMIT = {"ac": 12, "decisions": 10, "assumptions": 8, "open_items": 5, "groups": 8, "code": 8, "risky": 5,
          "proposals": 5, "gaps": 3, "not_doing": 5, "approvals": 6, "findings": 3}
@@ -518,6 +529,8 @@ def _approvals(events, tree, docs, plans, lcfg, req) -> dict:
     stage = lambda sid: next((e for e in reversed(events) if e.get("event") in STAGE_STATE  # noqa: E731
                               and _d(e).get("stage") == sid), None)
     need = [("REQUIREMENTS", None, "%s/%s" % (docs, REQ_DOC))]
+    if any(e.get("event") in STAGE_STATE and _d(e).get("stage") in IDEATION_IDS for e in events):
+        need.insert(0, ("IDEATION", None, "%s/%s" % (docs, IDEATION_DOC)))     # Ideation used (not PHASE_SKIPPED)
     skipped = stage("application-design")
     if skipped and skipped["event"] == "STAGE_SKIPPED" and (req or {}).get("size") == "small":
         design_skipped = True
