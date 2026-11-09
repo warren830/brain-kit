@@ -21,22 +21,22 @@
     "file://brain/PROJECT.md",
     "file://.kiro/steering/*.md"
   ],
-  "_notes": "Install at user level on the team runner: ~/.kiro/agents/brain-run.json (KiroCrew on kas/v3 reads agent specs and their hooks from the user level only, and never reads a project's .kiro/hooks/). Lean's hooks run through the hooks field above via the workspace's .kiro/brain/lean-hook.py. Messages the bridge sends count as human turns for Lean; that is by design (the bridge verified them). Still to confirm on the runner (V1): resources load from the workspace, the model is honoured, subagents also carry the hooks.",
+  "_notes": "Install at user level on the team runner: ~/.kiro/agents/brain-run.json (KiroCrew on kas/v3 reads agent specs and their hooks from the user level only, and never reads a project's .kiro/hooks/). Lean's hooks run through the hooks field above via the INSTALLED brain-kit's adapter (/opt/brain-kit/kit/.kiro/brain/lean-hook.py, run with /usr/bin/python3 -I), never the workspace's .kiro/brain/lean-hook.py, which the run could change. --runner names runnerd's config (spool_dir, runs_root, allowed_signers; hook_path, the PATH for git and ssh-keygen, default /usr/bin:/bin): the adapter takes the hand-over commit from the bridge-signed request in the spool and refuses every tool call while the workspace's kit files (.kiro/brain/, .kiro/agents/, .kiro/hooks/, .kiro/aidlc-lean/, .brain/kit.json, gates/) differ from it. With brain-kit installed elsewhere, change the three paths (and prompt) to that folder. Set runnerd.json agent_spec to this file: runnerd then refuses to prepare a workspace while its hooks do not run that kit's adapter this way. A session runs as brainbot: keep /opt/brain-kit and /etc/brain-kit (runnerd.json, allowed_signers) not writable by it, and this file too where KiroCrew allows (root-owned in a root-owned ~/.kiro/agents/). Messages the bridge sends count as human turns for Lean; that is by design (the bridge verified them). Still to confirm on the runner (V1): resources load from the workspace, the model is honoured, subagents also carry the hooks, KiroCrew writes nothing into a workspace's .kiro/agents/ or .kiro/hooks/ (the adapter would take that for a changed kit file).",
   "hooks": {
     "agentSpawn": [
       {
-        "command": "python3 .kiro/brain/lean-hook.py SessionStart"
+        "command": "/usr/bin/python3 -I /opt/brain-kit/kit/.kiro/brain/lean-hook.py --runner /etc/brain-kit/runnerd.json SessionStart"
       }
     ],
     "userPromptSubmit": [
       {
-        "command": "python3 .kiro/brain/lean-hook.py UserPromptSubmit"
+        "command": "/usr/bin/python3 -I /opt/brain-kit/kit/.kiro/brain/lean-hook.py --runner /etc/brain-kit/runnerd.json UserPromptSubmit"
       }
     ],
     "preToolUse": [
       {
         "matcher": "*",
-        "command": "python3 .kiro/brain/lean-hook.py PreToolUse"
+        "command": "/usr/bin/python3 -I /opt/brain-kit/kit/.kiro/brain/lean-hook.py --runner /etc/brain-kit/runnerd.json PreToolUse"
       }
     ]
   }

@@ -63,14 +63,21 @@ class KiroCrew:
     def set_project(self, name, path):
         return self._call("POST", "/api/chat/slots/%s/project" % q(name), body={"project": path})
 
-    def send(self, name, message, send_id):
+    def send(self, name, message, send_id, idempotency_key=None):
         if not SEND_ID_RE.match(send_id):
             raise BrainError("sendId must match [A-Za-z0-9_-]{1,128}")
         # KiroCrew does not deduplicate by meta.sendId; its Idempotency-Key makes a retry of the same send (one
         # KiroCrew process) a replay. The bridge also reads the slot before it sends a message again (delivery.py).
+        key = idempotency_key or send_id
         return self._call("POST", "/api/chat", query={"ws": "1"},
                           body={"slot": name, "message": message, "meta": {"sendId": send_id}},
-                          headers={"Idempotency-Key": send_id} if len(send_id) >= 8 else None)
+                          headers={"Idempotency-Key": key} if len(key) >= 8 else None)
+
+    def send_again(self, name, message, send_id, attempt):
+        """The same message (same meta.sendId) once more, after the slot showed that the earlier send did not land.
+        It gets its own Idempotency-Key: under the first one KiroCrew would replay the earlier send's answer (an
+        error) instead of sending it."""
+        return self.send(name, message, send_id, idempotency_key="%s-r%d" % (send_id, int(attempt)))
 
     def slot(self, name):
         return self._call("GET", "/api/chat/slots/%s" % q(name))

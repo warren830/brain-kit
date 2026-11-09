@@ -18,10 +18,12 @@ Brain usage (brainkit.usage); read-only.
                     entry) > agent (Who = agent, assumptions A-n) > unknown (Who empty); a Who outside that vocabulary
                     is "unclassified" and listed (key, id, where), never guessed; per ISO week
   复看队列          runs that need a human look, each with its reasons; also every unmerged run that is stuck (no
-                    progress for --stuck-hours), closed, failed on the runner, in a *_unknown state, or whose bridge
-                    question went void / invalid / unknown
-  这一批            one row per requirement: state, autonomous or not, human acts at / outside judgment points,
-                    questions asked, credits, delivered correctly or still open
+                    progress for --stuck-hours: waiting on whom for what, or holding an answer it did not go on with),
+                    closed, failed on the runner, in a *_unknown state, or whose bridge question went void / invalid /
+                    unknown / refused
+  这一批            one row per requirement: state, autonomous or not (a run that failed on the runner or whose MR
+                    was closed never is), human acts at / outside judgment points, questions asked, credits,
+                    delivered correctly or still open
   大需求            a split (brainkit/split.py): one row per parent (families), its children, how many merged into
                     its branch, judgment / questions / credits of the parent and its children together (trace's
                     family roll-up); a child merged into its parent's branch and not yet into main is
@@ -64,13 +66,18 @@ STUCK_HOURS = 24         # an unmerged run with nothing new for this long is stu
 DROPPED = {"stale": "过时（MR 更新了，问题重发）", "void": "作废", "invalid": "无效", "closed": "MR 关了"}
 # ... and the ones that leave an unmerged run stuck (review queue)
 QUESTION_PROBLEMS = {"void": "作废", "invalid": "无效", "delivery_unknown": "送达不明", "refused": "签名服务拒签"}
-STATE_LABEL = {"merged": "已合并", "accepted": "验收过了、没合并", "waiting": "在等回答", "open": "进行中",
+STATE_LABEL = {"merged": "已合并", "accepted": "验收过了、没合并", "waiting": "在等回答",
+               "answered": "有了回答、run 没接着做", "open": "进行中",
                "closed": "MR 关了（没合并）", "failed": "运行机失败", "unknown": "派单结果不明",
                "merged_not_here": "桥说已合并（这里的 main 没有）", "not_readable": "读不到（只有桥上的记录）",
-               "merged_into_parent": "已合进大需求"}
+               "unreadable": "run.json 读不了", "merged_into_parent": "已合进大需求"}
 FAMILY_LABEL = {"in_progress": "小需求在做", "ready_to_release": "小需求都合进了，等发布"}
 DELIVERY_LABEL = {"correct": "对", "wrong": "不对", "pending": "14 天未满", "wrong_open": "有问题（14 天未满）",
-                  "unknown": "没有验收记录", "open": "还没合并", "closed": "没合并"}
+                  "unknown": "没有验收记录", "open": "还没合并", "closed": "没合并",
+                  "merged_not_here": "桥说合并了（这里读不到合并，对不对不知道）"}
+# a hand-over run that ended without delivering is never autonomous, whoever stepped in (E5): the runner never got
+# going, or the MR was closed (a person's act outside every judgment point)
+ENDED = {"failed": "runner_failed", "closed": "closed_unmerged"}
 
 
 def run_keys(repo, cfg, ref=None) -> list:
@@ -108,7 +115,8 @@ def run_branches(repo, cfg, have=()) -> dict:
 
 
 def ledger_runs(path) -> dict:
-    """{requirement key: [run rows, oldest first]} from the bridge ledger (opened read-only)."""
+    """{requirement key: [run rows, oldest first]} from the bridge ledger (opened read-only). A run id reserved
+    while a hand-over is signed (state 'signing') is not a run yet."""
     if not path:
         return {}
     if not os.path.exists(path):
@@ -119,7 +127,8 @@ def ledger_runs(path) -> dict:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'").fetchone():
             return {}
         out = {}
-        for r in db.execute("SELECT run_id, req, state, created, updated FROM runs ORDER BY created, run_id"):
+        for r in db.execute("SELECT run_id, req, state, created, updated FROM runs WHERE state != ? "
+                            "ORDER BY created, run_id", (T.RESERVED,)):
             out.setdefault(str(r["req"]), []).append({"run_id": r["run_id"], "state": r["state"],
                                                       "created": T._utc(r["created"]),
                                                       "updated": T._utc(r["updated"]), "src": "bridge ledger runs"})
@@ -137,8 +146,11 @@ def done_at(t):
 
 
 def last_at(t):
+    """When anything last happened to the run: stages, people, decisions, commits, the merge or acceptance, and the
+    trace's last_activity (a ledger row changed: an MR closed, a run failed; a voucher)."""
     ats = [s["at"] for s in t["stages"]] + [h["at"] for h in t["humans"]] + [d.get("at") for d in t["decisions"]]
     ats += [c["at"] for c in t["actions"]["commits"] or []] + [done_at(t)]
+    ats += [(t["outcome"].get("last_activity") or {}).get("at")]
     ats = [a for a in ats if a]
     return max(ats) if ats else None
 
@@ -161,7 +173,9 @@ def correctness(t):
 
 
 def beyond_required(t) -> list:
-    """Human acts after hand-over other than the required approvals; None in the list = could not tell."""
+    """Human acts after hand-over other than the required approvals; None in the list = could not tell (an act
+    without a time; or the run's commits are not here, e.g. squash-merged with its branch gone: a person's push
+    after the hand-over cannot be seen)."""
     out = []
     for h in t["humans"]:
         if h["kind"] in ("approval", "approval_refused") and h["what"] in REQUIRED:
@@ -170,6 +184,8 @@ def beyond_required(t) -> list:
             out.append(h)
         elif h["after_handover"] is None:
             out.append(None)
+    if t["actions"]["commits"] is None and t["outcome"]["handed_over"]["value"]:
+        out.append(None)
     return out
 
 
@@ -220,9 +236,9 @@ def build_traces(repo, cfg, ref=None, ledger_path=None, vouchers_dir=None, credi
     if found is not None:
         found.update(branches=dict(branches), ledger_only=list(gone))
     note = None
-    if T.credits_shape(credits) == "one" and len(keys) + len(branches) > 1:
-        note = "--credits 只有一条记录，却有 %d 个需求：不知道是谁的，没有算给任何一个（请按 run 号或需求号给）" % (
-            len(keys) + len(branches))
+    n = len(keys) + len(branches) + len(gone)     # the ledger's runs not readable here are requirements too
+    if T.credits_shape(credits) == "one" and n > 1:
+        note = "--credits 只有一条记录，却有 %d 个需求：不知道是谁的，没有算给任何一个（请按 run 号或需求号给）" % n
         credits = {"runs": {}}
     traces, skipped, made = [], [], {}       # made: a split parent's trace makes its children's; each is made once
     for k, r, u in [(k, ref, _usage) for k in keys] + [(k, branches[k], None) for k in sorted(branches)]:
@@ -245,11 +261,12 @@ def build_traces(repo, cfg, ref=None, ledger_path=None, vouchers_dir=None, credi
 
 def run_state(t, as_of=None, stuck_hours=STUCK_HOURS) -> dict:
     """Where a run is: {"value", "bridge" (the ledger state of its last run), "last_activity", "idle_hours",
-    "stuck", "waiting_on"}. value: merged | merged_not_here (the ledger says merged; git here has no merge) |
-    closed (MR closed, not merged) | failed (the runner could not start it) | unknown (a *_unknown ledger state: the
-    bridge cannot tell whether it was sent) | waiting (parked on a question, or a bridge question is open) |
-    accepted (accepted, not merged yet) | open. Stuck: not merged, closed or failed, and nothing new for
-    `stuck_hours` (commits, Lean records, park questions, ledger rows, vouchers)."""
+    "stuck", "waiting_on", "answered"}. value: merged | merged_not_here (the ledger says merged; git here has no
+    merge) | closed (MR closed, not merged) | failed (the runner could not start it) | unknown (a *_unknown ledger
+    state: the bridge cannot tell whether it was sent) | answered (parked on a question the bridge already has the
+    answer to: delivered, or on its way; the run did not go on) | waiting (parked on a question nobody answered yet,
+    or a bridge question is open) | accepted (accepted, not merged yet) | open. Stuck: not merged, closed or failed,
+    and nothing new for `stuck_hours` (commits, Lean records, park questions, ledger rows, vouchers)."""
     o = t["outcome"]
     fam = t.get("family") or {}
     br = sorted(o.get("bridge_runs") or [], key=lambda r: (r.get("created") or "", r.get("run_id") or ""))
@@ -267,18 +284,33 @@ def run_state(t, as_of=None, stuck_hours=STUCK_HOURS) -> dict:
         v = {"merged": "merged_not_here"}.get(last, last)
     elif last and last.endswith("_unknown"):
         v = "unknown"
+    elif o.get("answered"):
+        v = "answered"
     elif o.get("waiting_on"):
         v = "waiting"
     elif o["accepted"]["value"]:
         v = "accepted"
     else:
         v = "open"
-    stuck = v in ("open", "waiting", "accepted", "unknown") and idle is not None and idle >= stuck_hours
+    stuck = v in ("open", "waiting", "answered", "accepted", "unknown") and idle is not None and idle >= stuck_hours
     st = {"value": v, "bridge": last, "last_activity": la, "idle_hours": idle, "stuck": stuck,
-          "waiting_on": o.get("waiting_on")}
+          "waiting_on": o.get("waiting_on"), "answered": o.get("answered")}
     if fam.get("role") == "parent":
         st["family_activity"] = fam["rollup"]["last_activity"]
     return st
+
+
+def _stuck_on(st) -> str:
+    """What a stuck run is held up by (E3): who is asked what; or the answer it has and did not go on with."""
+    a, w = st.get("answered"), st.get("waiting_on")
+    if a:
+        return "，%s 的回答%s（%s）：%s" % (a.get("decision") or "?", T.ANSWERED_LABEL.get(a.get("state"), a.get("state")),
+                                       a.get("at") or "?", T.ANSWERED_NEXT.get(a.get("state"), ""))
+    if w:
+        return "，在等%s回答%s：%s%s" % (" %s " % w["ask"] if w.get("ask") else "",
+                                    " " + w["decision"] if w.get("decision") else "", w.get("kind") or "?",
+                                    " " + w["lean_request"] if w.get("lean_request") else "")
+    return ""
 
 
 def open_reasons(t, st, stuck_hours=STUCK_HOURS) -> list:
@@ -288,12 +320,9 @@ def open_reasons(t, st, stuck_hours=STUCK_HOURS) -> list:
     if v == "merged":
         return out
     if st["stuck"]:
-        w = st["waiting_on"]
         out.append({"rule": "stuck", "text": "%.0f 小时没有进展（最后一次 %s，≥%g 小时算停住）%s" % (
-            st["idle_hours"], st["last_activity"], stuck_hours,
-            "，在等回答：%s%s" % (w.get("kind") or "?", " " + w["lean_request"] if w.get("lean_request") else "")
-            if w else ""), "evidence": [(st.get("family_activity") or t["outcome"].get("last_activity") or {})
-                                        .get("src")]})
+            st["idle_hours"], st["last_activity"], stuck_hours, _stuck_on(st)),
+            "evidence": [(st.get("family_activity") or t["outcome"].get("last_activity") or {}).get("src")]})
     if v == "closed":
         out.append({"rule": "closed_unmerged", "text": "MR 关了，没有合并", "evidence": "bridge ledger runs"})
     if v == "failed":
@@ -318,24 +347,45 @@ def questions_asked(t) -> int:
     return T.questions_asked(t)
 
 
+def _beyond(b) -> list:
+    return sorted({h["kind"] + (" " + h["what"] if h["what"] else "") for h in b if h})
+
+
+def autonomy_of(t, st):
+    """(autonomous, beyond) of a handed-over run (E5): True when nobody did anything after the hand-over besides
+    the required approvals; None when that cannot be told; False when someone did (beyond: what), and always for a
+    run that ended without delivering (ENDED: the runner failed, the MR was closed; beyond names it too)."""
+    b = beyond_required(t)
+    auto, beyond = (None if None in b else not b), _beyond(b)
+    if st["value"] in ENDED:
+        auto, beyond = False, beyond + [ENDED[st["value"]]]
+    return auto, beyond
+
+
+def _delivery(t, st):
+    if t["outcome"]["merged_at"]["value"]:
+        return correctness(t)
+    return st["value"] if st["value"] in ("closed", "merged_not_here") else "open"
+
+
 def batch(traces, skipped, states) -> list:
     """One row per requirement (the batch summary): {key, state, stuck, idle_hours, handed_over, autonomous (None:
-    not handed over, or a human act without a time), beyond (what people did after the hand-over besides the
-    required approvals), judgment [at judgment points, outside], questions, credits, delivery (correct | wrong |
-    pending | wrong_open | unknown | open | closed)}."""
+    not handed over, or it cannot be told: a human act without a time, the run's commits not here; False also for a
+    run that failed on the runner or whose MR was closed), beyond (what kept it from being autonomous: people's acts
+    after the hand-over besides the required approvals, runner_failed, closed_unmerged), judgment [at judgment
+    points, outside], questions, credits, delivery (correct | wrong | pending | wrong_open | unknown | open | closed |
+    merged_not_here)}. A skipped run gets a row too: not_readable (only the ledger has it), unreadable (its run.json
+    cannot be read)."""
     rows = []
     for t in sorted(traces, key=lambda x: x["key"]):
         st = states[t["key"]]
         handed = bool(t["outcome"]["handed_over"]["value"])
-        b = beyond_required(t) if handed else []
+        auto, beyond = autonomy_of(t, st) if handed else (None, [])
         jp = [h["judgment_point"] for h in t["humans"]]
         rows.append({"key": t["key"], "state": st["value"], "stuck": st["stuck"], "idle_hours": st["idle_hours"],
-                     "handed_over": handed, "autonomous": (None if None in b else not b) if handed else None,
-                     "beyond": sorted({h["kind"] + (" " + h["what"] if h["what"] else "") for h in b if h}),
+                     "handed_over": handed, "autonomous": auto, "beyond": beyond,
                      "judgment": [jp.count(True), jp.count(False)], "questions": questions_asked(t),
-                     "credits": t["cost"]["credits"],
-                     "delivery": correctness(t) if t["outcome"]["merged_at"]["value"] else (
-                         "closed" if st["value"] == "closed" else "open")})
+                     "credits": t["cost"]["credits"], "delivery": _delivery(t, st)})
         if (t.get("family") or {}).get("role") == "child":
             rows[-1]["parent"] = t["family"]["parent"]
     for s in skipped:
@@ -344,7 +394,11 @@ def batch(traces, skipped, states) -> list:
             rows.append({"key": s["key"], "state": "not_readable", "bridge": last.get("state"), "stuck": None,
                          "idle_hours": None, "handed_over": True, "autonomous": None, "beyond": [],
                          "judgment": None, "questions": None, "credits": None,
-                         "delivery": "closed" if last.get("state") == "closed" else "open"})
+                         "delivery": {"closed": "closed", "merged": "merged_not_here"}.get(last.get("state"), "open")})
+        else:   # its run.json is here but cannot be read (not JSON, wrong field types): nothing is known
+            rows.append({"key": s["key"], "state": "unreadable", "stuck": None, "idle_hours": None,
+                         "handed_over": None, "autonomous": None, "beyond": [], "judgment": None, "questions": None,
+                         "credits": None, "delivery": None})
     return sorted(rows, key=lambda r: r["key"])
 
 
@@ -412,16 +466,20 @@ def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouc
         # not merged yet: known wrong or not, it waits for its merge and 14 days like a merged one (N11)
         c = correctness(t) if t["outcome"]["merged_at"]["value"] else (
             "wrong_open" if t["outcome"]["accepted"]["first_time"] is False else "pending")
-        b = beyond_required(t)
-        auto = None if None in b else not b
-        row = {"key": t["key"], "correct": c, "autonomous": auto,
-               "beyond": sorted({h["kind"] + (" " + h["what"] if h["what"] else "") for h in b if h})}
-        if c in ("correct", "wrong") and auto is not None:
+        st = states[t["key"]]
+        auto, beyond = autonomy_of(t, st)
+        row = {"key": t["key"], "correct": c, "autonomous": auto, "beyond": beyond}
+        if st["value"] in ENDED:               # accepted, then the MR closed / the runner failed: never delivered
+            row["status"] = st["value"]
+        elif c in ("correct", "wrong") and auto is not None:
             den += 1
             num += 1 if auto and c == "correct" else 0
             row["status"] = "counted"
+        elif c not in ("correct", "wrong"):
+            row["status"] = "pending"
         else:
-            row["status"] = "pending" if c not in ("correct", "wrong") else "unknown (human acts without a time)"
+            row["status"] = "unknown (the run's commits are not here)" if t["actions"]["commits"] is None else \
+                "unknown (human acts without a time)"
         rows.append(row)
     autonomy = {"value": [num, den], "runs": rows,
                 "rule": "交接之后，除了必经的审批（REQUIREMENTS / DESIGN / INCEPTION / PLAN / RELEASE、验收），没有人做过"
@@ -656,7 +714,8 @@ def _pct(a, b):
 
 
 def _yes(v, handed=True) -> str:
-    return "本地" if not handed else {True: "是", False: "否", None: "?"}[v]
+    """是 / 否 / ? of a handed-over run; 本地 = not handed over; handed None (unreadable run.json): ?."""
+    return "?" if handed is None else "本地" if not handed else {True: "是", False: "否", None: "?"}[v]
 
 
 def batch_report(data) -> list:
@@ -683,7 +742,8 @@ def batch_report(data) -> list:
             r["key"], state, _yes(r["autonomous"], r["handed_over"]) + ("（%s）" % "、".join(r["beyond"])
                                                                          if r["beyond"] else ""),
             "%d / %d" % tuple(j) if j else "-", "-" if r["questions"] is None else r["questions"],
-            "-" if r["credits"] is None else r["credits"], DELIVERY_LABEL.get(r["delivery"], r["delivery"])))
+            "-" if r["credits"] is None else r["credits"],
+            "-" if r["delivery"] is None else DELIVERY_LABEL.get(r["delivery"], r["delivery"])))
     for f in data.get("families") or []:
         if f is data["families"][0]:
             out += ["", "大需求（拆成小需求的；判断点、提问、credits 是大需求自己加上小需求的）："]
@@ -694,9 +754,18 @@ def batch_report(data) -> list:
     return out
 
 
+AUTONOMY_STATUS = {"local only": "没交接（只在本地做），不算", "pending": "交付对不对还不知道",
+                   "closed": "MR 关了、没合并，不算", "failed": "运行机失败，不算",
+                   "unknown (the run's commits are not here)": "交接后的提交读不到（比如 squash 合并、分支删了），"
+                                                               "看不出有没有人插手，不算",
+                   "unknown (human acts without a time)": "有人做了事、但没有时间，看不出是不是交接后，不算"}
+
+
 def report(data) -> str:
-    out = ["Eval（%s%s）：%d 个需求，完成 %d 个" % (data["ref"], "，从 %s 起" % data["since"] if data["since"] else "",
-                                            data["runs"], len(data["completed"]))]
+    lo = data.get("ledger_only") or []
+    out = ["Eval（%s%s）：%d 个需求，完成 %d 个%s" % (
+        data["ref"], "，从 %s 起" % data["since"] if data["since"] else "", data["runs"], len(data["completed"]),
+        "；另有 %d 个只在桥上（这里读不到 run.json：%s）" % (len(lo), ", ".join(lo)) if lo else "")]
     for s in data.get("skipped") or []:
         out.append("跳过 %s（读不了，不算）：%s" % (s["key"], s["why"]))
     if data.get("open_branches"):
@@ -714,9 +783,8 @@ def report(data) -> str:
     out.append("  算法：" + a["rule"])
     for r in a["runs"]:
         if r["status"] != "counted":
-            out.append("  %s：%s" % (r["key"], "已知有问题，合并满 14 天才算" if r.get("correct") == "wrong_open" else
-                                     {"local only": "没交接（只在本地做），不算",
-                                      "pending": "交付对不对还不知道"}.get(r["status"], r["status"])))
+            out.append("  %s：%s" % (r["key"], "已知有问题，合并满 14 天才算" if r.get("correct") == "wrong_open" and
+                                     r["status"] == "pending" else AUTONOMY_STATUS.get(r["status"], r["status"])))
         elif r["beyond"]:
             out.append("  %s：交接后有人介入（%s）" % (r["key"], "、".join(r["beyond"])))
     d = data["delivery"]

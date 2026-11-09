@@ -548,7 +548,9 @@ class SendErrorIsToldAndSettled(unittest.TestCase):
         t.bridge.collect()
         self.assertEqual(len(answers_delivered(t)), 2)
 
-    def test_6_three_sends_that_never_land_and_the_bridge_gives_up_once(self):
+    def test_6_three_sends_that_never_land_tell_the_mr_once_and_sending_goes_on(self):
+        """QA r4 #50 changed this: the bridge used to stop for good after three sends (the run then waited for ever);
+        now the MR hears once after three and the bridge goes on sending (tests/test_qa_r4_bridge.py)."""
         t = self.t
         t.dispatched()
         t.park()
@@ -559,10 +561,15 @@ class SendErrorIsToldAndSettled(unittest.TestCase):
         for _ in range(6):
             t.bridge.collect()
         tried = [c for c in t.fake.called("POST", r"/api/chat") if c[3]["message"].startswith("决策 D-1 已答")]
-        self.assertEqual(len(tried), 3)
-        gave_up = [n for n in notes(t) if n.startswith(RUN + "：桥把消息") and "不再自动送了" in n]
+        self.assertEqual(len(tried), 6)                       # one each round (after ten, one every 5 minutes)
+        gave_up = [n for n in notes(t) if n.startswith(RUN + "：桥把消息") and "送了 3 次" in n]
         self.assertEqual(len(gave_up), 1)
+        self.assertIn("桥会接着重送", gave_up[0])
         self.assertEqual(state(t), "delivery_unknown")
+        t.fail_send = False                                   # KiroCrew takes messages again
+        t.bridge.collect()
+        landed = [m for m in t.slot_msgs.get("run-pay-1-1", []) if m["content"].startswith("决策 D-1 已答")]
+        self.assertEqual((state(t), len(landed)), ("delivered", 1))
 
     def test_6_an_older_bridges_answer_that_did_not_land_is_delivered_anew(self):
         t = self.t

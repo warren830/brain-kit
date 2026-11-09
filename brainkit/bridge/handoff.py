@@ -64,6 +64,15 @@ BRIDGE_DEFAULTS = {
     # row, or this many minutes since the first
     "edit_check_rounds": 3,
     "edit_check_wait_minutes": 30,
+    # a hand-over KiroCrew does not take (each send answered with an error, the slot shows it did not land) is sent
+    # again each round, then every 5 minutes; after this many minutes the run is failed and the MR says how to hand
+    # over again
+    "send_give_up_minutes": 60,
+    # a run brain-runnerd has neither prepared nor failed (nor tried again) for this long: the MR is told once (the run
+    # stays queued; it starts once runnerd prepares it)
+    "runnerd_wait_minutes": 90,
+    # an acceptance question waits for the MR head's pipeline to pass; one still running after this long: the MR hears
+    "acceptance_ci_wait_minutes": 60,
     "intake_dir": "",
     "runner_runs_root": "",
     "kirocrew": {"base": "http://127.0.0.1:5476", "app": "brain-bridge", "secret_file": "",
@@ -89,9 +98,9 @@ def load_bridge_config(path) -> dict:
 # it calls transient (runnerd itself tries such a request up to its own `tries` first), and how long after it gave up
 REQUEUES, REQUEUE_AFTER_S = 2, 300
 SETUP_TELL_AFTER = 3        # rounds of failed KiroCrew session setup before the MR is told (it is retried each round)
-# a run waiting for a person (a question open, being posted, or an answer whose delivery is unknown) holds no
-# session at work: it does not count against max_inflight / max_per_repo
-WAITING_DECISION_STATES = ("open", "posting", "asking", "delivery_unknown")
+# a run waiting for a person (a question open, being posted or asked) holds no session at work: it does not count
+# against max_inflight / max_per_repo. An answer whose delivery is unknown may have landed: that run counts.
+WAITING_DECISION_STATES = ("open", "posting", "asking")
 
 
 def _paths_meet(path, pattern) -> bool:
@@ -139,6 +148,12 @@ class Bridge(DecisionLoop):
             self._ids_mtime = os.stat(cfg["identities"]).st_mtime
         except OSError:
             self._ids_mtime = None
+
+    @property
+    def send_give_up_s(self) -> float:
+        """Seconds a hand-over KiroCrew does not take is sent again before its run is failed (bridge.json
+        send_give_up_minutes)."""
+        return sign.seconds(self.cfg.get("send_give_up_minutes"), 60.0) * 60
 
     @property
     def reservation_ttl(self) -> float:
@@ -621,9 +636,12 @@ class Bridge(DecisionLoop):
         return sent
 
     def active_runs(self, project=None) -> int:
-        """Dispatched runs at work (in `project`): one that waits for a person holds no session at work."""
+        """Runs whose session is, or may be, at work (in `project`): dispatched, or a hand-over that may have landed
+        (send_unknown; ready with its message in the outbox: being sent, or cut off). One that waits for a person
+        holds no session at work; one whose answer may have landed (delivery_unknown) does."""
         self._ddb()
-        q, args = "SELECT COUNT(*) FROM runs r WHERE r.state='dispatched'", []
+        q, args = ("SELECT COUNT(*) FROM runs r WHERE (r.state IN ('dispatched', 'send_unknown') OR (r.state='ready' "
+                   "AND EXISTS (SELECT 1 FROM outbox o WHERE o.send_id=r.voucher_id)))"), []
         if project is not None:
             q, args = q + " AND r.project=?", [project]
         q += (" AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.run_id=r.run_id AND d.state IN (%s))"
@@ -675,12 +693,12 @@ class Bridge(DecisionLoop):
             raise
         vid = v["voucher_id"]
         msg = self.message(v, extra=self._risk_lines(row, kit))
-        ob, new = self.ledger.outbox_put(vid, rid, slot, "handover:" + rid, msg)
+        ob, new = self.ledger.outbox_put(vid, rid, slot, "handover:" + rid, msg, sha=v["sha"])
         if new and existed and self._landed(slot, vid):
             self.ledger.outbox_set(vid, "sending", "sent")  # an older bridge sent it before it stopped
             r = "sent"
         else:
-            r = self._push(vid, slot, msg) if new else self._settle(ob)
+            r = self._push(vid, slot, msg) if new else self._settle(ob, give_up_after=self.send_give_up_s)
         return self._handover_sent(row, slot, r)
 
     def _setup_slot(self, slot, kit, path) -> bool:
@@ -714,8 +732,16 @@ class Bridge(DecisionLoop):
                 % (kit.get("risk_paths_file") or "gates/risk-paths", "、".join(one_line(x, 100) for x in hits[:5]),
                    row["req"])]
 
-    def _handover_sent(self, row, slot, r) -> str:
+    def _handover_sent(self, row, slot, r, state="ready") -> str:
+        """After the hand-over's send (the run is in `state`): dispatched, its outcome unknown (the MR hears once),
+        dropped (KiroCrew did not take it for send_give_up_minutes: the run is failed, the MR says how to hand over
+        again) or being sent by another bridge process."""
         rid = row["run_id"]
+        if r == "dropped":
+            ob = self.ledger.outbox(row["voucher_id"])
+            self._fail_run(row, "桥把接手消息送了 %d 次，KiroCrew 会话 %s 一直没有收下（%d 分钟）" % (
+                int(ob["tries"] or 0) if ob is not None else 0, slot, int(self.send_give_up_s // 60)), frm=state)
+            return "failed"
         if r == "sent":
             if self.ledger.set_run(rid, "ready", "dispatched", slot=slot) or \
                     self.ledger.set_run(rid, "send_unknown", "dispatched", slot=slot):
@@ -759,18 +785,21 @@ class Bridge(DecisionLoop):
                 self.ledger.set_run(row["run_id"], "ready", "spooled")
                 self.out("%s: its slot setup was cut off; dispatched again" % row["run_id"])
             return
-        self._handover_sent(row, ob["slot"], self._settle(ob))
+        self._handover_sent(row, ob["slot"], self._settle(ob, give_up_after=self.send_give_up_s))
 
     def _recover_send_unknown(self, row):
         rid, slot = row["run_id"], row["slot"] or row["run_id"].lower()
         ob = self.ledger.outbox(row["voucher_id"])
         if ob is None:                  # an older bridge's: its message rebuilt from the voucher
-            msg = self.message(json.loads(row["voucher"] or "{}"))
-            self.ledger.outbox_put(row["voucher_id"], rid, slot, "handover:" + rid, msg)
+            v = json.loads(row["voucher"] or "{}")
+            self.ledger.outbox_put(row["voucher_id"], rid, slot, "handover:" + rid, self.message(v), sha=v.get("sha"))
             self.ledger.outbox_set(row["voucher_id"], "sending", "unknown")
             self._handover_sent(dict(row, state="ready"), slot, "unknown")           # the MR hears once
             ob = self.ledger.outbox(row["voucher_id"])
-        if self._settle(ob) == "sent" and self.ledger.set_run(rid, "send_unknown", "dispatched", slot=slot):
+        r = self._settle(ob, give_up_after=self.send_give_up_s)
+        if r == "dropped":
+            self._handover_sent(row, slot, r, state="send_unknown")
+        elif r == "sent" and self.ledger.set_run(rid, "send_unknown", "dispatched", slot=slot):
             self.out("%s: its hand-over had landed (or was sent again); dispatched" % rid)
 
     def _tell_queued(self, row, limit, project):
@@ -797,14 +826,20 @@ class Bridge(DecisionLoop):
         rid = row["run_id"]
         f = self._read_failed(rid)
         if f is None:
+            self._runnerd_silent(row, row["updated"])       # nothing from runnerd since the run was spooled
             return
         asked = self.ledger.count_of("requeue:" + rid)
         try:
             attempt = int(f.get("attempt") or 0)
         except (TypeError, ValueError):
             attempt = 0
-        if attempt < asked or not f.get("final", True):
-            return                                  # runnerd has not looked at the newer request yet, or still tries
+        if attempt < asked:                         # runnerd has not looked at the newer request yet
+            n = self.ledger.notice("requeue:" + rid)
+            self._runnerd_silent(row, n["updated"] if n is not None else row["updated"])
+            return
+        if not f.get("final", True):                # runnerd still tries (it said so then)
+            self._runnerd_silent(row, str(f.get("at") or row["updated"]))
+            return
         err = one_line(f.get("error") or "unknown error", 300)
         if f.get("transient") and asked < REQUEUES:
             try:
@@ -824,10 +859,24 @@ class Bridge(DecisionLoop):
             return
         self._fail_run(row, "运行机建工作区失败（%s）" % err)
 
-    def _fail_run(self, row, why):
-        """The run cannot start: failed, and the MR is told once (labels: rejected instead of running)."""
+    def _runnerd_silent(self, row, since):
+        """runnerd has said nothing about the run since `since` (no workspace, no failure, no new try): after
+        runnerd_wait_minutes the MR is told once (runnerd is down, say). The run stays queued: it starts as soon as
+        runnerd prepares it."""
+        wait = sign.seconds(self.cfg.get("runnerd_wait_minutes"), 90.0)
+        if str(since or "") > iso(utcnow() - timedelta(minutes=wait)):
+            return
         rid = row["run_id"]
-        if not self.ledger.set_run(rid, "spooled", "failed"):
+        self.tell_mr_once("runnerd-silent:" + rid, row["project"], row["iid"], (
+            "%s 还没开始：运行机（brain-runnerd）%d 分钟里没有准备好工作区，也没有报错，可能没在运行。桥接着等，运行机准备好"
+            "以后自动开始，不用重新交接；请负责人看一下 brain-runnerd（比如 `systemctl status brain-runnerd` 和它的 "
+            "runnerd.json）。") % (rid, wait), run_id=rid)
+
+    def _fail_run(self, row, why, frm="spooled"):
+        """The run cannot start: failed (from state `frm`), and the MR is told once (labels: rejected instead of
+        running)."""
+        rid = row["run_id"]
+        if not self.ledger.set_run(rid, frm, "failed"):
             return
         self.tell_mr_once("failed:" + rid, row["project"], row["iid"], "%s 没能开始：%s。处理好以后在分支上重新运行 "
                           "`brain handoff`（它提交交接、推送并打标签），桥会重新接手。" % (rid, why), run_id=rid)
@@ -856,7 +905,8 @@ class Bridge(DecisionLoop):
     def _reconcile_one(self, row):
         mr = self.gl.mr(row["project"], row["iid"])
         if mr.get("state") in ("merged", "closed"):
-            if row["state"] == "dispatched" and row["slot"] and self.kc:
+            # a session is, or may be, at work: stopped (a hand-over whose send is unknown may have landed)
+            if row["state"] in ("dispatched", "send_unknown") and row["slot"] and self.kc:
                 try:
                     self.kc.stop(row["slot"])
                 except BrainError as e:

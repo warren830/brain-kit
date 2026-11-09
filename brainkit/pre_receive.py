@@ -10,10 +10,10 @@ parent's owner may change, close or delete it; a split child is closed, never de
 not change while someone owns it. key, parent, unit, source and filed_by never change. Bots never claim.
 Rules for run branches (<prefix>/<owner>/<JIRA>-<slug>):
   bot accounts   may push only branches under <prefix>/ (well-formed names), never delete or force-push,
-                 never push tags, never change bot_forbidden_paths (gates/, project-agent.yaml, CI, ...), and never
-                 change <runs_dir>/<KEY>/run.json (only `brain start` and `brain handoff`, run by the owner, write it;
-                 the runner writes park.json and its work next to it). Every bot commit is authored and committed
-                 as one of bot_emails.
+                 never push tags, never change bot_forbidden_paths (gates/, project-agent.yaml, CI, ...) or the
+                 kit's own files (KIT_PATHS, whatever the config says), and never change <runs_dir>/<KEY>/run.json
+                 (only `brain start` and `brain handoff`, run by the owner, write it; the runner writes park.json and
+                 its work next to it). Every bot commit is authored and committed as one of bot_emails.
   people         may push under <prefix>/ only to <prefix>/<their own username>/...; other branches are
                  left to GitLab's normal protection.
 
@@ -31,13 +31,19 @@ import sys
 
 from .common import JIRA_RE, ZERO_SHA, parse_branch
 
+# The kit's own files (KIT_PATHS of kit/.kiro/brain/lean-hook.py): they decide what a run may do (AI-DLC Lean, its
+# hooks, the agent specs, the hook adapter, the kit config, gates/). The runner's sessions may not change them, and bot
+# commits may not either, whatever a project's or the server's bot_forbidden_paths says.
+KIT_PATHS = (".kiro/brain/", ".kiro/agents/", ".kiro/hooks/", ".kiro/aidlc-lean/", ".brain/kit.json", "gates/")
+
 DEFAULT_CFG = {
     "branch_prefix": "ai",
     "default_branch": "main",
     "bot_users": ["brain-bot"],
     "bot_emails": ["brain-bot@noreply.invalid"],
-    "bot_forbidden_paths": ["gates/", "project-agent.yaml", ".brain/", "CODEOWNERS", ".gitlab/CODEOWNERS",
-                            ".gitlab-ci.yml", "ci/"],
+    "bot_forbidden_paths": ["gates/", "project-agent.yaml", ".brain/", "CODEOWNERS", ".gitlab/", ".gitlab/CODEOWNERS",
+                            "docs/CODEOWNERS", ".gitlab-ci.yml", "ci/", ".kiro/brain/", ".kiro/agents/",
+                            ".kiro/hooks/", ".kiro/aidlc-lean/"],
     "runs_dir": "runs",
 }
 
@@ -253,11 +259,13 @@ def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
 
 
 def bot_path_problems(branch, commits, cfg, cwd=None) -> list:
-    """The bot's path rules for these commits (what they change, not who made them): no bot_forbidden_paths, no
+    """The bot's path rules for these commits (what they change, not who made them): no bot_forbidden_paths and no
+    KIT_PATHS (in any letter case: a checkout on a case-insensitive disk writes .KIRO/brain/x over .kiro/brain/x), no
     <runs_dir>/<KEY>/run.json. brain-ci push-rules applies them to the bot's commits of an MR too."""
     reasons = []
     paths = changed_paths(commits, cfg["default_branch"], cwd)
-    bad = sorted(p for p in paths if _forbidden(p, cfg["bot_forbidden_paths"]))
+    rules = [r.casefold() for r in list(cfg.get("bot_forbidden_paths") or []) + list(KIT_PATHS)]
+    bad = sorted(p for p in paths if _forbidden(p.casefold(), rules))
     if bad:
         reasons.append("%s: bot accounts may not change %s" % (branch, ", ".join(bad[:5])))
     recs = sorted(p for p in own_changes(commits, cwd) if run_record_path(p, cfg.get("runs_dir", "runs")))

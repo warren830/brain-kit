@@ -301,7 +301,10 @@ class BranchAndMerge(unittest.TestCase):
                 self.assertEqual(t["outcome"]["merged_at"]["value"], "2026-11-03T00:00:00Z", t["outcome"]["merged_at"])
                 self.assertIn("squash", t["outcome"]["merged_at"]["how"])
                 d = EV.collect(w.repo, w.cfg(), as_of=AS_OF, traces=[t])
-                self.assertEqual((d["delivery"]["value"], d["autonomy"]["value"]), ([1, 1], [1, 1]))
+                # branch deleted: the run's own commits cannot be listed, so a person's push after the hand-over
+                # cannot be seen either: autonomy is not known (QA round 4), the delivery still is
+                self.assertEqual((d["delivery"]["value"], d["autonomy"]["value"]),
+                                 ([1, 1], [0, 0] if delete else [1, 1]), d["autonomy"]["runs"])
                 if not delete:
                     self.assertEqual(len(t["actions"]["commits"]), 4)   # the branch's own commits are listed
 

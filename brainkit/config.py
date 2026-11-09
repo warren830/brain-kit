@@ -24,8 +24,10 @@ DEFAULTS = {
     # the GitLab account the bridge posts as (its questions, replies): lets anyone tell its notes from people's.
     # Empty: the bridge goes by the note ids it recorded; an outside checker (a separate signer) cannot.
     "bridge_user": "",
-    "bot_forbidden_paths": ["gates/", "project-agent.yaml", ".brain/", "CODEOWNERS", ".gitlab/CODEOWNERS",
-                            ".gitlab-ci.yml", "ci/"],
+    # what bot commits may not change (pre_receive.KIT_PATHS, the kit's own files, are refused whatever this says)
+    "bot_forbidden_paths": ["gates/", "project-agent.yaml", ".brain/", "CODEOWNERS", ".gitlab/", ".gitlab/CODEOWNERS",
+                            "docs/CODEOWNERS", ".gitlab-ci.yml", "ci/", ".kiro/brain/", ".kiro/agents/",
+                            ".kiro/hooks/", ".kiro/aidlc-lean/"],
     "claim_statuses": ["In Progress", "进行中"],
     "model": "claude-opus-5.5",
     "review_model": "kimi-k3",

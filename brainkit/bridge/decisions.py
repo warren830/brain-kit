@@ -102,6 +102,14 @@ REPLY_STATES = ("original", "edited", "changed", "unknown")
 ASKING_STALE_S = 300
 # a run is told about at most this many failed pipelines (brain-run fixes CI for at most 3 rounds, then parks)
 MAX_CI_NOTICES = 6
+# an acceptance question is asked once the MR head's own pipeline is one of these (or the head has none)
+CI_GREEN = ("success", "skipped")
+# ... and while it is one of these, a person has to act first (re-run it, run its manual job): the MR is told
+CI_NEEDS_PERSON = ("canceled", "manual")
+# decisions whose answer was given: the same park.json (its hash) is not asked again at a later commit
+ANSWERED_STATES = ("answered", "delivered", "delivery_unknown", "refused")
+# ... of which these are still on their way to the run
+IN_FLIGHT_STATES = ("answered", "delivery_unknown")
 ADDED_COLUMNS = ("qnote_id", "told_id", "sign_told")
 # fields of a voucher that change from one attempt to the next; the rest says what is signed
 VOUCHER_TIME_FIELDS = ("issued_at", "expires_at", "voucher_id")
@@ -666,6 +674,7 @@ class DecisionLoop(Delivery):
         raw = self.gl.file_raw(row["project"], "%s/%s/park.json" % (kit["runs_dir"], row["req"]), head)
         seen = lambda: db.execute("UPDATE runs SET last_sha=? WHERE run_id=?", (head, row["run_id"]))  # noqa
         if raw is None:
+            self._moved_past(row)
             seen()
             return 0
         try:
@@ -676,10 +685,11 @@ class DecisionLoop(Delivery):
                               "run 写的 park.json 不是合法 JSON，已忽略。", run_id=row["run_id"])
             self.notify_run(row, key, "问题没发出：runs/%s/park.json（提交 %s）不是合法的 JSON，桥没有提问。改好后提交"
                                       "并推送，然后结束这一轮（等待决策，不继续）；桥在新的推送上提问。"
-                            % (row["req"], head[:12]))
+                            % (row["req"], head[:12]), sha=head)
             seen()
             return 0
         if not isinstance(park, dict) or park.get("status") != "waiting":
+            self._moved_past(row)
             seen()
             return 0
         ph = hashlib.sha256(raw).hexdigest()
@@ -691,6 +701,12 @@ class DecisionLoop(Delivery):
                 self._tell_invalid(row, old["id"], head, park)   # told once (also when it failed last round)
             seen()                                     # asked already (or invalid): this head is done
             return 0
+        if old is None:
+            # the same park.json at an earlier commit was answered already: the head moved before the run set it to
+            # answered (its next work commit, the owner's push, a rebase). It is not asked again
+            prior = self._answered_before(row, mr, head, ph)
+            if prior is not None:
+                return self._answered_already(row, prior, head, seen)
         probs = validate_park(park)
         owner = row["owner"]
         kind = self.effective_kind(park.get("kind"), park.get("lean_request")) if not probs else "other"
@@ -699,6 +715,8 @@ class DecisionLoop(Delivery):
             # the team's config, not the run, is missing someone: told once; asked once the config names someone
             self._tell_nobody(row, head, ph, kind)
             return 0
+        if not probs and (kind == "acceptance" or is_acceptance(park)) and self._acceptance_waits_for_ci(row, mr, head):
+            return 0                                   # not seen: looked at again next round
         pushed = None
         if not probs:
             self.check_bridge_user(kit)
@@ -771,6 +789,111 @@ class DecisionLoop(Delivery):
         self.out("asked %s for %s (%s)" % (did, row["run_id"], ", ".join(who)))
         return 1
 
+    def _answered_before(self, row, mr, head, ph):
+        """The newest decision of this run on the same park.json (its hash) at another commit whose answer was given
+        (ANSWERED_STATES) and that the run has not moved past since (_moved_past), or None. An answer still on its
+        way at an older head is settled first: it reached the run (delivered), or it did not (stale: the question is
+        asked again at this head), or that cannot be told yet (it stays, and so does this head: looked at again next
+        round)."""
+        db = self.ledger.db
+        for d in db.execute("SELECT * FROM decisions WHERE run_id=? AND park_hash=? AND sha!=? AND state IN (%s) "
+                            "AND voucher_id IS NOT NULL ORDER BY created" % ",".join("?" * len(IN_FLIGHT_STATES)),
+                            (row["run_id"], ph, head) + IN_FLIGHT_STATES).fetchall():
+            self._answer_moved(d, row, mr)
+        for d in db.execute("SELECT * FROM decisions WHERE run_id=? AND park_hash=? AND sha!=? AND state IN (%s) "
+                            "ORDER BY created DESC" % ",".join("?" * len(ANSWERED_STATES)),
+                            (row["run_id"], ph, head) + ANSWERED_STATES).fetchall():
+            if self.ledger.notice("past:" + d["id"]) is None:
+                return d
+        return None                 # (parked again after the run moved past it: a new question)
+
+    def _moved_past(self, row):
+        """The run's park.json no longer waits (answered, or gone): the questions it had answered are behind it, so
+        the same park.json parked again later is a new question (asked). Recorded per decision (ledger notices)."""
+        db = self.ledger.db
+        for d in db.execute("SELECT id FROM decisions WHERE run_id=? AND state IN (%s)"
+                            % ",".join("?" * len(ANSWERED_STATES)), (row["run_id"],) + ANSWERED_STATES).fetchall():
+            if self.ledger.notice("past:" + d["id"]) is None:
+                self.ledger.bump("past:" + d["id"], row["run_id"])
+
+    def _answered_already(self, row, prior, head, seen) -> int:
+        """park.json at `head` still asks `prior`'s question, which was answered: nothing is posted on the MR. The
+        run is told once what to do (an answer that reached it: set park.json to answered and go on; one the signer
+        would not sign: it is blocked, people act); an answer still on its way: nothing yet (next round)."""
+        did, st = prior["id"], prior["state"]
+        if st in IN_FLIGHT_STATES:
+            self.out("%s: park.json at %s is %s's question, whose answer is on its way to the run; looked at again "
+                     "next round" % (row["run_id"], head[:12], did))
+            return 0
+        if st == "refused":
+            self._tell_refused(row, prior, head)
+        else:
+            self.notify_run(row, "answered:%s" % did, (
+                "问题没发出：runs/%s/park.json（提交 %s）还是 waiting，可它问的就是 %s，%s 已经答过了，回答已经送到（凭证 %s，"
+                "以「决策 %s 已答」开头的那条消息）。桥不会把同一个问题再问一次。按那个回答继续：把 park.json 的 status 改成 "
+                "answered，和你的记录一起提交、推送；要问新的问题，就写新的 park.json。")
+                % (row["req"], head[:12], did, did, prior["voucher_id"] or "?", did), sha=head)
+        seen()
+        self.out("%s: park.json at %s was answered as %s (%s): not asked again" % (row["run_id"], head[:12], did, st))
+        return 0
+
+    def _tell_refused(self, row, d, sha):
+        """The signer would not sign the answer to `d`: the run, which waits for it, is told once that it is blocked
+        (the MR was told why); the question is not asked again."""
+        self.notify_run(row, "refused:%s" % d["id"], (
+            "问题没发出：%s（runs/%s/park.json 的问题）有人回答了，但签名服务不签这个回答（原因在 MR 上），桥不会再问这个问题。"
+            "这要人处理，park.json 不用改：在 Session notes 记 `Status: blocked: 签名服务没签 %s 的回答`，提交、推送，然后用 "
+            "`问题没发出，等人处理：签名服务没签 %s 的回答` 结束这一轮。") % (d["id"], row["req"], d["id"], d["id"]), sha=sha)
+
+    def _acceptance_waits_for_ci(self, row, mr, head) -> bool:
+        """An acceptance question is asked on a commit whose own pipeline passed (or that has none: no CI for it).
+        Once the product approves, Lean closes the intent and the run changes no code; so the product accepts what CI
+        accepted, and a CI fix never comes after the acceptance. While the head's pipeline runs, failed or needs a
+        person, the question waits (True; looked at again each round): a failed one goes to the run as a CI notice
+        (it fixes, releases again and parks again); one that is canceled or waits for a manual job, one that runs
+        longer than acceptance_ci_wait_minutes, and a failure the run can no longer be told about, are told on the
+        MR once."""
+        from .delivery import notice_send_id
+        pl = mr.get("head_pipeline")
+        if not isinstance(pl, dict) or str(pl.get("sha") or "") != head:
+            return False
+        status = str(pl.get("status") or "")
+        held = self._held_key(row, head)
+        if status in CI_GREEN:
+            self.ledger.drop_count(held)
+            return False
+        try:
+            pid = int(pl.get("id") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        self.ledger.bump(held, row["run_id"])
+        since = str(self.ledger.notice(held)["created"])
+        run_id, project, iid = row["run_id"], row["project"], row["iid"]
+        if status == "failed":
+            self.forward_ci(row, mr)        # the question step has looked at this head: the run is told now
+            if self.ledger.outbox(notice_send_id(run_id, "ci:%d" % pid)) is None and \
+                    self.ledger.count_of("ci:" + run_id) >= MAX_CI_NOTICES:
+                self.tell_mr_once("ciheld-red:%s:%d" % (run_id, pid), project, iid, (
+                    "%s 的验收问题（提交 %s）没有发：流水线 #%d 没过，run 已经收到过 %d 次 CI 失败，桥不再转给它。请负责人看一下。")
+                    % (run_id, head[:12], pid, MAX_CI_NOTICES), run_id=run_id)
+        elif status in CI_NEEDS_PERSON:
+            self.tell_mr_once("ciheld-person:%s:%d" % (run_id, pid), project, iid, (
+                "%s 的验收问题（提交 %s）等 MR 的流水线通过才发：流水线 #%d 现在是 %s，要有人处理（重新运行，或者跑完手动的 "
+                "job）。通过以后桥自动发出验收问题，不用别的操作。") % (run_id, head[:12], pid, status), run_id=run_id)
+        else:
+            wait = sign.seconds(self.cfg.get("acceptance_ci_wait_minutes"), 60.0)
+            if since <= iso(utcnow() - timedelta(minutes=wait)):
+                self.tell_mr_once("ciheld-wait:%s:%s" % (run_id, head[:12]), project, iid, (
+                    "%s 的验收问题（提交 %s）在等 MR 的流水线 #%d 跑完（现在是 %s，等了 %d 分钟以上）。通过以后桥自动发出验收问题；"
+                    "流水线一直不动的话请看一下。") % (run_id, head[:12], pid, status or "?", wait), run_id=run_id)
+        self.out("%s: the acceptance question at %s waits for pipeline #%d (%s)" % (run_id, head[:12], pid, status))
+        return True
+
+    @staticmethod
+    def _held_key(row, head) -> str:
+        """The ledger counter of the rounds an acceptance question at `head` waited for the head's pipeline."""
+        return "ciheld:%s:%s" % (row["run_id"], head)
+
     # ---------- the bridge's own account, and its notes ----------
 
     def _learn_me(self, note):
@@ -825,7 +948,7 @@ class DecisionLoop(Delivery):
                          "DESIGN`，写 \"lean_request\": \"DESIGN <hash>\" 再问一次。")
         lines.append("改好 runs/%s/park.json，提交并推送，然后结束这一轮（等待决策，不继续）；桥在新的推送上提问。"
                      % row["req"])
-        self.notify_run(row, "invalid:%s" % did, "\n".join(lines))
+        self.notify_run(row, "invalid:%s" % did, "\n".join(lines), sha=head)
 
     def _tell_nobody(self, row, head, ph, kind):
         key = "nobody:%s:%s" % (row["run_id"], ph[:16])
@@ -835,7 +958,7 @@ class DecisionLoop(Delivery):
                           % (row["run_id"], head[:12], label), run_id=row["run_id"])
         self.notify_run(row, key, "问题没发出：团队配置里没有人可以回答「%s」类决策。这要团队改配置，park.json 不用改：记 "
                                   "Status: blocked，提交、推送，用 `问题没发出，等人处理：没有人可以回答` 结束这一轮；配好以后桥会"
-                                  "自动在 MR 上提问。" % label)
+                                  "自动在 MR 上提问。" % label, sha=head)
 
     def _tell_void(self, d, row, v):
         """A question that became void. A deleted question note was taken off on purpose: the MR is told how to ask
@@ -847,7 +970,7 @@ class DecisionLoop(Delivery):
             sent = self.notify_run(row, "void:%s" % d["id"], "问题作废：%s 在 MR 上作废了（%s），对它的回答都不算。要重新提"
                                    "问：在 aidlc-state.md 的 Session notes 记一句「%s 作废，重新提问」，和 park.json（不用改）"
                                    "一起提交并推送，然后结束这一轮（等待决策，不继续）；桥会在新提交上重新提问。"
-                                   % (d["id"], v.reason, d["id"]))
+                                   % (d["id"], v.reason, d["id"]), sha=d["sha"])
         if deleted:
             tail = "问题被删掉了，桥不会自己再问；要让 run 重新提问，往分支推一个提交（park.json 不用改），桥会在新提交上再问。"
         elif sent == "sent":
@@ -861,8 +984,9 @@ class DecisionLoop(Delivery):
 
     def forward_ci(self, row, mr):
         """The MR's head pipeline failed: the run is told once per pipeline (job names, why, the end of their
-        logs), unless it waits for a person at that head (it gets the result with its next push). At most
-        MAX_CI_NOTICES per run. Never raises: CI helps the run, it never holds a decision up."""
+        logs), unless it waits for a person at that head or for an answer on its way (it gets the result with its
+        next push), and never after the product accepted the run (the MR is told instead). At most MAX_CI_NOTICES
+        per run. Never raises: CI helps the run, it never holds a decision up."""
         try:
             self._forward_ci(row, mr)
         except Exception as e:  # noqa: BLE001
@@ -870,8 +994,9 @@ class DecisionLoop(Delivery):
 
     def _forward_ci(self, row, mr):
         from .delivery import notice_send_id
+        head = str(mr.get("sha") or "")
         pl = mr.get("head_pipeline")
-        if not isinstance(pl, dict) or pl.get("status") != "failed" or str(pl.get("sha") or "") != mr.get("sha"):
+        if not isinstance(pl, dict) or pl.get("status") != "failed" or str(pl.get("sha") or "") != head:
             return
         try:
             pid = int(pl.get("id") or 0)
@@ -880,16 +1005,20 @@ class DecisionLoop(Delivery):
         key = "ci:%d" % pid
         if pid <= 0 or self.ledger.outbox(notice_send_id(row["run_id"], key)) is not None:
             return                                         # told about this pipeline already
-        if row["last_sha"] != mr.get("sha"):
+        held = self.ledger.notice(self._held_key(row, head)) is not None    # an acceptance waits for this pipeline
+        if row["last_sha"] != head and not held:
             return                                         # the question step has not looked at this head yet
-        if self.ledger.db.execute("SELECT 1 FROM decisions WHERE run_id=? AND sha=? AND state IN ('open', 'posting', "
-                                  "'asking')", (row["run_id"], mr.get("sha"))).fetchone():
+        if self._ci_waits(row, head, held=held):
+            return
+        accepted = self._accepted(row)
+        if accepted is not None:
+            self._tell_ci_after_acceptance(row, head, pid, accepted)
             return
         if self.ledger.count_of("ci:" + row["run_id"]) >= MAX_CI_NOTICES:
             return
         jobs = [j for j in self.gl.pipeline_jobs(row["project"], pid) if isinstance(j, dict)
                 and j.get("status") == "failed" and not j.get("allow_failure")]
-        lines = ["CI 没过：MR 的流水线 #%d（提交 %s）失败了。" % (pid, str(mr.get("sha"))[:12])]
+        lines = ["CI 没过：MR 的流水线 #%d（提交 %s）失败了。" % (pid, head[:12])]
         for j in jobs[:5]:
             lines.append("- job %s（stage %s）：%s" % (one_line(j.get("name"), 80), one_line(j.get("stage"), 40),
                                                        one_line(j.get("failure_reason") or "failed", 80)))
@@ -901,8 +1030,71 @@ class DecisionLoop(Delivery):
         lines.append("按 brain-run 第 4 节修好、推送（CI 最多 3 轮，之后 park）。brain-run-check 说风险路径没有桥签的设计审批"
                      "（DESIGN）的话：先 `lean request DESIGN`，在 park.json 写 \"lean_request\": \"DESIGN <hash>\" 停下来，"
                      "由桥在 MR 上问；本地 Lean 里的设计审批不算。")
-        self.ledger.bump("ci:" + row["run_id"], row["run_id"])
-        self.notify_run(row, key, "\n".join(lines))
+        lines.append("验收问题只在流水线通过的提交上发：你已经 `lean release`、`lean request RELEASE` 的话，修好以后再运行一次 "
+                     "`lean release` 和 `lean request RELEASE`，用新的 hash 写 park.json，再停下来等验收。")
+        self.notify_run(row, key, "\n".join(lines), sha=head, count="ci:" + row["run_id"])
+
+    def _ci_waits(self, row, head, held=False) -> bool:
+        """Is the run waiting for a person at `head` (a question open, being posted or asked there), or for an answer
+        on its way to it? A CI notice then would set it moving: its push makes the question, or the answer, stale.
+        `held`: the acceptance question at `head` waits for this very pipeline, so a row left 'posting' there is not
+        a question being asked (it is asked once the pipeline passes)."""
+        asking = ("open", "asking") if held else ("open", "posting", "asking")
+        return self.ledger.db.execute(
+            "SELECT 1 FROM decisions WHERE run_id=? AND ((sha=? AND state IN (%s)) OR state IN (%s))"
+            % (",".join("?" * len(asking)), ",".join("?" * len(IN_FLIGHT_STATES))),
+            (row["run_id"], head) + asking + IN_FLIGHT_STATES).fetchone() is not None
+
+    def _accepted(self, row):
+        """The run's acceptance, when the product approved it and the answer reached the run (its newest acceptance
+        decision, delivered, `approve`), else None. Lean closes the intent then: the run changes no code."""
+        d = self.ledger.db.execute("SELECT * FROM decisions WHERE run_id=? AND kind='acceptance' AND state='delivered' "
+                                   "ORDER BY created DESC", (row["run_id"],)).fetchone()
+        return d if d is not None and d["answer"] == "approve" else None
+
+    def _tell_ci_after_acceptance(self, row, head, pid, d):
+        """A pipeline that fails after the product accepted is not the run's to fix (its intent is closed; a code
+        change would not be the code the product accepted): the MR hears once, the run nothing."""
+        self.tell_mr_once("ci-accepted:%s" % row["run_id"], row["project"], row["iid"], (
+            "%s：流水线 #%d（提交 %s）没过，可产品已经在提交 %s 上验收通过了（%s，凭证 %s）。验收以后 run 不再改代码（Lean 的 "
+            "intent 验收后就关了），桥没有把这次失败转给 run。修它要改代码，改了的代码就不是产品验收过的那份：请负责人决定怎么办"
+            "（比如修好以后请产品在 MR 上重新看一遍，或者新开一个需求交接）。")
+            % (row["run_id"], pid, head[:12], str(d["sha"])[:12], d["id"], d["voucher_id"] or "?"), run_id=row["run_id"])
+
+    def _notice_hold(self, run, row) -> str:
+        """A notice whose send was cut off is sent again only while it still holds: the MR is open and still at the
+        commit the notice is about; a CI notice's pipeline is still the head's failed one, the run was not accepted,
+        and no question or answer is waiting ("hold" then: looked at again next round). Else: why not (dropped)."""
+        what = str(row["what"])[len("notice:"):]
+        mr = self.gl.mr(run["project"], run["iid"])
+        head = str(mr.get("sha") or "")
+        if mr.get("state") != "opened":
+            return "the MR is %s" % mr.get("state")
+        about = self._notice_sha(row, what)
+        if about and not head.startswith(about):
+            return "the MR head moved from %s to %s" % (about[:12], head[:12])
+        if what.startswith("ci:"):
+            pl = mr.get("head_pipeline") if isinstance(mr.get("head_pipeline"), dict) else {}
+            if str(pl.get("id")) != what[3:] or pl.get("status") != "failed" or str(pl.get("sha") or "") != head:
+                return "pipeline #%s is no longer the MR head's failed pipeline" % what[3:]
+            if self._accepted(run) is not None:
+                return "the run was accepted"
+            if self._ci_waits(run, head):
+                return "hold"
+        return ""
+
+    def _notice_sha(self, row, what) -> str:
+        """The MR head a notice is about: the outbox row's (this bridge), else what its key names (an older one's):
+        the decision of void: / invalid:, the head of badjson:. '' when unknown."""
+        if "sha" in row.keys() and row["sha"]:
+            return str(row["sha"])
+        kind, _, rest = what.partition(":")
+        if kind in ("void", "invalid"):
+            d = self.ledger.db.execute("SELECT sha FROM decisions WHERE id=?", (rest,)).fetchone()
+            return str(d["sha"]) if d is not None else ""
+        if kind == "badjson" and re.match(r"^[0-9a-f]{12}$", rest):
+            return rest
+        return ""
 
     def _job_tail(self, project, job, lines=20) -> list:
         try:
@@ -992,7 +1184,11 @@ class DecisionLoop(Delivery):
         except Exception as e:  # noqa: BLE001
             errors.append("recover: %s" % e)
         self._replies_scanned = set()
-        for d in db.execute("SELECT * FROM decisions WHERE state IN ('open', 'posting') ORDER BY created").fetchall():
+        # 'asking' rows a stopped bridge left (stale): made stale here once the head moved (watch asks them again
+        # while it has not)
+        stale = iso(utcnow() - timedelta(seconds=ASKING_STALE_S))
+        for d in db.execute("SELECT * FROM decisions WHERE state IN ('open', 'posting') OR (state='asking' AND "
+                            "updated<?) ORDER BY created", (stale,)).fetchall():
             try:
                 delivered += 1 if self._collect_one(db, d) else 0
             except Exception as e:  # noqa: BLE001 - one MR GitLab will not show (or shows too much of) must not hold
@@ -1014,7 +1210,7 @@ class DecisionLoop(Delivery):
                           (now, d["id"], d["state"])).rowcount and (d["state"] == "open" or self._asked_on_mr(d)):
                 self.gl.comment(d["project"], d["iid"], "%s 作废：问题发出后分支又有了新推送。run 需要时会重新提问。" % d["id"])
             return False
-        if d["state"] == "posting":
+        if d["state"] in ("posting", "asking"):
             return False                                      # watch posts it
         kit = self.kit(d["project"])
         pushed = head_pushed_at(self.gl.mr_versions(d["project"], d["iid"]), d["sha"])
@@ -1052,7 +1248,16 @@ class DecisionLoop(Delivery):
             db.execute("UPDATE decisions SET note_id=? WHERE id=? AND state='open'", (v.last_id, d["id"]))
             return False
         if v.status == "conflict":
-            note = self.gl.comment(d["project"], d["iid"], conflict_text(d["id"], v.conflict, v.held))
+            # one note per round, also with two bridge processes on this ledger (a stopped one's claim is taken over)
+            key = "conflict:%s:%d" % (d["id"], v.last_id)
+            if not self.ledger.claim_notice(key, d["run_id"], d["project"], d["iid"]):
+                return False                                  # another bridge process posts it
+            try:
+                note = self.gl.comment(d["project"], d["iid"], conflict_text(d["id"], v.conflict, v.held))
+            except BaseException:
+                self.ledger.release_notice(key)
+                raise
+            self.ledger.notice_told(key)
             start = max(v.last_id, int((note or {}).get("id") or 0))   # a new round starts after the bridge's note
             db.execute("UPDATE decisions SET note_id=?, told_id=?, updated=? WHERE id=? AND state='open'",
                        (start, start, now, d["id"]))
@@ -1084,7 +1289,8 @@ class DecisionLoop(Delivery):
                 return True
         return False
 
-    SETTLED = {"delivered": "已经收到回答，送回 run 了", "answered": "已经收到回答", "delivery_unknown": "已经收到回答",
+    SETTLED = {"delivered": "已经收到回答，送回 run 了", "answered": "已经收到回答",
+               "delivery_unknown": "已经收到回答，桥还在把它送回 run（不用重新回答）",
                "stale": "已经作废", "void": "已经作废", "invalid": "没有发出", "closed": "已经结束",
                "refused": "已经结束（签名服务没签它的回答）"}
 
@@ -1205,6 +1411,7 @@ class DecisionLoop(Delivery):
             self.gl.comment(d["project"], d["iid"], "%s 的回答没有送回 run：签名服务不签（%s）。请负责人看一下签名服务的记录。"
                             % (d["id"], "；".join(e.reasons)[:500]))
             self.out("%s: the signer refused the answer: %s" % (d["id"], e))
+            self._tell_refused(row, d, d["sha"])          # the run waits for this answer: it is blocked
             return False
         except sign.SignerUnavailable as e:
             # nothing was signed or sent: the question is open again and looked at next round; the MR hears once
@@ -1228,7 +1435,8 @@ class DecisionLoop(Delivery):
             if self.cfg.get("publish_vouchers"):
                 self.publish(d["run_id"], v["voucher_id"])
             with self.ledger.lock:      # the message first, then the voucher: a stop after this re-sends it
-                ob, new = self.ledger.outbox_put(v["voucher_id"], d["run_id"], row["slot"], "answer:" + d["id"], msg)
+                ob, new = self.ledger.outbox_put(v["voucher_id"], d["run_id"], row["slot"], "answer:" + d["id"], msg,
+                                                 sha=d["sha"])
                 db.execute("UPDATE decisions SET voucher_id=? WHERE id=?", (v["voucher_id"], d["id"]))
         except Exception as e:  # noqa: BLE001 - not stored: the next round stores this same voucher
             self._reopen(d)
@@ -1286,6 +1494,9 @@ class DecisionLoop(Delivery):
           answered / delivery_unknown  with the message in the outbox: settled (it landed: delivered; it did not:
                                        sent again with the same sendId; cannot tell: delivery_unknown, the MR is told
                                        once and it is looked at again next round).
+        Once the MR head moved on (or the MR closed), an answer that did not reach the run is never sent: the question
+        is stale (closed), as an open one would be (check_answer's "still current"); one that did reach it is
+        delivered. A decision of a run that ended is closed.
         A row of an older bridge without an outbox entry: delivered when the slot shows its voucher id; open again
         (delivered anew) when the slot shows it did not land; otherwise the MR is told once. One row that fails does
         not hold up the others. -> how many were delivered now."""
@@ -1306,13 +1517,19 @@ class DecisionLoop(Delivery):
 
     def _recover_answer(self, d) -> bool:
         run = self.ledger.run(d["run_id"])
-        if run is None or run["state"] != "dispatched" or not run["slot"]:
+        if run is None or run["state"] in ("merged", "closed", "failed"):
+            self._close_answer(d, "its run is %s" % (run["state"] if run is not None else "gone"))
+            return False
+        if run["state"] != "dispatched" or not run["slot"]:
             return False
         if not d["voucher_id"]:
             if d["state"] == "answered" and self._stale(d["updated"]):
                 self._reopen(d)
                 self.out("%s: its answer was not sent by a bridge that stopped; looked at again" % d["id"])
             return False
+        mr = self.gl.mr(d["project"], d["iid"])
+        if mr.get("state") != "opened" or mr.get("sha") != d["sha"]:
+            return self._answer_moved(d, run, mr)
         ob = self.ledger.outbox(d["voucher_id"])
         if ob is not None:
             return self._answer_sent(d, self._settle(ob), d["voucher_id"])
@@ -1328,6 +1545,47 @@ class DecisionLoop(Delivery):
         elif d["state"] == "delivery_unknown" or self._stale(d["updated"]):
             self._answer_sent(d, "unknown", d["voucher_id"])
         return False
+
+    def _answer_moved(self, d, run, mr) -> bool:
+        """The MR head moved on from the commit `d` was asked at (or the MR closed) while its answer was on its way.
+        It is never sent again: what it answers is stale. Landed before the push: delivered (True). Did not land:
+        stale (the MR is told; the question is asked again where park.json still waits) or closed (the MR closed).
+        Cannot tell (the slot cannot be read, the session is busy): it stays, looked at again next round; meanwhile
+        the same park.json is not asked again (watch) and no CI notice goes to the run."""
+        db, vid = self.ledger.db, d["voucher_id"]
+        ob = self.ledger.outbox(vid)
+        if ob is not None and ob["state"] == "sending" and not self._stale(ob["updated"]):
+            return False                                   # another bridge process sends it right now
+        landed = True if ob is not None and ob["state"] == "sent" else self._landed(run["slot"], vid)
+        if landed:
+            if ob is not None:
+                self.ledger.outbox_set(vid, (ob["state"],), "sent")
+            return self._answer_sent(d, "sent", vid)
+        if landed is None:
+            if d["state"] == "answered" and self._stale(d["updated"]):
+                self._answer_sent(d, "unknown", vid)       # the MR hears once
+            return False
+        if mr.get("state") != "opened":
+            self._close_answer(d, "the MR is %s" % mr.get("state"))
+            return False
+        if not db.execute("UPDATE decisions SET state='stale', updated=? WHERE id=? AND state IN ('answered', "
+                          "'delivery_unknown')", (iso(utcnow()), d["id"])).rowcount:
+            return False
+        if ob is not None:
+            self.ledger.outbox_set(vid, (ob["state"],), "dropped")
+        self.gl.comment(d["project"], d["iid"], "%s 作废：回答（凭证 %s）还没送到 run，分支就有了新推送，这个回答不再送了。run "
+                        "还要问的话会在新提交上重新提问，到时请回答新的问题。" % (d["id"], vid))
+        self.out("%s stale: its answer %s did not reach the run before %s moved to %s"
+                 % (d["id"], vid, d["sha"][:12], str(mr.get("sha"))[:12]))
+        return False
+
+    def _close_answer(self, d, why):
+        """An answer that is no longer to be delivered (its run or MR ended): closed, its message dropped."""
+        if self.ledger.db.execute("UPDATE decisions SET state='closed', updated=? WHERE id=? AND state IN "
+                                  "('answered', 'delivery_unknown')", (iso(utcnow()), d["id"])).rowcount:
+            if d["voucher_id"]:
+                self.ledger.outbox_set(d["voucher_id"], ("sending", "interrupted", "unknown"), "dropped")
+            self.out("%s closed: %s" % (d["id"], why))
 
     def _reopen(self, d):
         """Nothing reached the run: the decision is open again and its replies are looked at next round."""

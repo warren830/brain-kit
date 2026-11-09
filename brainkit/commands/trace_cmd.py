@@ -4,10 +4,10 @@
                   [--as-of TIME]
 Read-only. --vouchers defaults to <intake store>/vouchers when it exists ($BRAIN_INTAKE_DIR, git config
 brain.intake, ~/.brain/intake). --credits is the JSON the KiroCrew app passes in (credits are not readable here).
-Without --ref, a run whose run.json is not in the working tree (not merged yet) is read from its run branch here
-(the same branch `brain eval` reads: evaluate.run_branches; a split child merged into its parent's run branch: from
-that branch). A split's parent and children get a "family" section: the child's own records only, the parent's with
-its children's numbers rolled up (brainkit/trace.py).
+Without --ref, or with --ref naming the default branch (origin/main), a run whose run.json is not there (not merged
+yet) is read from its run branch here (the same branch `brain eval` reads: evaluate.run_branches; a split child merged
+into its parent's run branch: from that branch). A split's parent and children get a "family" section: the child's
+own records only, the parent's with its children's numbers rolled up (brainkit/trace.py).
 """
 from __future__ import annotations
 
@@ -51,11 +51,15 @@ def common_args(s, suppress=False):
 
 
 def ref_for(repo, cfg, key, ref):
-    """--ref as given; without it, the working tree, or the run branch when run.json is only there."""
-    if ref or T.Tree(repo, None).read("%s/%s/run.json" % (cfg["runs_dir"], key)) is not None:
+    """What to read: --ref (or the working tree) when run.json is there; when it is not and --ref is not given or
+    names the default branch (`--ref origin/main` for a run not merged yet), the run branch `brain eval` reads
+    (evaluate.run_branches); else --ref as given (the trace says what is missing)."""
+    if T.Tree(repo, ref).read("%s/%s/run.json" % (cfg["runs_dir"], key)) is not None:
+        return ref
+    if ref and T._short_ref(ref) != cfg["default_branch"]:
         return ref
     from .. import evaluate as EV
-    return EV.run_branches(repo, cfg).get(key)
+    return EV.run_branches(repo, cfg).get(key) or ref
 
 
 def cmd_trace(a):

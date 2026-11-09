@@ -285,7 +285,7 @@ class AdapterVersionIsChecked(unittest.TestCase):
         commit_file(repo, cli.CREW_HOOK, "# adapter of 48b6b97\n")
         probs = cli.runner_kit_problems(repo)
         self.assertEqual(len(probs), 1)
-        self.assertIn("older adapter (version 0, needs 2)", probs[0])
+        self.assertIn("older adapter (version 0, needs %d)" % cli.CREW_HOOK_VERSION, probs[0])
         with open(os.path.join(cli.KIT_SRC, cli.CREW_HOOK), encoding="utf-8") as f:
             commit_file(repo, cli.CREW_HOOK, f.read())
         self.assertEqual(cli.runner_kit_problems(repo), [])
