@@ -24,51 +24,90 @@ from xml.parsers import expat
 
 ZW_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069]")
 HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.S)
-TAG_RE = re.compile(r"<(/?)([A-Za-z][A-Za-z0-9]*)\b([^>]*)>")
+# a tag; a quoted attribute value may hold a ">" (if the quotes do not pair up, up to the first ">")
+TAG_RE = re.compile(r"""<(/?)([A-Za-z][A-Za-z0-9]*)\b((?:"[^"]*"|'[^']*'|[^>"'])*|[^>]*)>""")
 ATTR_RE = re.compile(r"""([^\s=/>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>"']+)))?""")
 HIDING_CLASSES = {"hidden", "hide", "d-none", "invisible", "sr-only", "visually-hidden"}
-CSS_NAMED = {"white": "ffffff", "snow": "fffafa", "ivory": "fffff0", "ghostwhite": "f8f8ff", "whitesmoke": "f5f5f5",
-             "floralwhite": "fffaf0", "mintcream": "f5fffa", "azure": "f0ffff", "seashell": "fff5ee"}
+CSS_NAMED = {   # near-white names, and common darker ones (an unknown name is no colour we can judge)
+    "white": "ffffff", "snow": "fffafa", "ivory": "fffff0", "ghostwhite": "f8f8ff", "whitesmoke": "f5f5f5",
+    "floralwhite": "fffaf0", "mintcream": "f5fffa", "azure": "f0ffff", "seashell": "fff5ee", "black": "000000",
+    "silver": "c0c0c0", "gray": "808080", "grey": "808080", "maroon": "800000", "red": "ff0000", "purple": "800080",
+    "fuchsia": "ff00ff", "green": "008000", "lime": "00ff00", "olive": "808000", "yellow": "ffff00", "navy": "000080",
+    "blue": "0000ff", "teal": "008080", "aqua": "00ffff", "cyan": "00ffff", "orange": "ffa500", "darkblue": "00008b",
+    "darkred": "8b0000", "darkgreen": "006400", "darkgray": "a9a9a9", "darkgrey": "a9a9a9", "dimgray": "696969",
+    "lightgray": "d3d3d3", "brown": "a52a2a", "gold": "ffd700", "steelblue": "4682b4", "royalblue": "4169e1",
+    "midnightblue": "191970", "darkslategray": "2f4f4f", "slategray": "708090"}
+CSS_COLOUR_RE = re.compile(r"#[0-9a-f]{3,8}\b|(?:rgb|hsl)a?\([^)]*\)|\b[a-z]+\b")
 
 
 def tag_attrs(s) -> dict:
-    """{name: value} of the attributes in a tag's text (names lower case; a bare attribute is '')."""
-    return {m.group(1).lower(): next((v for v in m.groups()[1:] if v is not None), "") for m in ATTR_RE.finditer(s)}
-
-
-def _css(style) -> dict:
+    """{name: value} of the attributes in a tag's text (names lower case; a bare attribute is ''; of a repeated
+    attribute the first counts, as in a browser)."""
     out = {}
-    for decl in (style or "").split(";"):
-        k, sep, v = decl.partition(":")
-        if sep:
-            out[k.strip().lower()] = v.replace("!important", "").strip().lower()
+    for m in ATTR_RE.finditer(s):
+        out.setdefault(m.group(1).lower(), next((v for v in m.groups()[1:] if v is not None), ""))
     return out
 
 
-def _css_rgba(v):
-    """(r, g, b, alpha) of a CSS colour (#rgb, #rrggbb(aa), rgb() / rgba(), a few named whites), else None."""
+def _css(style) -> dict:
+    """{property: value} of an inline style: comments out, names and values lower case; a later declaration wins,
+    unless an earlier one of the same property is !important and it is not."""
+    out, strong = {}, set()
+    for decl in re.sub(r"/\*.*?(?:\*/|$)", " ", style or "", flags=re.S).split(";"):
+        k, sep, v = decl.partition(":")
+        if not sep:
+            continue
+        k, v = k.strip().lower(), v.strip().lower()
+        important = re.search(r"!\s*important\s*$", v)
+        v = v[:important.start()].strip() if important else v
+        if k in strong and not important:
+            continue
+        out[k] = v
+        if important:
+            strong.add(k)
+    return out
+
+
+def _css_rgba(v, bare_hex=False):
+    """(r, g, b, alpha) of a CSS colour (#rgb, #rrggbb(aa), rgb(), hsl() with or without alpha, a common name), else
+    None. bare_hex: an HTML colour attribute, where the # may be left out (<font color="fefefe">)."""
     v = (v or "").strip().lower()
     if v == "transparent":
         return 0, 0, 0, 0.0
-    v = CSS_NAMED.get(v, v)
-    m = re.fullmatch(r"#?([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})", v)
-    if m and (v.startswith("#") or v in CSS_NAMED.values()):
-        h = m.group(1)
-        h = "".join(c * 2 for c in h) if len(h) <= 4 else h
-        return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), (int(h[6:8], 16) / 255 if len(h) == 8 else 1.0)
-    m = re.fullmatch(r"rgba?\(\s*([0-9.]+%?)[\s,]+([0-9.]+%?)[\s,]+([0-9.]+%?)(?:[\s,/]+([0-9.]+%?))?\s*\)", v)
-    if m:
-        def num(x, top):
-            return float(x[:-1]) * top / 100 if x.endswith("%") else float(x)
-        return (num(m.group(1), 255), num(m.group(2), 255), num(m.group(3), 255),
-                num(m.group(4), 1) if m.group(4) else 1.0)
-    return None
+    v = "#" + CSS_NAMED[v] if v in CSS_NAMED else ("#" + v if bare_hex and re.fullmatch(r"[0-9a-f]{3}|[0-9a-f]{6}", v)
+                                                     else v)
+    try:
+        m = re.fullmatch(r"#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})", v)
+        if m:
+            h = m.group(1)
+            h = "".join(c * 2 for c in h) if len(h) <= 4 else h
+            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), (int(h[6:8], 16) / 255 if len(h) == 8 else 1.0)
+        m = re.fullmatch(r"(rgb|hsl)a?\(\s*([0-9.]+)(deg|%)?[\s,]+([0-9.]+)(%?)[\s,]+([0-9.]+)(%?)"
+                         r"(?:[\s,/]+([0-9.]+)(%?))?\s*\)", v)
+        if not m:
+            return None
+        alpha = 1.0 if m.group(8) is None else float(m.group(8)) / (100 if m.group(9) else 1)
+        if m.group(1) == "hsl":
+            r, g, b = colorsys.hls_to_rgb(float(m.group(2)) / 360 % 1, float(m.group(6)) / 100, float(m.group(4)) / 100)
+            return r * 255, g * 255, b * 255, alpha
+
+        def num(x, pct):
+            return float(x) * 255 / 100 if pct else float(x)
+        return num(m.group(2), m.group(3) == "%"), num(m.group(4), m.group(5)), num(m.group(6), m.group(7)), alpha
+    except ValueError:
+        return None
 
 
-def _css_unseen(v) -> bool:
-    """A text colour that does not show on a white page: white, near white, transparent."""
-    c = _css_rgba(v)
-    return c is not None and (c[3] < 0.1 or min(c[:3]) >= 240)
+def _css_clear(v, bare_hex=False) -> bool:
+    """A text colour that does not show on any background: transparent, or nearly."""
+    c = _css_rgba(v, bare_hex)
+    return c is not None and c[3] < 0.1
+
+
+def _css_white(v, bare_hex=False) -> bool:
+    """A text colour that does not show on a white page: white or near white."""
+    c = _css_rgba(v, bare_hex)
+    return c is not None and min(c[:3]) >= 240
 
 
 def _font_tiny(v) -> bool:
@@ -80,33 +119,45 @@ def _font_tiny(v) -> bool:
     return pt < 4
 
 
-def has_background(attrs) -> bool:
-    """The element paints a background of its own (a colour that is not white, or an image): white text on it shows."""
-    bg = attrs.get("bgcolor")
+def has_background(attrs):
+    """What the element paints behind its text: True a colour white text shows on, False white, None nothing (or
+    nothing we can tell: transparent, an image): then what is behind it shows."""
     css = _css(attrs.get("style"))
-    for v in [bg] + [css.get(k) for k in ("background-color", "background")]:
-        if not v or v in ("none", "inherit", "initial", "unset"):
+    for v, bare in ((css.get("background-color"), False), (css.get("background"), False),
+                    (attrs.get("bgcolor"), True)):
+        if not v:
             continue
-        if "url(" in v or not _css_unseen(v.split()[0] if not v.startswith("rgb") else v):
-            return True
-    return False
+        cols = [c for c in (_css_rgba(x, bare) for x in CSS_COLOUR_RE.findall(v)) if c is not None and c[3] >= 0.5]
+        if cols:
+            return any(min(c[:3]) < 240 for c in cols)
+    return None
+
+
+def nearest_background(layers) -> bool:
+    """The background that shows: the nearest layer that paints one (an element, then those around it); a white
+    page when none does."""
+    return next((b for b in reversed(layers) if b is not None), False)
 
 
 def element_hides(tag, attrs, on_background=False) -> bool:
     """An element renders its content invisibly: the hidden attribute, a hidden input, a hiding class, display:none,
-    visibility:hidden, opacity near 0, a font under 4pt, or white (or transparent) text with no background colour on
-    it or on an element around it (on_background)."""
+    visibility:hidden, opacity near 0, a font under 4pt, transparent text, or white text with no colour behind it
+    (its own background, else on_background: the one that shows through from around it)."""
     css = _css(attrs.get("style"))
     try:
         faint = float(css.get("opacity", "1").rstrip("%")) / (100 if css.get("opacity", "").endswith("%") else 1) < 0.1
     except ValueError:
         faint = False
-    colour = css.get("color") or (attrs.get("color") if tag == "font" else None)
+    colour, bare = css.get("color"), False
+    if colour is None and tag == "font":
+        colour, bare = attrs.get("color"), True
+    own = has_background(attrs)
+    behind = own if own is not None else on_background
     return ("hidden" in attrs or (tag == "input" and attrs.get("type", "").lower() == "hidden")
             or bool(HIDING_CLASSES & set(attrs.get("class", "").lower().split()))
             or css.get("display") == "none" or css.get("visibility") in ("hidden", "collapse") or faint
             or _font_tiny(css.get("font-size")) or (tag == "font" and attrs.get("size", "").strip() == "0")
-            or (colour is not None and _css_unseen(colour) and not on_background and not has_background(attrs)))
+            or (colour is not None and (_css_clear(colour, bare) or (_css_white(colour, bare) and not behind))))
 
 
 def strip_hidden_html(text):
@@ -114,18 +165,18 @@ def strip_hidden_html(text):
     out, hidden = [], []
     pos = 0
     tokens = list(TAG_RE.finditer(text))
-    around = []                                      # (tag, paints a background) of the open elements
+    around = []                                      # (tag, its background: has_background) of the open elements
     i = 0
     while i < len(tokens):
         t = tokens[i]
         name = t.group(2).lower()
         attrs = tag_attrs(t.group(3) or "")
-        bare = name in VOID or (t.group(3) or "").rstrip().endswith("/")
+        bare = name in VOID                          # <div .../> opens a div, as in a browser
         if t.group(1) == "/":
             k = max((k for k, (n, _) in enumerate(around) if n == name), default=None)
             if k is not None:
                 del around[k:]
-        elif element_hides(name, attrs, any(b for _, b in around)):
+        elif element_hides(name, attrs, nearest_background([b for _, b in around])):
             if bare:                                 # <input type="hidden" value=...>: no content, no end tag
                 out.append(text[pos:t.start()])
                 hidden.append(t.group(0))
@@ -137,7 +188,7 @@ def strip_hidden_html(text):
             while j < len(tokens) and depth:
                 u = tokens[j]
                 if u.group(2).lower() == name:
-                    depth += -1 if u.group(1) == "/" else (0 if (u.group(3) or "").rstrip().endswith("/") else 1)
+                    depth += -1 if u.group(1) == "/" else 1
                 j += 1
             end = tokens[j - 1].end() if depth == 0 else len(text)
             out.append(text[pos:t.start()])
@@ -155,8 +206,7 @@ def strip_hidden_html(text):
 MD_FENCE_RE = re.compile(r"(?m)^ {0,3}(?:(`{3,})[^`\n]*|(~{3,})[^\n]*)$")    # up to 3 spaces: 4 is no fence
 # what may start a Markdown construct, leftmost first: a comment, a raw HTML tag (its attributes may hold a
 # backtick), a fence, a backtick run
-MD_TOKEN_RE = re.compile(r"<!--|<(?:/?[A-Za-z][A-Za-z0-9]*\b(?:\"[^\"]*\"|'[^']*'|[^>\"'])*|/?[A-Za-z][A-Za-z0-9]*\b[^>]*)>"
-                         r"|(?m:^ {0,3}(?:`{3,}[^`\n]*|~{3,}[^\n]*)$)|`+")
+MD_TOKEN_RE = re.compile(r"<!--|" + TAG_RE.pattern + r"|(?m:^ {0,3}(?:`{3,}[^`\n]*|~{3,}[^\n]*)$)|`+")
 MD_PARA_END_RE = re.compile(r"\n[ \t]*\n|\n {0,3}(?:`{3,}|~{3,})")       # a code span ends in its paragraph
 
 
@@ -378,7 +428,7 @@ class _HTML(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.doc = doc
         self.out = []
-        self.stack = []          # (tag, hidden?, paints a background?)
+        self.stack = []          # (tag, hidden?, its background: has_background)
         self.hidden_buf = []
         self.skip_depth = 0      # inside script/style/template
         self.row = None
@@ -390,12 +440,14 @@ class _HTML(HTMLParser):
         return any(h for _, h, _ in self.stack)
 
     def handle_starttag(self, tag, attrs):
-        a = {k.lower(): v or "" for k, v in attrs}
+        a = {}
+        for k, v in attrs:                           # of a repeated attribute the first counts, as in a browser
+            a.setdefault(k.lower(), v or "")
         if tag in ("script", "style", "noscript", "template"):
             self.skip_depth += 1
             self.scripts += tag == "script"
             return
-        on_bg = any(bg for _, _, bg in self.stack)
+        on_bg = nearest_background([bg for _, _, bg in self.stack])
         if tag == "img":
             self.doc.images += 1
             if a.get("alt") and not self.skip_depth:
@@ -422,6 +474,9 @@ class _HTML(HTMLParser):
             self.out.append("\x00cell\x00")
         elif tag in BLOCK:
             self.out.append("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)             # <div .../> opens a div in a browser; a void tag has no end
 
     def handle_endtag(self, tag):
         if tag in ("script", "style", "noscript", "template"):
@@ -648,7 +703,7 @@ def _xl_rgb(color, theme, palette):
     if not v or not re.fullmatch(r"[0-9A-Fa-f]{6}", v):
         return None
     try:
-        tint = float(color.get("tint") or 0)
+        tint = max(-1.0, min(1.0, float(color.get("tint") or 0)))
     except ValueError:
         tint = 0.0
     if tint:
@@ -1114,7 +1169,7 @@ def convert(path, name=None) -> Doc:
     except Refused:
         raise
     except (ET.ParseError, ValueError, KeyError, IndexError, zipfile.BadZipFile, UnicodeDecodeError, OSError,
-            RuntimeError, EOFError, zlib.error, lzma.LZMAError, struct.error) as e:   # a damaged zip member
+            RuntimeError, EOFError, OverflowError, zlib.error, lzma.LZMAError, struct.error) as e:
         raise Refused("文件内容损坏或格式不对：%s" % (str(e)[:200] or type(e).__name__))
 
 

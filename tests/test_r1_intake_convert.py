@@ -201,10 +201,35 @@ class R1_53InvisibleContent(unittest.TestCase):
             for shown in ("可见", "表头白字", "深底白字", "白底", "读屏不读", "溢出隐藏"):
                 self.assertIn(shown, doc.text, name)
 
+    def test_css_read_as_a_browser_reads_it(self):
+        """!important in any case, CSS comments, a repeated style attribute (the first counts), transparent text,
+        the nearest background (a white one inside a dark one), hsl() and gradients, a colour attribute without #,
+        <div .../> and <span/> that open an element, a ">" inside a quoted attribute."""
+        cases = ('<span style="display:none !IMPORTANT; display:inline">H1</span>', '<span style="display:none/**/">H2</span>',
+                 '<span style="visibility:hidden ! important">H3</span>', '<span style="display:none" style="color:red">H4</span>',
+                 '<span style="color:transparent;background:#000">H5</span>',
+                 '<div style="background:#000"><div style="background:#fff"><span style="color:#fff">H6</span></div></div>',
+                 '<span style="color:#fff;background:hsl(0,0%,100%)">H7</span>',
+                 '<span style="color:#fff;background:linear-gradient(#fff,#fff)">H8</span>', '<font color="fefefe">H9</font>',
+                 '<div style="display:none"/>H10</div>', '<span style="display:none">a <span/> b</span> H11</span>',
+                 '<span title=">" style="display:none">H12</span>', '<span style="color: white /* x */">H13</span>')
+        shown = ('<div style="background:#fff"><div style="background:navy"><span style="color:#fff">深底白字</span></div></div>'
+                 '<span style="color:#fff;background:rgb(0 0 0 / 80%)">半透明黑底</span><span style="color: rgb(.,.,.)">怪颜色</span>')
+        d = tmpdir(self)
+        for ext, wrap in ((".md", "# 需求\n\n%s\n"), (".html", "<html><body><p>%s</p></body></html>")):
+            for k, snip in enumerate(cases, 1):
+                doc = convert.convert(write(os.path.join(d, "%d%s" % (k, ext)), wrap % snip))
+                self.assertNotIn("H%d" % k, doc.text, (ext, snip))
+                self.assertIn("H%d" % k, "\n".join(t for _, t in doc.hidden), (ext, snip))
+            doc = convert.convert(write(os.path.join(d, "shown" + ext), wrap % shown))
+            for x in ("深底白字", "半透明黑底", "怪颜色"):
+                self.assertIn(x, doc.text, ext)
+
     def test_xlsx_white_font_without_fill(self):
         styles = ('<?xml version="1.0"?><styleSheet %s><fonts><font><sz val="11"/></font>'
                   '<font><color rgb="FFFFFFFF"/><sz val="11"/></font><font><color theme="0"/></font>'
-                  '<font><color theme="0" tint="-0.5"/></font><font><sz val="1"/></font></fonts>'
+                  '<font><color theme="0" tint="-0.5"/></font><font><sz val="1"/></font><font><color theme="0" '
+                  'tint="-inf"/></font></fonts>'
                   '<fills><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>'
                   '<fill><patternFill patternType="solid"><fgColor rgb="FF1F4E79"/></patternFill></fill></fills>'
                   '<cellXfs><xf fontId="0" fillId="0"/><xf fontId="1" fillId="0"/><xf fontId="2" fillId="0"/>'
