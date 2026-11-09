@@ -277,6 +277,8 @@ def _print_report(rep):
                                                rep["classification"], "（预览，未写入）" if rep.get("dry") else ""))
     for line in rep["findings"]:
         print("  " + line)
+    for w in rep.get("warnings", []):
+        print("  注意：" + w)
     for b in rep.get("blocking", []):
         print("  不能提交：" + b)
 
@@ -1468,7 +1470,8 @@ def _intake_args(s, required_key):
     s.add_argument("--consent", action="store_true", help="gate 1: I am the author or have the author's consent")
     s.add_argument("--business", choices=("keep", "mask"), help="gate 3: amounts/companies/contract numbers")
     s.add_argument("--store", help="intake store (default $BRAIN_INTAKE_DIR, git config brain.intake, ~/.brain/intake)")
-    s.add_argument("--exclude", action="append", help="leave out files matching this glob (repeatable)")
+    s.add_argument("--exclude", action="append", help="leave out a file or a folder: its path, its name or a glob "
+                                                     "(repeatable)")
 
 
 def main(argv=None):

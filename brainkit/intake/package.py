@@ -82,6 +82,23 @@ def collect(paths) -> list:
     return out
 
 
+def excluded(path, name, pattern) -> bool:
+    """`--exclude PATTERN` leaves out this file (`path`, shown as `name`, e.g. 飞书导出/附件/x.md). The pattern is the
+    path of the file or of a folder above it (absolute, or from the current folder: what Tab completion gives), or it
+    matches - as a glob, or as it is (a name with [ ]) - the name or a run of its parts: a folder (附件, 飞书导出/附件,
+    附件/*) leaves out everything under it."""
+    if not pattern.strip():
+        return False
+    for q in {os.path.abspath(os.path.expanduser(pattern)), os.path.realpath(os.path.expanduser(pattern))}:
+        for full in {path, os.path.realpath(path)}:
+            if full == q or full.startswith(q.rstrip(os.sep) + os.sep):
+                return True
+    pat = pattern.replace(os.sep, "/").strip("/")
+    parts = name.replace(os.sep, "/").split("/")
+    return any(run == pat or fnmatch.fnmatch(run, pat)
+               for i in range(len(parts)) for run in ("/".join(parts[i:j]) for j in range(i + 1, len(parts) + 1)))
+
+
 # A classification mark is a label, not a word in a sentence (CLASS_MARKERS are the words). In the text it is
 #   - the word on a line, in a part of a line or in a table cell of its own, maybe with a qualifier, a suffix, a ★
 #     term or a "do not distribute" (机密, 【机密】, **CONFIDENTIAL**, 機密文件, Company Confidential, 绝密★启用前,
@@ -203,7 +220,8 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
     """Run the gates and (unless dry_run) write the package. Returns a report dict.
 
     In a dry run a failed gate (1, 2, 3, 5) is listed under report["blocking"] instead of stopping, so the person
-    sees every finding at once. `exclude`: glob patterns on the file names to leave out (e.g. a partner guide)."""
+    sees every finding at once. `exclude`: files or folders to leave out (e.g. a partner guide): a path, a name or a
+    glob (see excluded()); a pattern that leaves out nothing is reported under report["warnings"]."""
     blocking = []
 
     def block(msg):
@@ -217,10 +235,15 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
         block("门 2：--classification 必须是 public / internal / confidential / secret / unsure")
     # (a dry run without a class goes on as public: the marks in the files still count)
     given = "confidential" if classification == "unsure" else classification if classification in CLASSES else "public"
-    files = [(p, n) for p, n in collect(paths)
-             if not any(fnmatch.fnmatch(n, x) or fnmatch.fnmatch(os.path.basename(n), x) for x in exclude)]
+    files, used = [], set()
+    for p, n in collect(paths):
+        hit = {x for x in exclude if excluded(p, n, x)}
+        used |= hit
+        if not hit:
+            files.append((p, n))
+    warnings = ["--exclude %s 没有匹配任何文件，什么都没去掉" % x for x in exclude if x not in used]
     if not files:
-        raise BrainError("没有可收的文件")
+        raise BrainError("没有可收的文件%s" % ("（--exclude 把文件都去掉了）" if used else ""))
     max_file = kit_intake.get("max_file_mb", 50) * 1024 * 1024
     max_total = kit_intake.get("max_total_mb", 200) * 1024 * 1024
     total = sum(_size(p) for p, _ in files)
@@ -371,7 +394,7 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
     manifest_sha = hashlib.sha256(canonical(manifest)).hexdigest()
     report = {"package": pkg, "manifest_sha256": manifest_sha, "segments": len(segs), "sources": len(sources),
               "refused": refused, "findings": findings, "classification": effective, "store": store,
-              "blocking": blocking, "excluded": list(exclude)}
+              "blocking": blocking, "excluded": list(exclude), "warnings": warnings}
     if dry_run:
         return report
     base = os.path.join(store, "packages", pkg)

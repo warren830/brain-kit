@@ -531,5 +531,43 @@ class R1_67DryRun(CliBase):
         self.assertNotIn("门 5", out)
 
 
+
+class R1_68Exclude(CliBase):
+    """--exclude written as a path (Tab completion), a folder, or a file name with [ ] left out nothing, silently."""
+
+    def setUp(self):
+        super().setUp()
+        self.top = os.path.join(self.src, "飞书导出")
+        write(os.path.join(self.top, "退款需求.md"), "# 退款\n\n14 天内可退。\n")
+        self.guide = write(os.path.join(self.top, "附件", "合作方 API 指南.md"), "# 合作方 API 指南\n\nConfidential\n")
+        write(os.path.join(self.top, "客户名单 [内部].md"), "# 名单\n\n联系人：王芳\n")
+
+    def names(self, *patterns):
+        rep = self.build([self.top], dry_run=True, exclude=list(patterns))
+        return sorted(f.split("**")[1].split(" ", 1)[1] for f in rep["findings"]), rep.get("warnings", [])
+
+    def test_forms(self):
+        guide = "飞书导出/附件/合作方 API 指南.md"
+        for pattern in ("合作方 API 指南.md", self.guide, os.path.join(self.top, "附件"), "飞书导出/附件", "附件",
+                        "附件/", "附件/*", "*指南*"):
+            names, warnings = self.names(pattern)
+            self.assertNotIn(guide, names, pattern)
+            self.assertEqual(len(names), 2, pattern)
+            self.assertEqual(warnings, [], pattern)
+        names, _ = self.names("客户名单 [内部].md")
+        self.assertEqual(names, sorted([guide, "飞书导出/退款需求.md"]))
+        with self.assertRaises(BrainError) as cm:
+            self.names("*.md")
+        self.assertIn("--exclude 把文件都去掉了", str(cm.exception))
+
+    def test_a_pattern_that_matches_nothing_is_told(self):
+        names, warnings = self.names("合作方指南.md", "附件")
+        self.assertEqual(len(names), 2)
+        self.assertEqual(warnings, ["--exclude 合作方指南.md 没有匹配任何文件，什么都没去掉"])
+        rc, out = self.brain("intake", self.top, "--key", "REQ-1", "--classification", "internal", "--consent",
+                             "--dry-run", "--store", self.store, "--exclude", "合作方指南.md")
+        self.assertIn("注意：--exclude 合作方指南.md 没有匹配任何文件", out)
+
+
 if __name__ == "__main__":
     unittest.main()
