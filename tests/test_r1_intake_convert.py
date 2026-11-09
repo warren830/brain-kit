@@ -6,6 +6,7 @@ import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from brainkit.common import BrainError  # noqa: E402
 from brainkit.intake import convert, package  # noqa: E402
 from tests.helpers import tmpdir  # noqa: E402
 
@@ -124,6 +125,22 @@ class R1_49HtmlInMarkdownCode(unittest.TestCase):
             self.assertNotIn(h, d.text)
             self.assertIn(h, hidden)
         self.assertEqual(len(d.hidden), 3)
+
+
+class R1_51SheetHeaderFooter(unittest.TestCase):
+    """Gate 2 reads an xlsx sheet's page header and footer (format codes taken out), as it reads a docx's."""
+
+    def test_footer_marking_raises_the_class(self):
+        d = tmpdir(self)
+        src = os.path.join(d, "src")
+        foot = ('<headerFooter><oddHeader>&amp;L&amp;"Arial,Bold"&amp;12R&amp;&amp;D</oddHeader>'
+                '<oddFooter>&amp;CConfidential&amp;R第 &amp;P 页</oddFooter></headerFooter>')
+        p = xlsx(os.path.join(src, "规则.xlsx"), [("规则", None, [["规则", "说明"], ["R1", "14 天内可退"]], foot)])
+        self.assertEqual(convert.convert(p).labels, ["R&D", "Confidential 第 页"])
+        with self.assertRaises(BrainError) as cm:
+            build(src)
+        self.assertIn("规则.xlsx=confidential", str(cm.exception))
+        self.assertEqual(build(src, kit_intake=dict(KIT, allow_confidential=True))[0]["classification"], "confidential")
 
 
 if __name__ == "__main__":

@@ -423,6 +423,10 @@ def _col_index(ref):
     return n
 
 
+# codes in a sheet's header / footer text: &L &C &R sections, &P page, &D date, &"font,style", &12 size, &K color
+XL_HF_CODE_RE = re.compile(r'&(?:&|"[^"]*"|K(?:[0-9A-Fa-f]{6}|[0-9]{2}[+-][0-9]{3})|[0-9]+|[A-Za-z+-])')
+
+
 def convert_xlsx(path, name, max_cells=20000) -> Doc:
     d = Doc(name, "xlsx")
     z = _open_zip(path)
@@ -460,6 +464,11 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
         root = _xml(z, target) if target else None
         if root is None:
             continue
+        hf = root.find(_q("s", "headerFooter"))
+        for part in (list(hf) if hf is not None else []):   # odd / even / first page header and footer
+            text = " ".join(XL_HF_CODE_RE.sub(lambda m: "&" if m.group(0) == "&&" else " ", part.text or "").split())
+            if text:
+                d.labels.append(text[:200])          # gate 2 reads them, as a docx header or footer
         hidden_cols = set()
         cols = root.find(_q("s", "cols"))
         for c in (cols.findall(_q("s", "col")) if cols is not None else []):
