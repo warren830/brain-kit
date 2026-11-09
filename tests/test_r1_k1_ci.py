@@ -8,6 +8,7 @@
          check-run; now one set of rules (brainkit/riskpaths.py) reads them as git does, and refuses what it cannot.
   R1-18  check-run looked for Brain changes case-sensitively: a run branch adding Agents.md (or Brain/...) passed,
          and a clone on a case-insensitive disk (macOS) then reads the bot's file as AGENTS.md.
+  R1-08  the server hook never read kit.json's bot_emails: a bot set up as the docs say had every push refused.
 """
 import json
 import os
@@ -18,7 +19,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from brainkit import ci, riskpaths, sign  # noqa: E402
+from brainkit import ci, pre_receive, riskpaths, sign  # noqa: E402
 from brainkit.common import BrainError, write_json  # noqa: E402
 from tests.helpers import ROOT, commit_file, git_repo, keypair, sh, tmpdir  # noqa: E402
 
@@ -281,6 +282,62 @@ class BrainFilesInAnyLetterCase(unittest.TestCase):
             self.assertTrue(ci.in_brain(path, "brain"), path)
         for path in ("docs/AGENTS.md", "brainstorm/x.md", "Agents.md.bak", "src/brain/x.py"):
             self.assertFalse(ci.in_brain(path, "brain/"), path)
+
+
+# ---------- R1-08: the hook knows the bot by kit.json's bot_emails ----------
+
+class HookReadsTheKitsBotEmails(unittest.TestCase):
+    TEAM_BOT = "brain-bot@pay.example"
+
+    def setUp(self):
+        self.d = tmpdir(self)
+
+    def server(self, kit_emails, bot_email):
+        """A bare repository whose main has kit.json (bot_emails as given) and a hand-over on BR, and the bot's next
+        commit (as `bot_email`) already on the server: the hook decides the ref update."""
+        r = git_repo(os.path.join(self.d, "work-%d" % len(os.listdir(self.d))))
+        kit = {"version": 1, "req_prefix": "PAY"}
+        if kit_emails is not None:
+            kit["bot_emails"] = kit_emails
+        commit_file(r, ".brain/kit.json", json.dumps(kit), "kit")
+        bc = commit_file(r, "brain/TECH.md", "# TECH\n", "brain")
+        sh("git", "-C", r, "switch", "-q", "-c", BR)
+        old = commit_file(r, "runs/PAY-1/run.json", json.dumps(run_record(bc)), "PAY-1: hand off", env=OWNER_ENV)
+        new = commit_file(r, "src/refund.py", "x = 1\n", "PAY-1: step 3", env=dict(
+            BOT_ENV, GIT_AUTHOR_EMAIL=bot_email, GIT_COMMITTER_EMAIL=bot_email))
+        origin = os.path.join(self.d, "origin-%d.git" % len(os.listdir(self.d)))
+        sh("git", "clone", "-q", "--bare", r, origin)
+        sh("git", "-C", origin, "update-ref", "refs/heads/" + BR, old)
+        return origin, "%s %s refs/heads/%s\n" % (old, new, BR)
+
+    def hook(self, origin, line, config):
+        """bin/brain-pre-receive as GitLab runs it: in the bare repository, the push on stdin."""
+        env = dict(os.environ, BRAIN_HOOK_CONFIG=config, GL_USERNAME="brain-bot", GL_PROJECT_PATH="grp/pilot-repo")
+        p = subprocess.run([sys.executable, os.path.join(ROOT, "bin", "brain-pre-receive")], cwd=origin, input=line,
+                           capture_output=True, text=True, env=env)
+        return p.returncode, p.stdout
+
+    def test_the_documented_setup_passes(self):
+        origin, line = self.server([self.TEAM_BOT], self.TEAM_BOT)
+        example = os.path.join(ROOT, "examples", "pre-receive.json")
+        self.assertEqual(self.hook(origin, line, example), (0, ""))
+        self.assertEqual(pre_receive.load_cfg("grp/pilot-repo", cwd=origin)["bot_emails"], [self.TEAM_BOT])
+        origin, line = self.server([self.TEAM_BOT], BOT)                     # the kit's default is not the bot now
+        rc, out = self.hook(origin, line, example)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("bot commits must be authored and committed as %s (found %s)" % (self.TEAM_BOT, BOT), out)
+
+    def test_without_bot_emails_in_kit_json_the_default_stays(self):
+        origin, line = self.server(None, BOT)
+        self.assertEqual(self.hook(origin, line, os.path.join(ROOT, "examples", "pre-receive.json")), (0, ""))
+
+    def test_bot_emails_in_the_hook_config_win(self):
+        cfg = os.path.join(self.d, "hook.json")
+        write_json(cfg, {"default": {"bot_emails": ["runner@corp.example"]}, "projects": {}})
+        origin, line = self.server([self.TEAM_BOT], self.TEAM_BOT)
+        rc, out = self.hook(origin, line, cfg)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("authored and committed as runner@corp.example", out)
 
 
 if __name__ == "__main__":
