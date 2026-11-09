@@ -5,7 +5,9 @@
 Read-only. --vouchers defaults to <intake store>/vouchers when it exists ($BRAIN_INTAKE_DIR, git config
 brain.intake, ~/.brain/intake). --credits is the JSON the KiroCrew app passes in (credits are not readable here).
 Without --ref, a run whose run.json is not in the working tree (not merged yet) is read from its run branch here
-(the same branch `brain eval` reads: evaluate.run_branches).
+(the same branch `brain eval` reads: evaluate.run_branches; a split child merged into its parent's run branch: from
+that branch). A split's parent and children get a "family" section: the child's own records only, the parent's with
+its children's numbers rolled up (brainkit/trace.py).
 """
 from __future__ import annotations
 

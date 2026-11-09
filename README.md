@@ -165,9 +165,10 @@ brain-kit/bin/brain install <项目目录> --lean <AI-DLC Lean 的 checkout 目�
 
 ## 测过什么
 
-本机 152 个测试全部通过（`python3 -m unittest discover -s tests -t .`）。做过两轮独立的对抗评审：流程部分找出 15 个问题，Brain 部分（条目工具、lint、reflect、usage）又找出 15 个，都已修掉，每个问题都补了回归测试。
+本机 645 个测试，2026-11-09 在 python3.9（pytest）和 python3.12（`python3.12 -W error -m unittest discover -s tests -t .`）上都加 `-W error` 跑过：643 个通过，2 个跳过（真实需求文档的测试，要 `BRAIN_TEST_REAL_DOCS` 指向一个文件夹）。做过三轮独立的对抗评审：流程部分找出 15 个问题，Brain 部分（条目工具、lint、reflect、usage）又找出 15 个，大需求拆分找出 16 个，都已修掉，每个问题都补了回归测试。
 
 - **认领**：本地和远端都测了；两个 clone 抢同一个号，git 本身就会拒掉后到的那个；钩子按 claim.json 认人。
+- **大需求拆成小需求**（`tests/test_split.py`、`tests/test_split_trace.py`）：用真的 Lean、一个 bare origin 和两个 clone 端到端跑（两人只靠登录名区分，没有 GitLab）：拆、认领、被拒的认领、被拒的开工、合并后开工、`brain sync` 解决 Lean 进度页的冲突、进度 n/m、大需求发布和关闭、重拆、`--on`、多团队模式下两个小需求之间走 Lean 的 CR；服务器钩子的每条认领规则；两个人抢同一个待认领；trace、eval、usage 的汇总。
 - **文档接收**：
   - 自造的 docx 和 xlsx 里各种隐藏内容都识别出来了，HTML 的隐藏元素和脚本也去掉了；
   - 五道关和 dry-run 都测了；

@@ -33,6 +33,24 @@ become a pseudonym G-<6 hex> of the email; Lean's audit file names (<host>-<6 he
 and home directories in free text (blocked commands, stage notes, failed check commands) are replaced. Human message
 text is never copied, except what decisions.md holds.
 Answers an eval oracle gave (golden tasks, `eval_oracle: true`) are kept apart and never count as a person's.
+
+A split (brainkit/split.py): a big requirement (the parent) and its children, each a run of its own that continues
+the parent's Lean intent for one unit. Their records share the intent's folder, so each run keeps only its own:
+  child   (run.json "parent"): its Lean events are its clone's ledger file(s) (aidlc-docs/audit/<host>-<lean_clone>
+          .jsonl; without lean_clone, the events of Lean team lean_team); its commits are judged against the parent's
+          run branch (target_branch: its MR goes there), its merge against the default branch as for any run (it gets
+          there with its parent); "family" says whether it merged into the parent's branch (intents.child_merged: its
+          run.json there has its `brain handoff` record "mr", and its owner's run branch, while one is here, has its
+          tip there; read on origin's copy as last fetched when there is one, else the local one).
+  parent  (other run.json files name it as parent: in the tree read, i.e. merged into its branch, and on their own
+          run branches here, not merged yet; a child's run.json a sibling carried in (`--on`) is not its merge: such a
+          child is read from its own branch): its events are the intent's minus its children's clone files, its
+          commits its branch's minus its children's. "family" lists each child with its numbers (from the child's own
+          trace) and rolls them up with the parent's.
+  both    decisions.md and requirements.md are the intent's: a row is the run's whose commit wrote that line (git
+          blame of the tree read; a line not committed yet: the run whose branch is checked out). Brain usage: each
+          run's own usage row (brainkit.usage attributes unit pages to the child of that unit).
+A run that is not part of a split has no "family" key: its trace is what it was before splits existed.
 """
 from __future__ import annotations
 
@@ -47,9 +65,9 @@ import subprocess
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-from . import lean, reflect, sign, usage
+from . import intents, lean, reflect, sign, usage
 from .bridge.ledger import RESERVED
-from .common import BrainError, JIRA_RE, USER_RE, git, iso, utcnow
+from .common import BRANCH_RE, JIRA_RE, USER_RE, ZERO_SHA, BrainError, git, iso, parse_branch, utcnow
 
 SCHEMA = 1
 WINDOW_DAYS = 14
@@ -737,8 +755,12 @@ def _ancestry(log, sha) -> set:
     return seen
 
 
-def git_history(repo, cfg, rec, ref, key, refs=None):
-    """Commits of the run branch, the hand-over commit, the merge, park.json history."""
+def git_history(repo, cfg, rec, ref, key, refs=None, target=None):
+    """Commits of the run branch, the hand-over commit, the merge, park.json history. `target` (a split child):
+    (the parent's run branch name, the ref or commit it is read at, or None): the run's own commits are judged against
+    it as they are against the default branch for any other run (rules M1-M6, C1-C3: its MR goes there), and the
+    commit the branch started from is left out too (`brain start --on`: a sibling's branch); out["into_parent"] is
+    how it reached the parent's branch, out["merge"] its merge into the default branch."""
     branch = rec.get("branch") if isinstance(rec.get("branch"), str) else ""
     bc = rec.get("brain_commit") if isinstance(rec.get("brain_commit"), str) else None
     intent = rec.get("intent") if isinstance(rec.get("intent"), str) else None
@@ -746,23 +768,31 @@ def git_history(repo, cfg, rec, ref, key, refs=None):
     pp = "%s/%s/park.json" % (cfg["runs_dir"], key)
     refs = _refs(repo) if refs is None else refs
     dref = default_ref(repo, cfg, ref, refs)
+    gcfg, gref = (dict(cfg, default_branch=target[0]), target[1]) if target else (cfg, dref)
     copies = copies_of(repo, branch, ref, refs)
     tip, tip_how, tip_note = freshest(repo, copies)
     out = {"tip": tip, "tip_src": tip_how, "tip_note": tip_note, "default_ref": dref, "merge": None, "commits": None,
            "range": None, "handover_commit": None, "park": None, "requests": [], "_log": [], "_rp": rp}
-    land = landing(repo, cfg, dref, key, intent, branch, copies, refs)
+    land = landing(repo, gcfg, gref, key, intent, branch, copies, refs) if gref else None
+    if target:
+        main = landing(repo, cfg, dref, key, intent, branch, copies, refs) if dref else None
+        out.update(merge=main["merge"] if main else None, into_parent=land["merge"] if land else None)
     if land:
-        out["merge"] = land["merge"]
+        if not target:
+            out["merge"] = land["merge"]
         if not land["tip"]:
             return out
         tip = land["tip"]
         out.update(tip=tip, tip_src=land["tip_src"], tip_note="; ".join(x for x in land["notes"] if x) or None)
         exclude = land["exclude"]
     elif tip:
-        exclude = [dref] if dref else ([bc] if _commit(repo, bc) else [])
+        exclude = [gref] if gref else ([bc] if _commit(repo, bc) else [])
     else:
         return out
     rng = [tip] + ["^" + x for x in exclude]
+    base = _base_of(repo, tip, rp) if target else None
+    if base and base not in exclude:
+        rng.append("^" + base)
     log = _log(repo, "--topo-order", "--reverse", *rng)
     foreign = foreign_parents(repo, [(c["sha"], c["parents"]) for c in log if len(c["parents"]) > 1], rp)
     if foreign:   # C2: main merged into the branch
@@ -1010,11 +1040,12 @@ def classify_who(who, bot_users=()):
     return "unclassified", None
 
 
-def md_decisions(text, path, bot_users):
+def md_decisions(text, path, bot_users, lines=None):
+    """decisions.md rows; `lines` (a split): only the rows on these line numbers (the run's own)."""
     out = []
     for n, row in decision_rows(text or ""):
         did, dec = row.get("id", ""), row.get("decision", "")
-        if not did or not dec:
+        if not did or not dec or (lines is not None and n not in lines):
             continue
         by, who = classify_who(row.get("who"), bot_users)
         whole = " ".join(v for k, v in row.items() if k != "id")
@@ -1029,13 +1060,13 @@ def md_decisions(text, path, bot_users):
     return out
 
 
-def assumptions(text, path, at, at_src):
+def assumptions(text, path, at, at_src, lines=None):
     out, on = [], False
     for n, line in enumerate((text or "").split("\n"), 1):
         if line.startswith("## "):
             on = line[3:].strip().lower().startswith("assumption")
             continue
-        m = ASSUMPTION_RE.match(line) if on else None
+        m = ASSUMPTION_RE.match(line) if on and (lines is None or n in lines) else None
         if m and not m.group(2).strip().startswith("<!--"):
             out.append({"id": m.group(1), "source": "requirements.md", "at": at, "stage": "requirements",
                         "by": "agent", "who": "agent", "text": m.group(2).strip(), "why": None,
@@ -1234,15 +1265,380 @@ def waiting_on(repo, cfg, key, tree, hist, decisions):
     return None
 
 
+# ---------- a split: the parent and its children (brainkit/split.py) ----------
+
+CLONE_RE = re.compile(r"^[0-9a-f]{6}$")                    # runrec: lean_clone, the random part of a Lean clone id
+RUN_JSON_RE = r"^%s/([A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6})/run\.json$"
+BLAME_RE = re.compile(r"^([0-9a-f]{40}) [0-9]+ ([0-9]+)(?: [0-9]+)?$")
+NUMBERS = ("stages_done", "verify_rounds", "verify_failed", "commits_bot", "commits_person", "blocked",
+           "human_at_judgment", "human_outside_judgment", "decisions", "questions", "credits")
+NUMBER_SRC = {
+    "stages_done": "stages: stages whose last Lean record is STAGE_COMPLETED, of the run's own Lean events",
+    "verify_rounds": "checks.verify: the run's own Lean VERIFY events",
+    "verify_failed": "checks.verify_failed: those not ok",
+    "commits_bot": "actions.commits by the bot (kit.json bot_emails); null when the run's commits are not here",
+    "commits_person": "actions.commits by a person",
+    "blocked": "actions.blocked: the run's own Lean BLOCKED events",
+    "human_at_judgment": "humans with judgment_point true (Lean approvals, rejections, refused approvals; bridge "
+                         "answers)",
+    "human_outside_judgment": "humans with judgment_point false (pushes after hand-over, allow test change, KiroCrew "
+                              "manual acts)",
+    "decisions": "decisions: decisions.md rows and assumptions A-n its commits wrote (git blame), bridge decisions of "
+                 "its runs",
+    "questions": "questions asked: distinct park.json questions or bridge questions, the larger (as brain eval)",
+    "credits": "cost.credits, passed in by the KiroCrew app; null when not known",
+}
+_CACHE = {}   # content read at a commit (immutable): (what, repo, ...) -> value
+
+
+def _cached(k, make):
+    if k not in _CACHE:
+        if len(_CACHE) > 4096:
+            _CACHE.clear()
+        _CACHE[k] = make()
+    return _CACHE[k]
+
+
+def _key_order(k):
+    m = re.match(r"^(.*)-([0-9]+)$", str(k))
+    return (m.group(1), int(m.group(2))) if m else (str(k), 0)
+
+
+def child_of(rec, key):
+    """The split fields of a child's run.json {parent, unit, target_branch, lean_team, lean_clone, built_on} (a
+    field that is not well formed: None), or None when the run is not a child of a split."""
+    p = rec.get("parent") if isinstance(rec, dict) else None
+    if not (isinstance(p, str) and JIRA_RE.match(p) and p != key):
+        return None
+    out = {"parent": p}
+    for f, ok in (("unit", lambda v: True), ("target_branch", BRANCH_RE.match), ("lean_team", lambda v: True),
+                  ("lean_clone", CLONE_RE.match), ("built_on", JIRA_RE.match)):
+        v = rec.get(f)
+        out[f] = v if isinstance(v, str) and v and ok(v) else None
+    return out
+
+
+def _parse_runs(cfg, paths, texts) -> dict:
+    rx = re.compile(RUN_JSON_RE % re.escape(cfg["runs_dir"]))
+    out = {}
+    for p, text in zip(paths, texts):
+        try:
+            rec = json.loads(text) if text is not None else None
+        except ValueError:
+            rec = None
+        out[rx.match(p).group(1)] = rec if isinstance(rec, dict) else None
+    return out
+
+
+def runs_at(repo, cfg, sha) -> dict:
+    """{key: run.json record, or None when it is not a JSON object} of runs/<KEY>/run.json in commit `sha`."""
+    if not sha:
+        return {}
+
+    def make():
+        rx = re.compile(RUN_JSON_RE % re.escape(cfg["runs_dir"]))
+        p = git(repo, "ls-tree", "-r", "-z", "--name-only", sha, "--", cfg["runs_dir"], check=False)
+        paths = sorted(x for x in p.stdout.split("\0") if rx.match(x)) if p.returncode == 0 else []
+        return _parse_runs(cfg, paths, _blobs(repo, ["%s:%s" % (sha, x) for x in paths]))
+    return _cached(("runs", repo, sha, cfg["runs_dir"]), make)
+
+
+def runs_in(repo, cfg, tree) -> dict:
+    """runs_at for the tree read (the working tree is read each time: it changes)."""
+    if tree.ref:
+        return runs_at(repo, cfg, _commit(repo, tree.ref))
+    rx = re.compile(RUN_JSON_RE % re.escape(cfg["runs_dir"]))
+    paths = [p for p in tree.files(cfg["runs_dir"]) if rx.match(p)]
+    return _parse_runs(cfg, paths, [tree.read(p) for p in paths])
+
+
+def branch_runs(repo, cfg, have=(), refs=None) -> dict:
+    """{key: (ref to read, run.json record or None)} for the run branches here (<prefix>/<owner>/<KEY>-<slug>, local
+    and origin's) of the requirements not in `have`: of each key, the branch whose tip has runs/<KEY>/run.json
+    (naming that branch) and was committed last; of that branch's copies, the freshest (origin's when they
+    diverged). brain eval reads the unmerged runs from these (evaluate.run_branches)."""
+    refs = _refs(repo) if refs is None else refs
+    prefix, by = cfg["branch_prefix"], {}
+    for r, sha in sorted(refs.items()):
+        space = next((x for x in ("refs/remotes/origin/", "refs/heads/") if r.startswith(x + prefix + "/")), None)
+        b = parse_branch(r[len(space):], prefix) if space else None
+        if b and b["key"] not in have and JIRA_RE.match(b["key"]):
+            by.setdefault(b["key"], {}).setdefault(r[len(space):], []).append((r, sha))
+    state = tuple((k, n, tuple(c)) for k, bs in sorted(by.items()) for n, c in sorted(bs.items()))
+
+    def make():
+        cands = []
+        for key, branches in sorted(by.items()):
+            for name, copies in sorted(branches.items()):
+                copies = sorted(copies, key=lambda x: not x[0].startswith("refs/remotes/"))
+                tip, ref, _ = freshest(repo, copies)
+                cands.append((key, name, tip, ref))
+        texts = _blobs(repo, ["%s:%s/%s/run.json" % (tip, cfg["runs_dir"], key) for key, _, tip, _ in cands])
+        found = {}
+        for (key, name, tip, ref), text in zip(cands, texts):
+            if text is None:
+                continue
+            try:
+                rec = json.loads(text)
+            except ValueError:
+                rec = None                    # read anyway: the trace says why it cannot be used (skipped)
+            if isinstance(rec, dict) and isinstance(rec.get("branch"), str) and rec["branch"] != name:
+                continue
+            found.setdefault(key, []).append((tip, ref, rec if isinstance(rec, dict) else None))
+        out = {}
+        for key, rows in found.items():
+            best = None
+            for tip, ref, rec in rows:        # the branch committed last (the first one of those committed together)
+                when = (_cdate(repo, tip) or "") if len(rows) > 1 else ""
+                if best is None or when > best[0]:
+                    best = (when, ref, rec)
+            out[key] = (best[1], best[2])
+        return out
+    return _cached(("branches", repo, cfg["runs_dir"], prefix, frozenset(have), state), make)
+
+
+def children_of(repo, cfg, key, tree, refs) -> list:
+    """[(child key, ref to read it at, run.json)] of the runs that name `key` as their parent, in key order: those in
+    the tree read (merged into the parent's branch; or with it into the default branch), read there (tree.ref); and
+    those on their own run branches here (local or origin's), not merged yet, read from their branch. A child whose
+    run.json is in the tree read but that has not merged (a sibling started from its branch and carried it in) is read
+    from its own branch when it has one."""
+    here = runs_in(repo, cfg, tree)
+    own = {k: (r, rec) for k, (r, rec) in branch_runs(repo, cfg, (), refs).items()
+           if child_of(rec, k) and rec["parent"] == key}
+    out = {}
+    for k, rec in here.items():
+        cf = child_of(rec, k)
+        if k == key or not cf or cf["parent"] != key:
+            continue
+        carried = k in own and not merged_into_parent(repo, cfg, k, rec, cf, refs)["value"]
+        out[k] = own[k] if carried else (tree.ref, rec)
+    for k, v in own.items():
+        out.setdefault(k, v)
+    return [(k,) + out[k] for k in sorted(out, key=_key_order)]
+
+
+def _target(repo, cfg, tree, cf, ref, refs):
+    """(parent's run branch name, ref or commit to read it at or None, how it was found) for a child, or None when
+    its run.json names no target_branch."""
+    tb = cf["target_branch"]
+    if not tb:
+        return None
+    r = default_ref(repo, dict(cfg, default_branch=tb), ref, refs)
+    if r:
+        return tb, r, "the parent's run branch %s" % r
+    # gone (deleted after it merged): the parent's tip as it merged into the default branch
+    prec = runs_in(repo, cfg, tree).get(cf["parent"])
+    dref = default_ref(repo, cfg, ref, refs)
+    pb = prec.get("branch") if isinstance(prec, dict) and isinstance(prec.get("branch"), str) else None
+    if pb == tb and dref:
+        pi = prec.get("intent") if isinstance(prec.get("intent"), str) else None
+        land = landing(repo, cfg, dref, cf["parent"], pi, pb, copies_of(repo, pb, None, refs), refs)
+        if land and land.get("tip"):
+            return tb, land["tip"], "%s as it merged into %s (%s, %s): the branch is gone" % (
+                tb, dref, land["merge"]["commit"][:12], land["merge"]["how"])
+    return tb, None, "the parent's run branch %s is not here or on origin, and not merged into %s" % (
+        tb, dref or cfg["default_branch"])
+
+
+def tips_of(cfg, refs) -> dict:
+    """{key: {run branch name: tip sha}} of the run branches in `refs` (origin's tip when both have one): what
+    intents.run_branches gives, as last fetched (trace does not ask origin)."""
+    prefix, out = cfg["branch_prefix"], {}
+    for space in ("refs/heads/", "refs/remotes/origin/"):            # origin's last: its tip wins
+        for r, sha in sorted(refs.items()):
+            b = parse_branch(r[len(space):], prefix) if r.startswith(space + prefix + "/") else None
+            if b:
+                out.setdefault(b["key"], {})[r[len(space):]] = sha
+    return out
+
+
+def merged_at(repo, cfg, key, rec, sha, refs) -> bool:
+    """intents.child_merged for the child `key` (its run.json `rec`) at commit `sha`."""
+    return intents.child_merged(repo, cfg, {"key": key, "parent": rec.get("parent"), "owner": rec.get("owner")}, sha,
+                                tips_of(cfg, refs))
+
+
+def merged_into_parent(repo, cfg, key, rec, cf, refs) -> dict:
+    """Has a child merged into its parent's run branch (intents.child_merged: its runs/<KEY>/run.json there has the
+    record of its `brain handoff`, "mr", and its owner's run branch, while one is here, has its tip there; its
+    run.json alone proves nothing, a sibling that started from its branch carries it too). Read on the parent's
+    branch (origin's copy as last fetched when there is one, else the local one: trace does not fetch), then on the
+    default branch (it got there with its parent). {"value", "ref", "src"}."""
+    rp = "%s/%s/run.json" % (cfg["runs_dir"], key)
+    tb = cf.get("target_branch")
+    if not tb:
+        return {"value": False, "ref": None, "src": "%s names no target_branch" % rp}
+    rule = "intents.child_merged: %s there with its `brain handoff` record (mr), and %s's run branch, while one is " \
+           "here, with its tip there" % (rp, rec.get("owner") or "its owner")
+    tref = next((r for r in ("refs/remotes/origin/" + tb, "refs/heads/" + tb) if refs.get(r)), None)
+    d = default_ref(repo, cfg, None, refs)
+    for r in (tref, d):
+        sha = (refs.get(r) or _commit(repo, r)) if r else None
+        if sha and merged_at(repo, cfg, key, rec, sha, refs):
+            return {"value": True, "ref": r, "src": "%s (%s)%s: %s" % (
+                r, sha[:12], ", the parent's run branch" if r == tref else ", the default branch: it merged with its "
+                "parent" if not tref else "", rule)}
+    if not tref:
+        return {"value": False, "ref": None, "src": "%s is not here or on origin (as last fetched), and %s has not "
+                "merged into %s: %s" % (tb, key, d or cfg["default_branch"], rule)}
+    text = _show(repo, refs[tref], rp)
+    try:
+        there = json.loads(text) if text is not None else None
+    except ValueError:
+        there = None
+    why = "%s is not there" % rp if text is None else "%s there has no `brain handoff` record (mr): a sibling that " \
+        "started from or merged its branch carried it in" % rp if not (isinstance(there, dict) and
+                                                                        isinstance(there.get("mr"), dict)) else \
+        "its run branch has commits that are not there (after its hand-off)"
+    return {"value": False, "ref": tref, "src": "%s (%s), the parent's run branch: %s. %s" % (
+        tref, refs[tref][:12], why, rule)}
+
+
+def _base_of(repo, tip, rp):
+    """The commit a run branch started from: the first parent of the oldest commit on its first-parent line that
+    added runs/<KEY>/run.json (`brain start`), or None."""
+    lines = [x for x in (_g(repo, "log", "--first-parent", "--diff-filter=A", "--format=%P", tip, "--", rp)
+                         or "").split("\n") if x.strip()]
+    return lines[-1].split()[0] if lines else None
+
+
+def blame(repo, tree, path):
+    """{line number: commit sha} of a file as the tree read has it (git blame; a working-tree line not committed
+    yet: ZERO_SHA), or None when git cannot blame it (the file is not committed)."""
+    def make():
+        out = _raw(repo, "blame", "--porcelain", *([tree.ref] if tree.ref else []), "--", path)
+        if out is None:
+            return None
+        rows = {}
+        for line in out.split("\n"):
+            m = BLAME_RE.match(line)
+            if m:
+                rows[int(m.group(2))] = m.group(1)
+        return rows
+    sha = _commit(repo, tree.ref) if tree.ref else None
+    return _cached(("blame", repo, sha, path), make) if sha else make()
+
+
+def _head_branch(repo):
+    out = _g(repo, "symbolic-ref", "-q", "--short", "HEAD")
+    return out.strip() if out else None
+
+
+def owned_lines(repo, tree, path, mine, theirs, branch, their_branches):
+    """The line numbers of a shared Lean page (decisions.md, requirements.md) that are the run's: written by one of
+    its commits (`mine`, a child) or by none of its children's (`theirs`, a parent; mine None). A line not committed
+    yet belongs to the run whose branch is checked out (the parent when it is neither). None: every line (git cannot
+    blame the file, and the run is a parent); an empty set: none (a child)."""
+    rows = blame(repo, tree, path)
+    if rows is None:
+        return None if mine is None else set()
+    head = _head_branch(repo) if tree.ref is None and ZERO_SHA in rows.values() else None
+    out = set()
+    for n, sha in rows.items():
+        if sha == ZERO_SHA:
+            ok = head == branch if mine is not None else head not in their_branches
+        else:
+            ok = sha in mine if mine is not None else sha not in theirs
+        if ok:
+            out.add(n)
+    return out
+
+
+def _only(text, lines):
+    """The text with the lines not in `lines` blanked (line numbers kept)."""
+    if text is None or lines is None:
+        return text
+    return "\n".join(x if i in lines else "" for i, x in enumerate(text.split("\n"), 1))
+
+
+def questions_asked(t) -> int:
+    """How many questions the run parked on: distinct park.json questions, or bridge questions (the larger)."""
+    park = {(q.get("kind"), q.get("lean_request"), q.get("question_sha256")) for q in t["actions"]["questions"] or []
+            if q.get("kind") or q.get("question_sha256")}
+    asked = {d["id"] for d in list(t["decisions"]) + list(t.get("oracle") or []) if d.get("source") == "bridge"}
+    return max(len(park), len(asked))
+
+
+def numbers(t) -> dict:
+    """A run's numbers for a split's roll-up (NUMBERS; where each comes from: NUMBER_SRC)."""
+    c, commits = t["checks"], t["actions"]["commits"]
+    jp = [h["judgment_point"] for h in t["humans"]]
+    return {"stages_done": sum(1 for s in t["stages"] if s["state"] == "done"),
+            "verify_rounds": len(c["verify"]) if c else None, "verify_failed": c["verify_failed"] if c else None,
+            "commits_bot": None if commits is None else sum(1 for x in commits if x["by"] == "bot"),
+            "commits_person": None if commits is None else sum(1 for x in commits if x["by"] != "bot"),
+            "blocked": len(t["actions"]["blocked"]), "human_at_judgment": jp.count(True),
+            "human_outside_judgment": jp.count(False), "decisions": len(t["decisions"]),
+            "questions": questions_asked(t), "credits": t["cost"]["credits"]}
+
+
+def rollup(rows) -> tuple:
+    """(sums, [what is not known: "KEY field"]): each number summed over the runs that have it; None when none has."""
+    total, unknown = {}, []
+    for f in NUMBERS:
+        vals = [n[f] for _, n in rows if n is not None and n[f] is not None]
+        unknown += ["%s %s" % (k, f) for k, n in rows if n is None or n[f] is None]
+        s = sum(vals) if vals else None
+        total[f] = round(s, 4) if isinstance(s, float) else s
+    return total, sorted(set(unknown), key=lambda x: (_key_order(x.split(" ")[0]), x))
+
+
+def _team_of(e):
+    a = e.get("actor")
+    return a.get("team") if isinstance(a, dict) else None
+
+
+def _claims(cf):
+    """A test (file path, event) -> is it this child's Lean record; and what it is, for src."""
+    if cf["lean_clone"]:
+        end = "-%s.jsonl" % cf["lean_clone"]
+        return (lambda path, e: os.path.basename(path).endswith(end)), "its clone's ledger file(s) (*-%s.jsonl, " \
+            "run.json lean_clone)" % cf["lean_clone"]
+    team = cf["lean_team"] or (re.sub(r"[^A-Za-z0-9_]", "_", cf["unit"]) if cf["unit"] else None)
+    if team:
+        return (lambda path, e: _team_of(e) == team), "Lean events of team %s (run.json has no lean_clone)" % team
+    return (lambda path, e: False), "none: run.json has no lean_clone, lean_team or unit"
+
+
+def _split_events(tree, events, chains, mine=None, theirs=()):
+    """(events, chains) a split run keeps: a child's (`mine`: its test), or a parent's (all but `theirs`: tests)."""
+    labels = audit_labels([p for p in tree.files(lean.DOCS + "/audit") if p.endswith(".jsonl")])
+
+    def keep(path, e):
+        return mine(path, e) if mine else not any(t(path, e) for t in theirs)
+    events = [e for e in events if keep(e["_file"], e)]
+    files = {e["_file"] for e in events}
+    # a ledger file stays when the run keeps one of its records, or (no record of this intent in it) when the file
+    # itself is the run's
+    chains = {labels[p]: chains[labels[p]] for p in sorted(labels) if labels[p] in chains and
+              (p in files or keep(p, {}))}
+    return events, chains
+
+
+def _member_line(t):
+    return "trace of %s read from %s" % (t["key"], t["ref"])
+
+
 # ---------- the trace ----------
 
 def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits=None, as_of=None,
-          allowed_signers=None, _usage=None) -> dict:
+          allowed_signers=None, _usage=None, _cache=None) -> dict:
     """The trace of one requirement key. `credits`: a number, a KiroCrew record {credits|total, turns, manual,
     context_used, context_window}, or {"runs": {RUN-id or KEY: record}}. `as_of`: ISO time the 14-day window is
-    judged at (default now; recorded in the trace)."""
+    judged at (default now; recorded in the trace). `_cache` (brain eval): {(key, ref): trace} of the traces made
+    with these same arguments; a parent's children are taken from it and every trace made is put in it."""
     if not JIRA_RE.match(key or ""):
         raise BrainError("%r is not a requirement key like PAY-1" % key)
+    if _cache is not None and (key, ref) in _cache:
+        return _cache[(key, ref)]
+    t = _build(repo, cfg, key, ref, ledger_path, vouchers_dir, credits, as_of, allowed_signers, _usage, _cache)
+    if _cache is not None:
+        _cache[(key, ref)] = t
+    return t
+
+
+def _build(repo, cfg, key, ref, ledger_path, vouchers_dir, credits, as_of, allowed_signers, _usage, _cache):
     tree = Tree(repo, ref)
     as_of_dt = _dt(as_of) if as_of else utcnow()
     if as_of and not as_of_dt:
@@ -1266,16 +1662,27 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
         ("intent", "string"), ("branch", "string"), ("brain_commit", "string"), ("handoff", "JSON object"))
         if rec.get(f) is not None and not isinstance(rec[f], dict if f == "handoff" else str)]
 
+    refs = _refs(repo)
+    # ----- a split (brainkit/split.py): a child keeps its own records, a parent leaves its children's out -----
+    cf = child_of(rec, key)
+    kids = children_of(repo, cfg, key, tree, refs) if cf is None else []
+    kid_tests = [_claims(child_of(r, k))[0] for k, _, r in kids]
     events, chains = lean_events(tree, intent) if intent else ([], {})
+    if cf:
+        test, events_src = _claims(cf)
+        events, chains = _split_events(tree, events, chains, mine=test)
+    elif kids:
+        events, chains = _split_events(tree, events, chains, theirs=kid_tests)
     if not chains:
-        missing.append("Lean audit (no aidlc-docs/audit/*.jsonl in %s)" % tree.label)
+        missing.append("Lean audit (no aidlc-docs/audit/*.jsonl in %s)" % tree.label if not cf else
+                       "Lean audit (%s: not in %s)" % (events_src, tree.label))
     docs = "%s/%s" % (lean.DOCS, intent) if intent else None
     dec_path = docs + "/decisions.md" if docs else None
     dec_text = tree.read(dec_path) if dec_path else None
     req_path = docs + "/inception/requirements/requirements.md" if docs else None
 
-    refs = _refs(repo)
-    hist = git_history(repo, cfg, rec, ref, key, refs) if branch else {
+    target = _target(repo, cfg, tree, cf, ref, refs) if cf else None
+    hist = git_history(repo, cfg, rec, ref, key, refs, target=target[:2] if target else None) if branch else {
         "tip": None, "tip_src": None, "tip_note": None, "default_ref": default_ref(repo, cfg, ref, refs), "merge": None,
         "commits": None, "range": None, "handover_commit": None, "park": None, "requests": [], "_log": [], "_rp": rp}
     if hist["tip"] is None:
@@ -1308,14 +1715,41 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
         for c in hist["commits"]:
             c["after_handover"] = False if not handed else (c["sha"] not in before) if before is not None else None
 
+    # ----- a split parent: its children's own traces (their numbers; their commits are not the parent's) -----
+    u = _usage if _usage is not None else usage.collect(repo, cfg, ref=ref)
+    members, theirs = [], set()
+    for k, kref, krec in kids:
+        kt, why = None, None
+        try:
+            kt = build(repo, cfg, k, ref=kref, ledger_path=ledger_path, vouchers_dir=vouchers_dir,
+                       credits=None if credits_shape(credits) == "one" else credits, as_of=as_of,
+                       allowed_signers=allowed_signers, _usage=u if kref == ref else None, _cache=_cache)
+            theirs |= {c["sha"] for c in kt["actions"]["commits"] or []}
+        except BrainError as e:
+            why = str(e)
+        except (ValueError, TypeError, KeyError, AttributeError) as e:   # as brain eval: a record nobody foresaw
+            why = "%s while reading it: %s" % (type(e).__name__, e)
+        members.append((k, kref, krec, kt, why))
+    if kids and hist["commits"] is not None:
+        hist["commits"] = [c for c in hist["commits"] if c["sha"] not in theirs]
+    # decisions.md and requirements.md are the intent's: the lines this run's commits wrote
+    lines = {}
+    if cf or kids:
+        mine = {c["sha"] for c in hist["commits"] or []} if cf else None
+        their_branches = {r.get("branch") for _, _, r in kids if isinstance(r.get("branch"), str)}
+        for path in (dec_path, req_path):
+            if path and tree.read(path) is not None:
+                lines[path] = owned_lines(repo, tree, path, mine, theirs, branch, their_branches)
+
     # ----- decisions -----
-    decisions = md_decisions(dec_text, dec_path, cfg.get("bot_users", [])) if dec_text is not None else []
+    decisions = md_decisions(dec_text, dec_path, cfg.get("bot_users", []), lines.get(dec_path)) \
+        if dec_text is not None else []
     if dec_text is None and docs:
         missing.append("%s (not in %s)" % (dec_path, tree.label))
     req_done = [e for e in events if e.get("event") == "STAGE_COMPLETED" and _data(e).get("stage") == "requirements"]
     a_at, a_src = ((req_done[-1]["_at"], req_done[-1]["_src"]) if req_done else
                    (_utc(rec.get("created_at")), run_src + " created_at"))
-    decisions += assumptions(tree.read(req_path), req_path, a_at, a_src) if req_path else []
+    decisions += assumptions(tree.read(req_path), req_path, a_at, a_src, lines.get(req_path)) if req_path else []
     bridge = {}
     for d in (led or {}).get("decisions", []):
         bridge[(d["run_id"], d["id"])] = {
@@ -1456,15 +1890,21 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
     handovers.sort(key=lambda x: (x["at"] or "", x["kind"]))
 
     # ----- brain -----
-    u = _usage if _usage is not None else usage.collect(repo, cfg, ref=ref)
-    urow = next((r for r in u["runs"] if r["intent"] == intent), None)
+    urow = next((r for r in u["runs"] if r["intent"] == intent and r["key"] == key), None)
+    if urow is None and not (cf or kids):
+        urow = next((r for r in u["runs"] if r["intent"] == intent), None)
     brain = {"brain_commit": rec.get("brain_commit") if isinstance(rec.get("brain_commit"), str) else None,
              "loaded": urow["loaded"] if urow else None,
              "cited": urow["cited"] if urow else [], "stale": urow["stale"] if urow else [],
              "unknown": urow["unknown"] if urow else [],
-             "proposals": proposals_of(dec_text, dec_path) if dec_text is not None else None,
+             "proposals": proposals_of(_only(dec_text, lines.get(dec_path)), dec_path) if dec_text is not None
+             else None,
              "src": "brainkit.usage (%s): loaded = Brain at brain_commit; cited = ids in aidlc-docs/%s/*.md outside "
                     "brain-proposal blocks" % (u["ref"], intent)}
+    if cf or kids:
+        brain["src"] += " (a split: its own usage row, the unit pages construction/<unit>/ and construction/plans/" \
+                        "<unit>-code-generation-plan.md the child's of that unit, the other pages the parent's; " \
+                        "proposals: the decisions.md lines its commits wrote)"
 
     # ----- outcome -----
     acc = [h for h in humans if h["what"] in ACCEPT_WHAT and h["kind"] in ("approval", "rejection")]
@@ -1510,7 +1950,7 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
         missing.append("credits (%s)" % credits_why)
     missing.append("pushes (git keeps no push log; person commits after hand-over stand in for them)")
     missing.append("CI pipelines (GitLab, not readable here)")
-    return {
+    t = {
         "schema": SCHEMA, "key": key, "as_of": iso(as_of_dt), "ref": tree.label,
         "intent": intent, "owner": owner, "branch": branch,
         "brain_commit": brain["brain_commit"], "run_ids": run_ids,
@@ -1531,9 +1971,104 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
         "outcome": outcome,
         "missing": missing,
     }
+    if cf:
+        t["family"] = _child_family(repo, cfg, key, rec, cf, refs, target, hist, events_src, lines, dec_path,
+                                    req_path, t)
+    elif kids:
+        t["family"] = _parent_family(t, members, kid_tests, lines, dec_path, req_path, hist)
+    return t
+
+
+def _shared_src(lines, dec_path, req_path, whose):
+    out = []
+    for path in (dec_path, req_path):
+        if path in lines:
+            n = lines[path]
+            out.append("%s: %s (git blame)" % (path, "every line (git cannot blame it)" if n is None else
+                                                "%d line(s) %s" % (len(n), whose)))
+    return "; ".join(out) or "no decisions.md or requirements.md in the tree read"
+
+
+def _child_family(repo, cfg, key, rec, cf, refs, target, hist, events_src, lines, dec_path, req_path, t) -> dict:
+    into = hist.get("into_parent")
+    fam = {"role": "child", "parent": cf["parent"], "unit": cf["unit"], "target_branch": cf["target_branch"],
+           "merged_into_parent": merged_into_parent(repo, cfg, key, rec, cf, refs), "numbers": numbers(t),
+           "src": {"events": "Lean audit: %s" % events_src,
+                   "commits": "git log %s: judged against %s" % (hist["range"], target[2]) if target and
+                   hist["range"] else "not here (%s)" % (target[2] if target else "run.json names no target_branch"),
+                   "into_parent": "%s (%s)" % (into["how"], into["src"]) if into else None,
+                   "decisions": _shared_src(lines, dec_path, req_path, "written by its commits"),
+                   "numbers": NUMBER_SRC}}
+    if cf["built_on"]:
+        fam["built_on"] = cf["built_on"]
+    return fam
+
+
+def _parent_family(t, members, kid_tests, lines, dec_path, req_path, hist) -> dict:
+    children, rows = [], [(t["key"], numbers(t))]
+    acts = [(t["outcome"]["last_activity"], t["key"])]
+    for k, kref, krec, kt, why in members:
+        cf = child_of(krec, k)
+        if kt is not None:
+            m = (kt.get("family") or {}).get("merged_into_parent")
+            n = numbers(kt)
+            acts.append((kt["outcome"]["last_activity"], k))
+        else:
+            m, n = None, None
+        children.append({"key": k, "unit": cf["unit"], "merged_into_parent": m or {
+            "value": False, "ref": None, "src": "its trace was not read"}, "numbers": n,
+            "src": _member_line(kt) if kt is not None else "trace of %s not read: %s" % (k, why)})
+        rows.append((k, n))
+    total, unknown = rollup(rows)
+    la = max(((a["at"], a.get("src"), k) for a, k in acts if a and a.get("at")), key=lambda x: (x[0], x[2]),
+             default=None)
+    gone = [c["key"] for c in children if c["numbers"] is None or c["numbers"]["commits_bot"] is None]
+    return {"role": "parent", "children": children,
+            "rollup": {"own": rows[0][1], "total": total, "unknown": unknown,
+                       "last_activity": {"at": la[0], "key": la[2], "src": la[1]} if la else
+                       {"at": None, "key": None, "src": None}},
+            "src": {"children": "run.json files naming %s as parent: in the tree read (%s), and on their own run "
+                                "branches here (local or origin's), each read there" % (t["key"], t["ref"]),
+                    "events": "Lean audit: the intent's events minus its children's (%d child ledger test(s): their "
+                              "clone files, or their team)" % len(kid_tests),
+                    "commits": "git log %s minus its children's commits%s" % (
+                        hist["range"], " (not known for %s: theirs may be counted here)" % ", ".join(gone)
+                        if gone else "") if hist["range"] else "not here",
+                    "decisions": _shared_src(lines, dec_path, req_path, "not written by a child's commit"),
+                    "total": "its own numbers plus each child's, summed where known; unknown lists what is not",
+                    "numbers": NUMBER_SRC}}
 
 
 # ---------- text ----------
+
+def _nums(n) -> str:
+    if n is None:
+        return "读不到"
+
+    def v(f):
+        return "?" if n[f] is None else n[f]
+    return "阶段做完 %s，verify %s 次（失败 %s），提交 机器人 %s / 人 %s，被拦 %s，人 判断点内 %s / 外 %s，决策 %s，提问 %s，" \
+        "credits %s" % tuple(v(f) for f in NUMBERS)
+
+
+def render_family(f) -> list:
+    """A split's lines: a child's one line; a parent's line per child and the total."""
+    if not f:
+        return []
+    if f["role"] == "child":
+        m = f["merged_into_parent"]
+        return ["小需求：%s 的单元 %s；%s %s%s" % (
+            f["parent"], f["unit"] or "?", "已合进" if m["value"] else "还没合进", f["target_branch"] or "大需求的分支",
+            "（从 %s 的分支开始）" % f["built_on"] if f.get("built_on") else "")]
+    kids = f["children"]
+    out = ["大需求：拆成的小需求有 %d 个 run，已合进 %d 个" % (
+        len(kids), sum(1 for c in kids if c["merged_into_parent"]["value"]))]
+    for c in kids:
+        out.append("  %s %s（%s）：%s" % (c["key"], c["unit"] or "?", "已合进" if c["merged_into_parent"]["value"]
+                                         else "没合进", _nums(c["numbers"])))
+    out.append("  合计（大需求自己 + 小需求）：%s" % _nums(f["rollup"]["total"]))
+    return out
+
 
 def render(t) -> str:
     out = ["%s · %s · %s（%s）" % (t["key"], t["intent"] or "-", t["branch"] or "-", t["ref"])]
@@ -1547,6 +2082,7 @@ def render(t) -> str:
     g = t["src"]["git"]
     if g.get("tip_note"):
         out.append("分支：用的是 %s；%s" % (g["tip_src"], g["tip_note"]))
+    out += render_family(t.get("family"))
     if t["stages"]:
         mark = {"done": "x", "skipped": "S", "started": "-"}
         out.append("")

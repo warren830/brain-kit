@@ -1,7 +1,8 @@
 """`brain eval`: Eval v1 over all runs (brainkit/evaluate.py).
 
   brain eval [--ref REF] [--since DATE] [--json] [--credits FILE] [--ledger PATH] [--vouchers DIR] [--stuck-hours N]
-              runs: the tree's (merged), the unmerged ones on <prefix>/* branches here, and the ledger's
+              runs: the tree's (merged), the unmerged ones on <prefix>/* branches here, and the ledger's;
+              a split: one 大需求 row per parent (its children, merged into its branch, numbers rolled up)
   brain eval gaps [--file] [same options]     knowledge / test / golden-case gaps worth filing; --file files them
                                               as intents (source eval-gap) when brainkit.intents is installed
 """

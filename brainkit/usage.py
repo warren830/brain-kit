@@ -10,6 +10,11 @@ For each run (runs/<KEY>/run.json) the entries it loaded are the Brain at its br
   never cited      current entries loaded by at least --min-runs runs and never cited: withdraw candidates
   stale citations  runs citing entries that are archived now (they leaned on old knowledge)
   unknown ids      cited ids that are not in the Brain at all (typos, or entries from an unmerged MR)
+
+One row per intent, the run whose run.json names it. A split (brainkit/split.py) has several runs on one intent: the
+parent and its children (run.json "parent", "unit"). Then each run has its own row and the intent's pages are
+attributed: construction/<unit>/... and construction/plans/<unit>-code-generation-plan.md (Lean's unit pages) to the
+child of that unit, every other page (decisions.md included) to the parent, the run without "parent".
 """
 from __future__ import annotations
 
@@ -24,6 +29,9 @@ from .common import git
 CITE_RE = re.compile(r"(?<![A-Za-z0-9-])([PTIJ]-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3})(?![0-9-])")
 LEGACY_CITE_RE = re.compile(r"(?<![A-Za-z0-9-])([PTIJ]-[0-9]{1,5})(?![0-9-])")
 PROPOSAL_BLOCK_RE = re.compile(r"^\s*```+\s*brain-(?:proposal|gap)\s*$.*?^\s*```+\s*$", re.M | re.S)
+# Lean's unit pages (aidlc_lean.py STAGES, PLAN_FILE_RE): construction/<unit>/<stage>/..., the code-generation plan
+UNIT_PAGE_RE = re.compile(r"^construction/(?:plans/(?P<plan>[^/]+)-code-generation-plan\.md|(?P<dir>[^/]+)/.+)$")
+NOT_UNITS = ("plans", "build-and-test")          # Lean's RESERVED_UNITS: folders under construction/ that are not units
 
 
 def strip_proposals(text) -> str:
@@ -51,6 +59,56 @@ def _tree_files(repo, ref, prefix):
     return out
 
 
+def page_unit(rel):
+    """The unit a page of an intent is about (rel: its path under aidlc-docs/<intent>/), or None."""
+    m = UNIT_PAGE_RE.match(rel)
+    u = (m.group("plan") or m.group("dir")) if m else None
+    return None if u in NOT_UNITS else u
+
+
+def _is_child(rec) -> bool:
+    return isinstance(rec.get("parent"), str) and bool(rec["parent"]) and isinstance(rec.get("unit"), str)
+
+
+def _key_order(rec):
+    m = re.match(r"^(.*)-([0-9]+)$", str(rec.get("key", "")))
+    return (m.group(1), int(m.group(2))) if m else (str(rec.get("key", "")), 0)
+
+
+def _add(into, ids):
+    for i, n in ids.items():
+        into[i] = into.get(i, 0) + n
+
+
+def _rows_of(intent, recs, pages) -> list:
+    """[(run.json, who counts as the run, {cited id: count})] for one intent. Without a split child: one row, the
+    last run.json read, with every page. A split: one row per run, the unit pages to the child of that unit (each, if
+    two name it), the other pages to the runs without "parent" (a row of its own, key "", when none is here)."""
+    kids = [r for r in recs if _is_child(r)]
+    if not kids:
+        ids = {}
+        for c in pages.values():
+            _add(ids, c)
+        return [(recs[-1] if recs else {}, intent, ids)]
+    others = sorted((r for r in recs if not _is_child(r)), key=_key_order)
+    kids.sort(key=_key_order)
+    by_unit = {}
+    for r in kids:
+        by_unit.setdefault(r["unit"], []).append(r)
+    every = others + kids
+    at = {id(r): i for i, r in enumerate(every)}
+    got, rest = [{} for _ in every], {}
+    for rel, c in sorted(pages.items()):
+        u = page_unit(rel)
+        to = by_unit[u] if u in by_unit else others
+        for r in to:
+            _add(got[at[id(r)]], c)
+        if not to:
+            _add(rest, c)
+    rows = [(r, (intent, r.get("key", "")), got[i]) for i, r in enumerate(every)]
+    return ([({}, intent, rest)] if rest and not others else []) + rows
+
+
 def collect(repo, cfg, ref=None) -> dict:
     brain = E.Brain.from_git(repo, ref, cfg["brain_dir"]) if ref else E.Brain.load(os.path.join(repo, cfg["brain_dir"]))
     current = brain.main()
@@ -66,51 +124,54 @@ def collect(repo, cfg, ref=None) -> dict:
             if isinstance(rec, dict) and isinstance(rec.get("intent"), str) and rec["intent"]:
                 if not isinstance(rec.get("brain_commit"), str):
                     rec = dict(rec, brain_commit=None)
-                runs[rec["intent"]] = rec
-    cites = {}                                    # intent -> {id: count}
+                runs.setdefault(rec["intent"], []).append(rec)
+    cites = {}                                    # intent -> {page under aidlc-docs/<intent>/: {id: count}}
     for path, text in _tree_files(repo, ref, "aidlc-docs").items():
-        parts = path.split("/")
+        parts = path.replace(os.sep, "/").split("/")
         if len(parts) < 3 or not path.endswith(".md"):
             continue
         intent = parts[1]
         body = strip_proposals(text)
         found = CITE_RE.findall(body) + [i for i in LEGACY_CITE_RE.findall(body) if i in legacy_known]
         if found:
-            c = cites.setdefault(intent, {})
+            c = cites.setdefault(intent, {}).setdefault("/".join(parts[2:]), {})
             for i in found:
                 c[i] = c.get(i, 0) + 1
     loaded_cache = {}
-    per_run, loaded_by = [], {}
+    per_run, loaded_by, cited_by = [], {}, {}
     for intent in sorted(set(runs) | set(cites)):
-        rec = runs.get(intent, {})
-        bc = rec.get("brain_commit")
-        loaded, old_archive = None, set()
-        if bc:
-            if bc not in loaded_cache:
-                ok = git(repo, "cat-file", "-e", bc + "^{commit}", check=False).returncode == 0
-                if ok:
-                    then = E.Brain.from_git(repo, bc, cfg["brain_dir"])
-                    loaded_cache[bc] = (set(then.main()), set(then.archived()))
-                else:
-                    loaded_cache[bc] = (None, set())
-            loaded, old_archive = loaded_cache[bc]
-        cited = set(cites.get(intent, {}))
-        for i in loaded or ():
-            loaded_by.setdefault(i, set()).add(intent)
-        known = set(current) | set(archived) | (loaded or set()) | old_archive
-        # stale: already archived when the run started (it leaned on old knowledge). An entry archived later
-        # was current when the run cited it, so that citation counts as use.
-        stale = old_archive if loaded is not None else set(archived)
-        per_run.append({"intent": intent, "key": rec.get("key", ""), "loaded": None if loaded is None else len(loaded),
-                        "cited": sorted(cited & loaded) if loaded is not None else sorted(cited & set(current)),
-                        "stale": sorted(cited & stale),
-                        "unknown": sorted(i for i in cited if i not in known)})
-    cited_by = {}
-    for intent, c in cites.items():
-        for i, n in c.items():
-            row = cited_by.setdefault(i, {"count": 0, "runs": set()})
-            row["count"] += n
-            row["runs"].add(intent)
+        for rec, who, ids in _rows_of(intent, runs.get(intent, []), cites.get(intent, {})):
+            bc = rec.get("brain_commit")
+            loaded, old_archive = None, set()
+            if bc:
+                if bc not in loaded_cache:
+                    ok = git(repo, "cat-file", "-e", bc + "^{commit}", check=False).returncode == 0
+                    if ok:
+                        then = E.Brain.from_git(repo, bc, cfg["brain_dir"])
+                        loaded_cache[bc] = (set(then.main()), set(then.archived()))
+                    else:
+                        loaded_cache[bc] = (None, set())
+                loaded, old_archive = loaded_cache[bc]
+            cited = set(ids)
+            for i in loaded or ():
+                loaded_by.setdefault(i, set()).add(who)
+            for i in cited:
+                cited_by.setdefault(i, {"count": 0, "runs": set()})["runs"].add(who)
+            known = set(current) | set(archived) | (loaded or set()) | old_archive
+            # stale: already archived when the run started (it leaned on old knowledge). An entry archived later
+            # was current when the run cited it, so that citation counts as use.
+            stale = old_archive if loaded is not None else set(archived)
+            row = {"intent": intent, "key": rec.get("key", ""), "loaded": None if loaded is None else len(loaded),
+                   "cited": sorted(cited & loaded) if loaded is not None else sorted(cited & set(current)),
+                   "stale": sorted(cited & stale),
+                   "unknown": sorted(i for i in cited if i not in known)}
+            if _is_child(rec):
+                row.update(parent=rec["parent"], unit=rec["unit"])
+            per_run.append(row)
+    for intent, pages in cites.items():
+        for c in pages.values():
+            for i, n in c.items():
+                cited_by.setdefault(i, {"count": 0, "runs": set()})["count"] += n
     entries = []
     for eid, (f, e) in sorted(current.items()):
         cb = cited_by.get(eid, {"count": 0, "runs": set()})
@@ -147,8 +208,10 @@ def report(data, min_runs=3) -> str:
         out.append("每个 run：")
         for r in data["runs"]:
             loaded = "装载 %d 条" % r["loaded"] if r["loaded"] is not None else "装载数不明（没有 brain_commit）"
-            out.append("  %s %s：%s，引用 %d 条%s" % (r["key"] or "-", r["intent"], loaded, len(r["cited"]),
-                                                  "（%s）" % ", ".join(r["cited"]) if r["cited"] else ""))
+            out.append("  %s %s%s：%s，引用 %d 条%s" % (r["key"] or "-", r["intent"],
+                                                    "（%s 的小需求，单元 %s，只算它的单元页）" % (r["parent"], r["unit"])
+                                                    if r.get("parent") else "", loaded, len(r["cited"]),
+                                                    "（%s）" % ", ".join(r["cited"]) if r["cited"] else ""))
     never = [x for x in data["entries"] if not x["cites"] and x["loaded_by"] >= min_runs]
     if never:
         out.append("")
@@ -162,12 +225,16 @@ def report(data, min_runs=3) -> str:
         out.append("")
         out.append("重复出现的教训：" + "，".join("%s ×%d%s" % (i, n, "（改成 gate）" if n >= 2 else "")
                                            for i, n in data["repeats_any"]))
-    stale = [(r["intent"], r["stale"]) for r in data["runs"] if r["stale"]]
+    shared = {r["intent"] for r in data["runs"] if r.get("parent")}     # a split: several runs on one intent
+
+    def who(r):
+        return "%s %s" % (r["key"] or "-", r["intent"]) if r["intent"] in shared else r["intent"]
+    stale = [(who(r), r["stale"]) for r in data["runs"] if r["stale"]]
     if stale:
         out.append("")
         out.append("引用了已归档的条目（用了过时知识）：")
         out += ["  %s：%s" % (i, ", ".join(s)) for i, s in stale]
-    unknown = [(r["intent"], r["unknown"]) for r in data["runs"] if r["unknown"]]
+    unknown = [(who(r), r["unknown"]) for r in data["runs"] if r["unknown"]]
     if unknown:
         out.append("")
         out.append("引用了 Brain 里没有的条目号（写错了，或还没合并）：")

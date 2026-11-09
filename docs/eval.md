@@ -157,6 +157,14 @@ Who 的写法是运行机提示词（`remote/prompts/brain-run.md` 第 5 节）�
 
 **E5 这一批**（报告开头那张表，JSON 的 `batch`）：每个需求一行：需求、状态（停住了的写"n 小时没动静"）、自主（交接后除了必经的审批没人插手：是 / 否（做了什么）/ 本地 = 没交接 / ? = 有人做了事、但没有时间）、人工介入落在判断点内 / 外的次数、问过几个问题（park.json 里不同的问题，或桥上的问题，取多的）、credits、交付（对 / 不对 / 14 天未满 / 有问题（14 天未满）/ 没有验收记录 / 还没合并 / 没合并）。表上面一句话：交接给运行机的有几个、交接后没人插手的几个、其中已经确认交付对的几个。"能不能无人值守地跑一批"先看这张表，再看下面的复看队列。
 
+**E6 大需求**（`brain split` 拆出来的，见 [安装和使用.md](安装和使用.md) 4.7）：
+
+- 小需求和大需求共用一个 Lean intent。小需求的 trace 只读它自己 worktree 的 Lean 账本（run.json 的 `lean_clone`），提交按合进大需求的分支来认；`merged_at` 还是合进 main 的时间。另有 `family.merged_into_parent`：它 `brain handoff` 时在 run.json 记的 `mr` 和它分支上的提交都到了大需求的分支（`intents.child_merged`；只有 run.json 不算，从它分支开工的兄弟也带着它）。
+- 大需求的 trace 去掉小需求的账本和提交。`family` 里列每个小需求的数（做完的阶段、verify 次数和失败次数、机器人和人的提交、被拦次数、判断点内外的人工介入、决策、问题、credits），`rollup.total` 是大需求自己加所有小需求；哪个数谁都不知道，就是 null。decisions.md、requirements.md 的行按 `git blame` 分给写它的那个 run。
+- 状态多一个 `merged_into_parent`（已合进大需求，等大需求进 main）：不算停住。大需求的空闲时间按全家最后一次动静算。
+- `batch` 每个需求照旧一行，小需求多一个 `parent`。`families` 每个大需求一行：小需求、已合并 n/m、状态、判断点内外的人工介入合计、问题合计、credits 合计。报告里多一段"大需求"。没有拆分的仓库，`families` 是空列表，别的不变。
+- `brain usage`：有小需求的 intent，每个 run 一行；单元自己的页面（`construction/<单元>/`、它的代码计划）算那个小需求的，别的页面（包括 decisions.md）算大需求的。
+
 **缺口**（`brain eval gaps`）：
 
 - 被驳回过、但 decisions.md 里没有引用它的 correction 或 repeats 提案（知识缺口）。验收时成批审、驳回了其中几项（`rejected_items`）的，每一项都要有一条 src 写着这一项的提案（和 `brain reflect` 一样）；本地 Lean 里的驳回没有凭证可引，提案的 src 写记下这次驳回的那一行（同一阶段、当天或之后的 decisions.md 行）就算。“同一阶段”按 Lean 的审批管哪些阶段看 Stage 栏：REQUIREMENTS 是 requirements；DESIGN 是 design；INCEPTION 管 requirements 和 application-design，写 inception、requirements、design 都认；PLAN 管 code-generation，写 plan、code 都认；RELEASE 是 release、acceptance、验收；

@@ -22,23 +22,27 @@ Brain usage (brainkit.usage); read-only.
                     question went void / invalid / unknown
   这一批            one row per requirement: state, autonomous or not, human acts at / outside judgment points,
                     questions asked, credits, delivered correctly or still open
+  大需求            a split (brainkit/split.py): one row per parent (families), its children, how many merged into
+                    its branch, judgment / questions / credits of the parent and its children together (trace's
+                    family roll-up); a child merged into its parent's branch and not yet into main is
+                    merged_into_parent (已合进大需求): not open, never stuck
 Runs are found in the tree read (runs/<KEY>/run.json: merged ones, on main), on run branches here (<prefix>/*, local
-and origin's: the unmerged ones, read from the branch) and in the bridge ledger (a run whose run.json is nowhere here
-is listed as skipped, with its ledger state). Answers given by an eval oracle (`eval_oracle: true`) are never
+and origin's: the unmerged ones, read from the branch; a split child merged into its parent's run branch, its own
+branch there or gone: from the parent's branch, as merged) and in the bridge ledger (a run whose run.json is nowhere
+here is listed as skipped, with its ledger state). Answers given by an eval oracle (`eval_oracle: true`) are never
 counted. A run whose record cannot be read is skipped and listed with the reason (`skipped`); the others are still
 evaluated.
 """
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import sqlite3
 import statistics
 import urllib.parse
 
 from . import brainlint, entries as E, trace as T, usage
-from .common import BrainError, JIRA_RE, parse_branch, utcnow
+from .common import BrainError, JIRA_RE, utcnow
 
 REQUIRED = {"IDEATION", "REQUIREMENTS", "DESIGN", "INCEPTION", "PLAN", "RELEASE", "ideation", "requirements",
             "design", "plan", "acceptance"}
@@ -62,7 +66,9 @@ DROPPED = {"stale": "过时（MR 更新了，问题重发）", "void": "作废",
 QUESTION_PROBLEMS = {"void": "作废", "invalid": "无效", "delivery_unknown": "送达不明", "refused": "签名服务拒签"}
 STATE_LABEL = {"merged": "已合并", "accepted": "验收过了、没合并", "waiting": "在等回答", "open": "进行中",
                "closed": "MR 关了（没合并）", "failed": "运行机失败", "unknown": "派单结果不明",
-               "merged_not_here": "桥说已合并（这里的 main 没有）", "not_readable": "读不到（只有桥上的记录）"}
+               "merged_not_here": "桥说已合并（这里的 main 没有）", "not_readable": "读不到（只有桥上的记录）",
+               "merged_into_parent": "已合进大需求"}
+FAMILY_LABEL = {"in_progress": "小需求在做", "ready_to_release": "小需求都合进了，等发布"}
 DELIVERY_LABEL = {"correct": "对", "wrong": "不对", "pending": "14 天未满", "wrong_open": "有问题（14 天未满）",
                   "unknown": "没有验收记录", "open": "还没合并", "closed": "没合并"}
 
@@ -80,34 +86,25 @@ def run_keys(repo, cfg, ref=None) -> list:
 def run_branches(repo, cfg, have=()) -> dict:
     """{key: ref to read} for the run branches here (<prefix>/<owner>/<KEY>-<slug>, local and origin's) of the
     requirements not in `have`: of each key, the branch whose tip has runs/<KEY>/run.json (naming that branch) and
-    was committed last; of that branch's copies, the freshest (trace.freshest: origin's when they diverged)."""
-    prefix, by = cfg["branch_prefix"], {}
-    for r, sha in sorted(T._refs(repo).items()):
-        space = next((x for x in ("refs/remotes/origin/", "refs/heads/") if r.startswith(x + prefix + "/")), None)
-        b = parse_branch(r[len(space):], prefix) if space else None
-        if b and b["key"] not in have and JIRA_RE.match(b["key"]):
-            by.setdefault(b["key"], {}).setdefault(r[len(space):], []).append((r, sha))
-    out = {}
-    for key, branches in sorted(by.items()):
-        best = None
-        for name, copies in sorted(branches.items()):
-            copies.sort(key=lambda x: not x[0].startswith("refs/remotes/"))
-            tip, ref, _ = T.freshest(repo, copies)
-            text = T._show(repo, tip, "%s/%s/run.json" % (cfg["runs_dir"], key))
-            if text is None:
-                continue
-            try:
-                rec = json.loads(text)
-            except ValueError:
-                rec = None                    # read anyway: the trace says why it cannot be used (skipped)
-            if isinstance(rec, dict) and isinstance(rec.get("branch"), str) and rec["branch"] != name:
-                continue
-            when = T._cdate(repo, tip) or ""
-            if best is None or when > best[0]:
-                best = (when, ref)
-        if best:
-            out[key] = best[1]
-    return out
+    was committed last; of that branch's copies, the freshest (trace.freshest: origin's when they diverged).
+    A split child merged into its parent's run branch (intents.child_merged) is read there, as merged (as a merged
+    run is read from the tree, not from its branch), also when its own branch is gone (deleted after its MR merged):
+    the run branch of its parent (as above) whose tip has its runs/<CHILD>/run.json, naming that requirement as parent
+    and that branch as target_branch. One that has not merged (a sibling started from its branch and carried its
+    run.json in) is read from its own branch, or from there when it has none. The parent's trace reads them alike
+    (trace.children_of)."""
+    refs = T._refs(repo)
+    out = {k: r for k, (r, _) in T.branch_runs(repo, cfg, have, refs).items()}
+    for pkey, (r, prec) in sorted(T.branch_runs(repo, cfg, (), refs).items()):
+        if not isinstance(prec, dict) or not isinstance(prec.get("branch"), str):
+            continue
+        sha = T._commit(repo, r)
+        for k, rec in sorted(T.runs_at(repo, cfg, sha).items()):
+            cf = T.child_of(rec, k)
+            if k not in have and cf and cf["parent"] == pkey and cf["target_branch"] == prec["branch"] and \
+                    (k not in out or T.merged_at(repo, cfg, k, rec, sha, refs)):
+                out[k] = r
+    return dict(sorted(out.items()))
 
 
 def ledger_runs(path) -> dict:
@@ -227,11 +224,12 @@ def build_traces(repo, cfg, ref=None, ledger_path=None, vouchers_dir=None, credi
         note = "--credits 只有一条记录，却有 %d 个需求：不知道是谁的，没有算给任何一个（请按 run 号或需求号给）" % (
             len(keys) + len(branches))
         credits = {"runs": {}}
-    traces, skipped = [], []
+    traces, skipped, made = [], [], {}       # made: a split parent's trace makes its children's; each is made once
     for k, r, u in [(k, ref, _usage) for k in keys] + [(k, branches[k], None) for k in sorted(branches)]:
         try:
             traces.append(T.build(repo, cfg, k, ref=r, ledger_path=ledger_path, vouchers_dir=vouchers_dir,
-                                  credits=credits, as_of=as_of, allowed_signers=allowed_signers, _usage=u))
+                                  credits=credits, as_of=as_of, allowed_signers=allowed_signers, _usage=u,
+                                  _cache=made))
         except BrainError as e:
             skipped.append({"key": k, "why": str(e)})
         except (ValueError, TypeError, KeyError, AttributeError) as e:   # a record shaped in a way nobody foresaw
@@ -253,13 +251,18 @@ def run_state(t, as_of=None, stuck_hours=STUCK_HOURS) -> dict:
     accepted (accepted, not merged yet) | open. Stuck: not merged, closed or failed, and nothing new for
     `stuck_hours` (commits, Lean records, park questions, ledger rows, vouchers)."""
     o = t["outcome"]
+    fam = t.get("family") or {}
     br = sorted(o.get("bridge_runs") or [], key=lambda r: (r.get("created") or "", r.get("run_id") or ""))
     last = str(br[-1]["state"]) if br else None
     la = (o.get("last_activity") or {}).get("at")
+    if fam.get("role") == "parent":      # a split parent moves while its children do
+        la = fam["rollup"]["last_activity"]["at"] or la
     now = as_of or T._dt(t.get("as_of")) or utcnow()
     idle = round((now - T._dt(la)).total_seconds() / 3600.0, 1) if la and T._dt(la) else None
     if o["merged_at"]["value"]:
         v = "merged"
+    elif fam.get("role") == "child" and fam["merged_into_parent"]["value"]:
+        v = "merged_into_parent"
     elif last in ("merged", "closed", "failed"):
         v = {"merged": "merged_not_here"}.get(last, last)
     elif last and last.endswith("_unknown"):
@@ -271,8 +274,11 @@ def run_state(t, as_of=None, stuck_hours=STUCK_HOURS) -> dict:
     else:
         v = "open"
     stuck = v in ("open", "waiting", "accepted", "unknown") and idle is not None and idle >= stuck_hours
-    return {"value": v, "bridge": last, "last_activity": la, "idle_hours": idle, "stuck": stuck,
-            "waiting_on": o.get("waiting_on")}
+    st = {"value": v, "bridge": last, "last_activity": la, "idle_hours": idle, "stuck": stuck,
+          "waiting_on": o.get("waiting_on")}
+    if fam.get("role") == "parent":
+        st["family_activity"] = fam["rollup"]["last_activity"]
+    return st
 
 
 def open_reasons(t, st, stuck_hours=STUCK_HOURS) -> list:
@@ -286,7 +292,8 @@ def open_reasons(t, st, stuck_hours=STUCK_HOURS) -> list:
         out.append({"rule": "stuck", "text": "%.0f 小时没有进展（最后一次 %s，≥%g 小时算停住）%s" % (
             st["idle_hours"], st["last_activity"], stuck_hours,
             "，在等回答：%s%s" % (w.get("kind") or "?", " " + w["lean_request"] if w.get("lean_request") else "")
-            if w else ""), "evidence": [(t["outcome"].get("last_activity") or {}).get("src")]})
+            if w else ""), "evidence": [(st.get("family_activity") or t["outcome"].get("last_activity") or {})
+                                        .get("src")]})
     if v == "closed":
         out.append({"rule": "closed_unmerged", "text": "MR 关了，没有合并", "evidence": "bridge ledger runs"})
     if v == "failed":
@@ -308,10 +315,7 @@ def open_reasons(t, st, stuck_hours=STUCK_HOURS) -> list:
 
 def questions_asked(t) -> int:
     """How many questions the run parked on: distinct park.json questions, or bridge questions (the larger)."""
-    park = {(q.get("kind"), q.get("lean_request"), q.get("question_sha256")) for q in t["actions"]["questions"] or []
-            if q.get("kind") or q.get("question_sha256")}
-    asked = {d["id"] for d in list(t["decisions"]) + list(t.get("oracle") or []) if d.get("source") == "bridge"}
-    return max(len(park), len(asked))
+    return T.questions_asked(t)
 
 
 def batch(traces, skipped, states) -> list:
@@ -332,6 +336,8 @@ def batch(traces, skipped, states) -> list:
                      "credits": t["cost"]["credits"],
                      "delivery": correctness(t) if t["outcome"]["merged_at"]["value"] else (
                          "closed" if st["value"] == "closed" else "open")})
+        if (t.get("family") or {}).get("role") == "child":
+            rows[-1]["parent"] = t["family"]["parent"]
     for s in skipped:
         if s.get("state") == "not_readable":
             last = (s.get("bridge_runs") or [{}])[-1]
@@ -340,6 +346,27 @@ def batch(traces, skipped, states) -> list:
                          "judgment": None, "questions": None, "credits": None,
                          "delivery": "closed" if last.get("state") == "closed" else "open"})
     return sorted(rows, key=lambda r: r["key"])
+
+
+def families(traces, states) -> list:
+    """One row per split parent among `traces` (its trace's family): {key, children (the keys of the child runs, a
+    child not started has none), merged (into the parent's branch), total, state (the parent's when it is merged,
+    closed or cannot go on; else ready_to_release when every child merged, in_progress), judgment [at, outside],
+    questions, credits (None when none is known): the parent's and its children's together (family.rollup.total)."""
+    rows = []
+    for t in sorted(traces, key=lambda x: x["key"]):
+        f = t.get("family") or {}
+        if f.get("role") != "parent":
+            continue
+        kids, tot = f["children"], f["rollup"]["total"]
+        merged = sum(1 for c in kids if c["merged_into_parent"]["value"])
+        v = states[t["key"]]["value"]
+        state = v if v in ("merged", "closed", "failed", "unknown", "merged_not_here") else (
+            "ready_to_release" if kids and merged == len(kids) else "in_progress")
+        rows.append({"key": t["key"], "children": [c["key"] for c in kids], "merged": merged, "total": len(kids),
+                     "state": state, "judgment": [tot["human_at_judgment"] or 0, tot["human_outside_judgment"] or 0],
+                     "questions": tot["questions"] or 0, "credits": tot["credits"]})
+    return rows
 
 
 def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouchers_dir=None, credits=None,
@@ -484,7 +511,7 @@ def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouc
             "runs": len(traces), "skipped": skipped, "completed": [t["key"] for t in completed],
             "states": {k: v for k, v in sorted(states.items())}, "stuck_hours": stuck_hours,
             "open_branches": found.get("branches", {}), "ledger_only": found.get("ledger_only", []),
-            "batch": batch(active, skipped, states),
+            "batch": batch(active, skipped, states), "families": families(active, states),
             "autonomy": autonomy, "delivery": delivery, "judgment": judgment,
             "repeat_rate": u["repeat_rate"], "useful": u["useful"],
             "useful_loaded": _per_run_useful(u), "staleness": staleness, "cost": cost, "funnel": funnel,
@@ -645,6 +672,8 @@ def batch_report(data) -> list:
            "  | 需求 | 状态 | 自主 | 判断点内 / 外 | 提问 | credits | 交付 |", "  |---|---|---|---|---|---|---|"]
     for r in rows:
         state = STATE_LABEL.get(r["state"], r["state"])
+        if r.get("parent"):
+            state += "（%s 的小需求）" % r["parent"]
         if r["state"] == "not_readable" and r.get("bridge"):
             state += "：桥上 %s" % r["bridge"]
         if r.get("stuck"):
@@ -655,6 +684,13 @@ def batch_report(data) -> list:
                                                                          if r["beyond"] else ""),
             "%d / %d" % tuple(j) if j else "-", "-" if r["questions"] is None else r["questions"],
             "-" if r["credits"] is None else r["credits"], DELIVERY_LABEL.get(r["delivery"], r["delivery"])))
+    for f in data.get("families") or []:
+        if f is data["families"][0]:
+            out += ["", "大需求（拆成小需求的；判断点、提问、credits 是大需求自己加上小需求的）："]
+        out.append("  %s：%s；小需求 %d 个 run，已合进 %d 个（%s）；判断点内 / 外 %d / %d；提问 %d；credits %s" % (
+            f["key"], FAMILY_LABEL.get(f["state"]) or STATE_LABEL.get(f["state"], f["state"]), f["total"], f["merged"],
+            "、".join(f["children"]) or "-", f["judgment"][0], f["judgment"][1], f["questions"],
+            "-" if f["credits"] is None else f["credits"]))
     return out
 
 
