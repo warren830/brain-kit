@@ -268,5 +268,17 @@ class R1_30_InstallPrefix(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.repo, ".kiro")))
 
 
+class R1_31_DoctorOffline(Project):
+    def test_r1_31_offline_with_an_origin_says_it_did_not_fetch(self):
+        rc, out = brain(self.repo, "doctor", "--offline")
+        self.assertIn("WARN no origin remote: Brain freshness not checked", out)     # really none
+        self.add_origin()
+        rc, out = brain(self.repo, "doctor", "--offline")
+        self.assertNotIn("no origin remote", out)
+        self.assertIn("WARN Brain vs origin/main not checked (--offline: nothing fetched)", out)
+        rc, out = brain(self.repo, "doctor")
+        self.assertIn("OK   Brain vs origin/main: same", out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -447,7 +447,11 @@ def doctor_checks(repo, cfg, fetch=True) -> list:
     add(("OK" if os.path.exists(os.path.join(repo, "AGENTS.md")) else "FAIL", "AGENTS.md at repo root"))
     ignored = git(repo, "check-ignore", "-q", MATERIALS_DIR + "/x", check=False).returncode == 0
     add(("OK" if ignored else "FAIL", "%s/ is git-ignored (materials never get committed)" % MATERIALS_DIR))
-    if _has_origin(repo) and fetch:
+    if not _has_origin(repo):
+        add(("WARN", "no origin remote: Brain freshness not checked"))
+    elif not fetch:
+        add(("WARN", "Brain vs origin/%s not checked (--offline: nothing fetched)" % cfg["default_branch"]))
+    else:
         p = git(repo, "fetch", "-q", "origin", cfg["default_branch"], check=False)
         if p.returncode != 0:
             add(("WARN", "cannot fetch origin/%s: Brain freshness unknown" % cfg["default_branch"]))
@@ -456,8 +460,6 @@ def doctor_checks(repo, cfg, fetch=True) -> list:
                         cfg["brain_dir"], "AGENTS.md", check=False).returncode != 0
             add(("WARN" if stale else "OK", "Brain vs origin/%s: %s" % (cfg["default_branch"],
                                                                          "differs, merge or rebase" if stale else "same")))
-    else:
-        add(("WARN", "no origin remote: Brain freshness not checked"))
     for tool, cmd in (("kiro-cli", ["kiro-cli", "--version"]), ("kirocrew", ["kirocrew", "--version"])):
         want = cfg["pins"].get(tool, "")
         have = _version_of(cmd)
