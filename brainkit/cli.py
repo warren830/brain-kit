@@ -46,9 +46,13 @@ KIT_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 TEMPLATES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "templates")
 CREW_AGENT_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "crew", "brain-dev.json")
 CREW_HOOK = ".kiro/brain/lean-hook.py"
-# The adapter version the team runner needs: 2 lets the run write its own runs/<KEY>/park.json in every Lean approval
-# state (kit/.kiro/brain/lean-hook.py, ADAPTER_VERSION).
-CREW_HOOK_VERSION = 2
+# The adapter version brain-kit needs (kit/.kiro/brain/lean-hook.py, ADAPTER_VERSION): 2 lets a run write its own
+# runs/<KEY>/park.json in every Lean approval state; 3 refuses every tool call while the kit's own files differ from
+# the reference commit, has the runner mode (the team runner runs the installed kit's copy) and escapes Lean's host
+# marker in forwarded text.
+CREW_HOOK_VERSION = 3
+KIT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUNNER_HOOK = os.path.join("kit", ".kiro", "brain", "lean-hook.py")     # in an installed brain-kit (/opt/brain-kit)
 VENDORED_LEAN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor", "aidlc-lean")
 
 
@@ -59,13 +63,75 @@ def crew_hook_version(text) -> int:
 
 
 def crew_hook_problem(text) -> str:
-    """Why this adapter source is too old for the team runner, or ''."""
+    """Why this adapter source is too old, or ''."""
     have = crew_hook_version(text)
     if have >= CREW_HOOK_VERSION:
         return ""
-    return ("%s is an older adapter (version %d, needs %d): the team runner could not write runs/<KEY>/park.json, its "
-            "only way to ask a person, before the Lean approvals; run `brain install` and commit it on main through an "
-            "MR" % (CREW_HOOK, have, CREW_HOOK_VERSION))
+    return ("%s is an older adapter (version %d, needs %d): it does not refuse tool calls after the kit's own files "
+            "(.kiro/, .brain/kit.json, gates/) were changed%s; run `brain install` and commit it on main through an MR"
+            % (CREW_HOOK, have, CREW_HOOK_VERSION, "" if have >= 2 else ", and the team runner could not write "
+               "runs/<KEY>/park.json, its only way to ask a person, before the Lean approvals"))
+
+
+def _runner_command_problem(command, ev, adapter) -> str:
+    """'' when `command` runs `adapter` in runner mode for event `ev`, else why not."""
+    import shlex
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return "cannot be read"
+    if not argv or not os.path.isabs(argv[0]):
+        return "does not name its Python by an absolute path"
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 1
+    flags, script, tail = argv[1:i], (argv[i] if i < len(argv) else ""), argv[i + 1:]
+    if "-I" not in flags:
+        return "does not run Python isolated (-I: no PYTHON* variables, no user site-packages)"
+    if not os.path.isabs(script) or os.path.realpath(script) != os.path.realpath(adapter):
+        return ("does not run the installed brain-kit's adapter %s (a workspace's copy is one the run can change)"
+                % adapter)
+    if len(tail) != 3 or tail[0] != "--runner" or not os.path.isabs(tail[1]) or tail[2] != ev:
+        return "is not `%s --runner <runnerd.json> %s`" % (adapter, ev)
+    return ""
+
+
+def runner_hook_problems(kit_dir=None, spec_path=None) -> list:
+    """What the team runner's sessions need from the installed brain-kit (`kit_dir`; default: the one this code is
+    part of): its hook adapter (kit/.kiro/brain/lean-hook.py) at version CREW_HOOK_VERSION or later; and, given the
+    user-level agent spec KiroCrew runs (brain-run.json), Lean's three hooks running that adapter in runner mode
+    (`<absolute python> -I <adapter> --runner <runnerd.json> <event>`, PreToolUse for every tool), never a
+    workspace's .kiro/brain/lean-hook.py, which the run could change. brain-runnerd checks it before each workspace."""
+    kit = os.path.realpath(os.path.expanduser(kit_dir or KIT_ROOT))
+    adapter = os.path.join(kit, RUNNER_HOOK)
+    try:
+        with open(adapter, encoding="utf-8", errors="replace") as f:
+            have = crew_hook_version(f.read())
+    except OSError:
+        return ["the installed brain-kit (%s) has no hook adapter %s: a runner session's hooks could not run Lean"
+                % (kit, adapter)]
+    probs = []
+    if have < CREW_HOOK_VERSION:
+        probs.append("the installed brain-kit's hook adapter %s is version %d, needs %d: update brain-kit on the runner"
+                     % (adapter, have, CREW_HOOK_VERSION))
+    if not spec_path:
+        return probs
+    spec_path = os.path.expanduser(spec_path)
+    try:
+        hooks = agent_hooks(load_json(spec_path))
+    except (OSError, ValueError) as e:
+        return probs + ["the runner's agent spec %s cannot be read: %s" % (spec_path, e)]
+    for trig, ev in CREW_EVENTS:
+        rows = [(c, m) for t, c, m in hooks if t == trig and _is_lean(ev, c)]
+        if not rows:
+            probs.append("%s has no %s hook running Lean's %s" % (spec_path, trig, ev))
+        for c, m in rows:
+            why = _runner_command_problem(c, ev, adapter)
+            if not why and trig == "preToolUse" and m not in (None, "", "*"):
+                why = "has matcher %r: tool calls it does not match pass Lean by" % m
+            if why:
+                probs.append("%s: the %s hook `%s` %s" % (spec_path, trig, c, why))
+    return probs
 
 
 def crew_agent_path():
@@ -318,7 +384,8 @@ def doctor_checks(repo, cfg, fetch=True) -> list:
             with open(hook, encoding="utf-8", errors="replace") as f:
                 why = crew_hook_problem(f.read())
             add(("FAIL", why) if why else
-                ("OK", "%s lets a run write its own %s/<KEY>/park.json whatever Lean's approvals (version %d)"
+                ("OK", "%s lets a run write its own %s/<KEY>/park.json whatever Lean's approvals, and refuses tool "
+                       "calls while the kit's own files differ from the commit (version %d)"
                  % (CREW_HOOK, cfg["runs_dir"], CREW_HOOK_VERSION)))
         else:
             add(("FAIL", "%s missing in this repo (run `brain install`): KiroCrew sessions, the team runner's too, run "
@@ -767,8 +834,9 @@ def _label_names(mr) -> list:
 
 
 def runner_kit_problems(repo) -> list:
-    """What the team runner's session needs in git (not just on this disk): Lean, and the hook adapter that
-    carries Lean's hooks in KiroCrew. Without the adapter every tool call of the runner's session is blocked."""
+    """What a run needs in git (not just on this disk): Lean, and the hook adapter that carries Lean's hooks in
+    KiroCrew at the version brain-kit needs. Teammates' local sessions run the committed adapter; the team runner runs
+    the installed brain-kit's own (runner_hook_problems), and runnerd still wants the project to have one."""
     probs = []
     for path, why in ((".kiro/aidlc-lean/aidlc_lean.py", "AI-DLC Lean"),
                       (CREW_HOOK, "the KiroCrew hook adapter (brain install wrote it)")):

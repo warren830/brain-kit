@@ -55,12 +55,15 @@ CREATE TABLE IF NOT EXISTS notices (
 # before it is sent, so a bridge that stops mid-send knows what it was sending. send_id: meta.sendId (the voucher id,
 # or N-<hash> for a notice); what: handover:<run> | answer:<D-n> | notice:<key>. state: sending (being sent now, by
 # this or another bridge process), interrupted (the bridge was stopped while it sent: it may or may not have
-# landed), sent, unknown (KiroCrew answered with an error: it may or may not have landed). A row is settled again by
-# reading the slot (a user message with that sendId landed); tries: how often it was sent.
+# landed), sent, unknown (KiroCrew answered with an error: it may or may not have landed), dropped (never sent again:
+# what it says no longer holds - the MR head moved on, the run ended - or KiroCrew did not take a hand-over for
+# send_give_up_minutes). A row is settled again by reading the slot (a user message with that sendId landed); tries:
+# how often it was sent; sha (added later, NULL in an older bridge's rows): the MR head the message is about.
 # notices: things the bridge tells once (an MR note, a counter of attempts), by key. state: telling (one bridge
 # process posts it now; taken over once stale), told, counting (only `count` matters).
 MR_DESC_ADDED_COLUMNS = ()
-OUTBOX_STATES = ("sending", "interrupted", "sent", "unknown")
+OUTBOX_ADDED_COLUMNS = (("sha", "TEXT"),)
+OUTBOX_STATES = ("sending", "interrupted", "sent", "unknown", "dropped")
 
 
 class _Rows:
@@ -127,6 +130,7 @@ class Ledger:
         self.sleep = time.sleep
         self.db.executescript(SCHEMA)
         self._add_columns("mr_desc_notes", MR_DESC_ADDED_COLUMNS)
+        self._add_columns("outbox", OUTBOX_ADDED_COLUMNS)
 
     def _add_columns(self, table, columns):
         """Columns a newer brain-kit added to `table`, added to a ledger file made before them ((name, type) pairs)."""
@@ -334,13 +338,13 @@ class Ledger:
     def outbox(self, send_id):
         return self.db.execute("SELECT * FROM outbox WHERE send_id=?", (send_id,)).fetchone()
 
-    def outbox_put(self, send_id, run_id, slot, what, message):
-        """Record a message about to be sent (state 'sending'). An earlier row with this send id is kept as it is
-        (the caller looks at its state). -> (the row, whether it is new)."""
+    def outbox_put(self, send_id, run_id, slot, what, message, sha=None):
+        """Record a message about to be sent (state 'sending'); `sha`: the MR head it is about. An earlier row with
+        this send id is kept as it is (the caller looks at its state). -> (the row, whether it is new)."""
         now = iso(utcnow())
         new = self.db.execute("INSERT OR IGNORE INTO outbox(send_id,run_id,slot,what,message,state,tries,created,"
-                              "updated) VALUES (?,?,?,?,?,?,?,?,?)",
-                              (send_id, run_id, slot, what, message, "sending", 0, now, now)).rowcount == 1
+                              "updated,sha) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                              (send_id, run_id, slot, what, message, "sending", 0, now, now, sha)).rowcount == 1
         return self.outbox(send_id), new
 
     def outbox_set(self, send_id, frm, to, tried=False, updated=None) -> bool:

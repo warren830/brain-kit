@@ -133,7 +133,8 @@ class PluggableSigning(unittest.TestCase):
         self.assertEqual((d["state"], d["answer"]), ("open", None))
         self.assertEqual(t.bridge.collect(), 1)
         self.assertEqual(sum("@bob 不在" in n["body"] for n in t.notes_db[5]), 1)
-        # the next question's answer is refused: the decision says so and nothing reaches the run
+        # the next question's answer is refused: the decision says so and no answer reaches the run; the run, which
+        # waits for it, is told that it is blocked (QA r4: it used to wait for ever)
         rec.refuse = lambda v: v["kind"] == "answer"
         t.park(question="第二个问题？")
         t.bridge.watch()
@@ -143,7 +144,9 @@ class PluggableSigning(unittest.TestCase):
         d2 = t.bridge.ledger.db.execute("SELECT * FROM decisions WHERE id='D-2'").fetchone()
         self.assertEqual(d2["state"], "refused")
         self.assertTrue(any(n["body"].startswith("D-2 的回答没有送回 run：签名服务不签") for n in t.notes_db[5]))
-        self.assertEqual(len(t.sends()), sends)
+        later = [s["message"] for s in t.sends()[sends:]]
+        self.assertEqual([m.split("：", 1)[0] for m in later], ["问题没发出"])
+        self.assertIn("签名服务不签", later[0])
 
     def test_a_spool_signer_instead_of_a_key(self):
         t = self.t

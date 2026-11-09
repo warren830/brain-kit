@@ -5,5 +5,8 @@
   "allowed_signers": "/opt/brain-kit/deploy/allowed_signers",
   "clone_url": "ssh://git@gitlab.example.internal/{project}.git",
   "intake_dir": "/home/brainbot/brain-intake",
-  "interval": 30
+  "interval": 30,
+  "kit_dir": "/opt/brain-kit",
+  "agent_spec": "/home/brainbot/.kiro/agents/brain-run.json",
+  "hook_path": "/usr/bin:/bin"
 }

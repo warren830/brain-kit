@@ -3,7 +3,7 @@
     "branch_prefix": "ai",
     "default_branch": "main",
     "bot_users": ["brain-bot"],
-    "bot_forbidden_paths": ["gates/", "project-agent.yaml", ".brain/", "CODEOWNERS", ".gitlab/CODEOWNERS", ".gitlab-ci.yml", "ci/"]
+    "bot_forbidden_paths": ["gates/", "project-agent.yaml", ".brain/", "CODEOWNERS", ".gitlab/", ".gitlab/CODEOWNERS", "docs/CODEOWNERS", ".gitlab-ci.yml", "ci/", ".kiro/brain/", ".kiro/agents/", ".kiro/hooks/", ".kiro/aidlc-lean/"]
   },
   "projects": {}
 }

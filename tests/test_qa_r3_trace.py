@@ -421,6 +421,10 @@ class Batch(unittest.TestCase):
         r2 = w.run("PAY-2", "export", 4, runner_events=[DESIGN], park=PARK)
         w.git("update-ref", "refs/remotes/origin/" + r2["branch"], r2["tip"])   # the runner pushed it
         L = w.ledger
+        # PAY-1's run, as the bridge records every run it hands over (with --ledger, only the bridge's records
+        # make a hand-over: H3 / H4, QA round 4)
+        L.add_run("RUN-PAY-1-1", "grp/pay", "PAY-1", 2, r1["tip"], vid("h1"), owner="alice")
+        L.set_run("RUN-PAY-1-1", "spooled", "merged")
         L.add_run("RUN-PAY-2-1", "grp/pay", "PAY-2", 6, r2["tip"], vid("h2"), owner="alice")
         L.set_run("RUN-PAY-2-1", "spooled", "dispatched")
         for key, slug, day, state in (("PAY-3", "fail", 5, "failed"), ("PAY-4", "lost", 6, "send_unknown"),
