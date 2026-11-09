@@ -194,5 +194,38 @@ class R1_56EmphasisedLabels(Base):
         self.assertIn("- Reported by **[人名-5]**", text)
 
 
+
+class R1_60CompanyWords(Base):
+    """--business mask took 银行卡 / 证券账户 for company names, and a heading plus the next paragraph ("Payment Methods" /
+    "Bank cards ...") for one Latin company name, which merged them into one line."""
+
+    def business(self, text):
+        return [(h.kind, h.value) for h in checks.scan(text) if h.cat == "business"]
+
+    def test_words_are_not_companies(self):
+        for text in ("用户绑定银行卡后才能申请退款，退款原路返回银行卡。", "客户的证券账户冻结时不能退款。", "填写银行账号和银行名称",
+                     "## Payment Methods\n\nBank cards and e-wallets are supported.",
+                     "Send a contract notification email after each refund.", "The contract no longer applies."):
+            self.assertEqual(self.business(text), [], text)
+
+    def test_companies_and_contracts_still_found(self):
+        self.assertIn(("company", "汇丰银行"), self.business("汇丰银行提供清算接口"))
+        self.assertIn(("company", "Example Bank Limited"), self.business("Counterparty: Example Bank Limited."))
+        self.assertIn(("contract", "HT-2026-001"), self.business("合同编号：HT-2026-001"))
+        self.assertIn(("contract", "C-12345"), self.business("Contract No. C-12345"))
+
+    def test_package_keeps_the_words_and_the_heading(self):
+        self.file("退款需求.md", "# 退款需求\n\n用户绑定银行卡后才能申请退款，退款原路返回银行卡。\n\n客户的证券账户冻结时不能退款。\n\n"
+                  "## Payment Methods\n\nBank cards and e-wallets are supported. Send a contract notification email after "
+                  "each refund.\n")
+        rep = self.build()
+        text = self.segments(rep)
+        self.assertNotIn("[公司-", text)
+        self.assertNotIn("[合同号-", text)
+        self.assertIn("## Payment Methods\n\nBank cards", text)
+        self.assertIn("| D01#S002 | 退款需求 / Payment Methods |", read(os.path.join(self.store, "packages", rep["package"],
+                                                                                 "toc.md")))
+
+
 if __name__ == "__main__":
     unittest.main()

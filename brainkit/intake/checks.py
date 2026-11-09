@@ -321,11 +321,18 @@ AMOUNT_RE = re.compile(r"(?<![A-Za-z0-9])(?:{cur}{sp}{num}(?:{sp}{scale})?(?:{sp
                        r"|{num}{sp}[百千]?[億亿萬万]{counted})(?![A-Za-z0-9])".format(
                            cur=CUR, sp=_SP, num=_NUM, scale=SCALE, word=MONEY_WORD, cjk=CJK_SCALE, code=CUR_CODE,
                            counted=_COUNTED))
+# A company name ends with its suffix. The suffixes are also the head of common words (银行卡, 银行账户, 证券账户, 证券代码,
+# 资产管理计划): followed by one of these characters it is such a word, not a name. A Latin name stays on one line
+# (a heading "Payment Methods" over "Bank cards ..." is no company).
+COMPANY_WORD_NEXT = "卡账帳户戶号號转轉流代码碼间間业業系端侧側网網柜櫃存利汇匯信名回渠接交市投类類级級费費产產品计計规規"
 COMPANY_RE = re.compile(r"[一-鿿A-Za-z0-9&·（）()]{2,30}?(?:股份有限公司|有限公司|有限責任公司|銀行|银行|集團|集团|證券|证券|"
-                        r"基金管理|資產管理|资产管理)"
-                        r"|\b[A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,5}\s+(?:Limited|Ltd\.?|Bank|Securities|"
-                        r"Inc\.?|LLC|Corp\.?|Corporation|Holdings|Group)\b")
-CONTRACT_RE = re.compile(r"(?:合同|合約|合约|協議|协议|Contract)\s*(?:編號|编号|號|号|No\.?)\s*[:：#]?\s*([A-Za-z0-9-]{4,})", re.I)
+                        r"基金管理|資產管理|资产管理)(?![%s])"
+                        r"|\b[A-Z][A-Za-z0-9&.\-]*(?:[ \t]+[A-Z][A-Za-z0-9&.\-]*){0,5}[ \t]+(?:Limited|Ltd\.?|Bank|"
+                        r"Securities|Inc\.?|LLC|Corp\.?|Corporation|Holdings|Group)\b" % COMPANY_WORD_NEXT)
+# 合同编号：HT-2026-001, Contract No. C-12345: "No" is a word of its own and the number has a digit (a contract
+# notification, the contract no longer applies)
+CONTRACT_RE = re.compile(r"(?:合同|合約|合约|協議|协议|Contract)\s*(?:編號|编号|號|号|No(?![A-Za-z])\.?)\s*[:：#]?\s*"
+                         r"((?=[A-Za-z-]*[0-9])[A-Za-z0-9-]{4,})", re.I)
 
 # ---------- links and instructions ----------
 
