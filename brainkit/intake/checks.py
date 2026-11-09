@@ -293,14 +293,24 @@ def _kv_secrets(text) -> list:
 
 # ---------- business-sensitive ----------
 
-CUR = r"(?:HKD|USD|CNY|RMB|HK\$|US\$|S\$|¥|￥|\$|€|£)"
-SCALE = r"(?:億|亿|萬|万|千|k|K|m|M|bn|million|billion)"          # only after a currency: 3M alone is a tenor
-MONEY_WORD = r"(?:元|港元|港幣|港币|美元|美金|人民幣|人民币|歐元|欧元|英鎊|英镑|日元)"
+# An amount carries a currency (a code, a sign or a name, before or after the number) or 元 / 萬 (README, gate 3):
+# HKD 50,000, EUR 300, 300 EUR, €300, 港幣 50,000, 人民币 5,000, 100萬港元, 5千元, 3,000 元, 500萬. A number with
+# 萬 / 亿 alone is an amount unless a word follows that says what is counted (500萬用户, 1亿 次请求).
 CUR_CODE = r"(?:HKD|USD|CNY|RMB|CNH|EUR|GBP|SGD|JPY|AUD)"
-AMOUNT_RE = re.compile(r"(?<![A-Za-z0-9])(?:%s\s?[0-9][0-9,]*(?:\.[0-9]+)?(?:\s?%s)?(?:\s?%s)?"
-                       r"|[0-9][0-9,]*(?:\.[0-9]+)?\s?(?:億|亿|萬|万)?\s?%s"
-                       r"|[0-9][0-9,]*(?:\.[0-9]+)?\s?%s?\s?%s)(?![A-Za-z0-9])"
-                       % (CUR, SCALE, MONEY_WORD, MONEY_WORD, SCALE, CUR_CODE))
+CUR_NAME = r"(?:港元|港幣|港币|美元|美金|人民幣|人民币|歐元|欧元|英鎊|英镑|日元)"
+CUR = r"(?:%s|HK\$|US\$|S\$|¥|￥|\$|€|£|%s)" % (CUR_CODE, CUR_NAME)     # before the number (元 alone only after it)
+MONEY_WORD = r"(?:元|%s)" % CUR_NAME                                       # after the number
+CJK_SCALE = r"(?:[百千]?[億亿萬万]|[百千])"
+SCALE = r"(?:%s|k|K|m|M|bn|million|billion)" % CJK_SCALE                    # only after a currency: 3M alone is a tenor
+_NUM = r"[0-9][0-9,]*(?:\.[0-9]+)?"
+_SP = r"[ \t\u00a0]?"
+_COUNTED = r"(?![ \t\u00a0]*(?!左右|以上|以内|以內|以下|起|封顶|封頂|上下)\w)"   # 500萬，/ 500萬左右, not 500萬用户
+AMOUNT_RE = re.compile(r"(?<![A-Za-z0-9])(?:{cur}{sp}{num}(?:{sp}{scale})?(?:{sp}{word})?"
+                       r"|{num}{sp}(?:{cjk}{sp})?{word}"
+                       r"|{num}{sp}(?:{scale}{sp})?{code}"
+                       r"|{num}{sp}[百千]?[億亿萬万]{counted})(?![A-Za-z0-9])".format(
+                           cur=CUR, sp=_SP, num=_NUM, scale=SCALE, word=MONEY_WORD, cjk=CJK_SCALE, code=CUR_CODE,
+                           counted=_COUNTED))
 COMPANY_RE = re.compile(r"[一-鿿A-Za-z0-9&·（）()]{2,30}?(?:股份有限公司|有限公司|有限責任公司|銀行|银行|集團|集团|證券|证券|"
                         r"基金管理|資產管理|资产管理)"
                         r"|\b[A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,5}\s+(?:Limited|Ltd\.?|Bank|Securities|"

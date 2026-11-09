@@ -109,5 +109,35 @@ class R1_70HongKongPhone(Base):
         self.assertIn("客服電話：[电话-1]", text)
 
 
+
+class R1_52AmountForms(Base):
+    """Gate 3 missed amounts with a currency code or name before the number, 千元 and 萬 alone."""
+
+    def amounts(self, text):
+        return [h.value for h in checks.scan(text) if h.kind == "amount"]
+
+    def test_forms(self):
+        for text, value in (("欧洲站：EUR 300 / 单", "EUR 300"), ("英国站：GBP 1,000 / 月", "GBP 1,000"),
+                            ("新加坡站：SGD 2,000 / 月", "SGD 2,000"), ("单笔上限 5千元", "5千元"),
+                            ("年度预算 500萬", "500萬"), ("最低認購金額：港幣 50,000", "港幣 50,000"),
+                            ("单笔上限：人民币 5,000", "人民币 5,000"), ("单笔上限：美元 1,000", "美元 1,000"),
+                            ("手续费：港币 100 元", "港币 100 元"), ("对照：300 EUR", "300 EUR"),
+                            ("HKD 5千万", "HKD 5千万"), ("预算 500万左右", "500万")):
+            self.assertEqual(self.amounts(text), [value], text)
+
+    def test_not_amounts(self):
+        for text in ("期限 3M、6M、12M", "票息 8%", "注册用户 500万用户", "支持 1000万 并发", "第 3 单元 5 个", "5千人"):
+            self.assertEqual(self.amounts(text), [], text)
+
+    def test_masked_in_the_package(self):
+        self.file("报价.md", "# 报价\n\n- 欧洲站：EUR 300 / 单\n- 英国站：GBP 1,000 / 月\n- 新加坡站：SGD 2,000 / 月\n"
+                  "- 国内：单笔上限 5千元，年度预算 500萬\n- 最低認購金額：港幣 50,000\n- 内地：人民币 5,000\n"
+                  "- 美国：美元 1,000\n")
+        text = self.segments(self.build())
+        for raw in ("300", "1,000", "2,000", "5千元", "500萬", "50,000", "5,000"):
+            self.assertNotIn(raw, text)
+        self.assertIn("- 欧洲站：[金额-1] / 单", text)
+
+
 if __name__ == "__main__":
     unittest.main()
