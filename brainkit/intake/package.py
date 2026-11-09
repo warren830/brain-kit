@@ -202,7 +202,7 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
           exclude=()) -> dict:
     """Run the gates and (unless dry_run) write the package. Returns a report dict.
 
-    In a dry run a failed gate (2, 3, 5) is listed under report["blocking"] instead of stopping, so the person
+    In a dry run a failed gate (1, 2, 3, 5) is listed under report["blocking"] instead of stopping, so the person
     sees every finding at once. `exclude`: glob patterns on the file names to leave out (e.g. a partner guide)."""
     blocking = []
 
@@ -212,10 +212,11 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
         blocking.append(msg)
 
     if not consent:
-        raise BrainError("门 1：确认你是作者，或已取得作者同意（--consent）")
+        block("门 1：确认你是作者，或已取得作者同意（--consent）")
     if classification not in CLASSES + ("unsure",):
-        raise BrainError("门 2：--classification 必须是 public / internal / confidential / secret / unsure")
-    given = "confidential" if classification == "unsure" else classification
+        block("门 2：--classification 必须是 public / internal / confidential / secret / unsure")
+    # (a dry run without a class goes on as public: the marks in the files still count)
+    given = "confidential" if classification == "unsure" else classification if classification in CLASSES else "public"
     files = [(p, n) for p, n in collect(paths)
              if not any(fnmatch.fnmatch(n, x) or fnmatch.fnmatch(os.path.basename(n), x) for x in exclude)]
     if not files:

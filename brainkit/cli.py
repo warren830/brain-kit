@@ -197,11 +197,13 @@ def _login_name() -> str:
     return name if USER_RE.match(name) else ""
 
 
-def _store(repo, override=None) -> str:
-    """Where material packages live on this machine (a clone of brain-intake when shared)."""
+def _store(repo, override=None, create=True) -> str:
+    """Where material packages live on this machine (a clone of brain-intake when shared). A dry run does not
+    create it (create=False)."""
     s = override or os.environ.get("BRAIN_INTAKE_DIR") or git(repo, "config", "brain.intake", check=False).stdout.strip()
     s = os.path.abspath(os.path.expanduser(s or "~/.brain/intake"))
-    os.makedirs(os.path.join(s, "packages"), exist_ok=True)
+    if create:
+        os.makedirs(os.path.join(s, "packages"), exist_ok=True)
     return s
 
 
@@ -691,10 +693,11 @@ def _release(repo, cfg, me, key):
 
 
 def _intake(repo, cfg, a, key, me):
-    rep = intake.build(a.doc, key, _store(repo, a.store), submitter=me, consent=a.consent,
+    dry = getattr(a, "dry_run", False)
+    rep = intake.build(a.doc, key, _store(repo, a.store, create=not dry), submitter=me, consent=a.consent,
                        classification=a.classification, business=a.business, kit_intake=cfg["intake"],
-                       dry_run=getattr(a, "dry_run", False), exclude=a.exclude or ())
-    rep["dry"] = getattr(a, "dry_run", False)
+                       dry_run=dry, exclude=a.exclude or ())
+    rep["dry"] = dry
     _print_report(rep)
     return rep
 

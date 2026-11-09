@@ -2,18 +2,22 @@
 
 Key-shaped and token-shaped values are built at runtime, so the source holds none (the commit hook scans for them).
 """
+import io
 import json
 import os
 import random
+import shutil
 import sys
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from brainkit import cli  # noqa: E402
 from brainkit.common import BrainError  # noqa: E402
 from brainkit.intake import checks, package  # noqa: E402
-from tests.helpers import tmpdir  # noqa: E402
+from tests.helpers import ROOT, git_repo, tmpdir  # noqa: E402
 
 KIT = {"allow_confidential": False, "bulk_pii_limit": 30, "segment_chars": 6000, "max_file_mb": 50, "max_total_mb": 200}
 
@@ -455,6 +459,76 @@ class R1_66NothingTakenIn(Base):
         self.file("req.md", "# 退款\n\n14 天内可退。\n")
         rep = self.build()
         self.assertEqual((rep["sources"], len(rep["refused"])), (1, 2))
+
+
+
+class CliBase(Base):
+    """`brain intake` in a project with only a kit.json (no Lean needed)."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = git_repo(os.path.join(self.d, "proj"))
+        os.makedirs(os.path.join(self.repo, ".brain"))
+        shutil.copyfile(os.path.join(ROOT, "templates", "kit.json"), os.path.join(self.repo, ".brain", "kit.json"))
+        for k, v in (("BRAIN_USER", "alice"), ("HOME", os.path.join(self.d, "home"))):
+            old = os.environ.get(k)
+            os.environ[k] = v
+            self.addCleanup(lambda k=k, old=old: os.environ.pop(k) if old is None else os.environ.__setitem__(k, old))
+        for k in ("BRAIN_INTAKE_DIR", "GITLAB_TOKEN"):
+            if k in os.environ:
+                self.addCleanup(os.environ.__setitem__, k, os.environ.pop(k))
+
+    def brain(self, *args, env=None):
+        out, err = io.StringIO(), io.StringIO()
+        cwd = os.getcwd()
+        os.chdir(self.repo)
+        os.environ.update(env or {})
+        try:
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = cli.main(list(args))
+        finally:
+            os.chdir(cwd)
+            for k in env or {}:
+                os.environ.pop(k, None)
+        return rc, out.getvalue() + err.getvalue()
+
+
+class R1_67DryRun(CliBase):
+    """--dry-run created the store folder; without --consent only gate 1 was reported, the other gates' problems not."""
+
+    def setUp(self):
+        super().setUp()
+        self.file("退款需求.md", "# 退款\n\n单笔上限 HKD 5,000。\n")
+        self.file("合作方指南.md", "# 合作方指南\n\nConfidential\n\n-----BEGIN RSA " + "PRIVATE KEY-----\nMIIBOgIBAAJBAK\n")
+
+    def test_dry_run_creates_no_store(self):
+        new_store = os.path.join(self.d, "newstore")
+        rc, out = self.brain("intake", self.src, "--key", "REQ-1", "--classification", "internal", "--consent",
+                             "--dry-run", "--store", new_store)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("（预览，未写入）", out)
+        env_store = os.path.join(self.d, "envstore")
+        rc, out = self.brain("intake", self.src, "--key", "REQ-1", "--classification", "internal", "--consent",
+                             "--dry-run", env={"BRAIN_INTAKE_DIR": env_store})
+        self.assertEqual(rc, 1, out)
+        self.assertFalse(os.path.exists(new_store))
+        self.assertFalse(os.path.exists(env_store))
+
+    def test_without_consent_every_gate_is_listed(self):
+        rc, out = self.brain("intake", self.src, "--key", "REQ-1", "--classification", "internal", "--dry-run",
+                             "--store", self.store)
+        self.assertEqual(rc, 1, out)
+        for gate in ("门 1", "门 5", "门 2", "门 3"):
+            self.assertIn("不能提交：" + gate, out)
+        rep = self.build(consent=False, classification=None, business=None, dry_run=True)
+        self.assertEqual([b[:3] for b in rep["blocking"]], ["门 1", "门 2", "门 5", "门 2", "门 3"])
+
+    def test_a_real_run_still_stops_at_gate_1(self):
+        rc, out = self.brain("intake", self.src, "--key", "REQ-1", "--classification", "internal", "--store",
+                             self.store)
+        self.assertEqual(rc, 2)
+        self.assertIn("门 1", out)
+        self.assertNotIn("门 5", out)
 
 
 if __name__ == "__main__":
