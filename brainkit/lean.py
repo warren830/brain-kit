@@ -1,18 +1,25 @@
 """Thin wrapper over AI-DLC Lean (installed in the project as .kiro/aidlc-lean/aidlc_lean.py).
 
-brain-kit does not change Lean; it only calls its CLI and reads aidlc-state.md.
+brain-kit does not change Lean; it only calls its CLI and reads aidlc-state.md. The one exception is `brain install`
+adding brain-kit's record folder to aidlc-docs/lean.json fingerprint_exclude (merge_fingerprint_exclude): additions
+only, never a removal, and the person who runs it reviews and commits the file (it is human-owned).
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
+import tempfile
 
 from .common import BrainError, run
 
 SCRIPT = os.path.join(".kiro", "aidlc-lean", "aidlc_lean.py")
 DOCS = "aidlc-docs"
+CONFIG = DOCS + "/lean.json"
 TEMPLATE_STATUS = "Status: Inception: starting"
+# Lean's DEFAULT_CONFIG fingerprint_exclude (aidlc_lean.py). A lean.json that sets the key replaces this list.
+DEFAULT_FINGERPRINT_EXCLUDE = (DOCS + "/**", ".kiro/**")
 
 
 def installed(repo) -> bool:
@@ -30,6 +37,53 @@ def install(repo, lean_src, extra=()):
     if not os.path.exists(script):
         raise BrainError("not an AI-DLC Lean checkout (no install.sh): %s" % lean_src)
     return run(["bash", script, repo] + list(extra))
+
+
+def fingerprint_exclude(cfg) -> list:
+    """The fingerprint_exclude Lean uses for this lean.json content: its own list when it sets one, else Lean's
+    default. BrainError when it is set but is not a list of strings (Lean would not read it the way it looks)."""
+    if "fingerprint_exclude" not in cfg:
+        return list(DEFAULT_FINGERPRINT_EXCLUDE)
+    pats = cfg["fingerprint_exclude"]
+    if not isinstance(pats, list) or not all(isinstance(p, str) for p in pats):
+        raise BrainError("%s fingerprint_exclude is not a list of patterns" % CONFIG)
+    return list(pats)
+
+
+def merge_fingerprint_exclude(repo, patterns) -> list:
+    """Add `patterns` (and Lean's own defaults, when lean.json's list leaves them out) to aidlc-docs/lean.json
+    fingerprint_exclude. Never removes or reorders an entry, and leaves the rest of the file as it is (key order
+    kept). Returns what was added ([] when nothing was missing). lean.json is human-owned: the caller tells the
+    person to review and commit it. BrainError when lean.json is missing or cannot be read as Lean reads it."""
+    path = os.path.join(repo, CONFIG)
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except OSError as e:
+        raise BrainError("%s cannot be read: %s" % (CONFIG, e))
+    except ValueError as e:
+        raise BrainError("%s is not valid JSON: %s" % (CONFIG, e))
+    if not isinstance(cfg, dict):
+        raise BrainError("%s is not a JSON object" % CONFIG)
+    have = fingerprint_exclude(cfg)
+    added = []
+    for p in list(DEFAULT_FINGERPRINT_EXCLUDE) + list(patterns):
+        if p not in have and p not in added:
+            added.append(p)
+    if not added:
+        return []
+    cfg["fingerprint_exclude"] = have + added
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")     # as Lean's `init` writes it
+        os.chmod(tmp, os.stat(path).st_mode & 0o777)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return added
 
 
 def new_intent(repo, slug, title) -> str:

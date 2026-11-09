@@ -7,7 +7,8 @@
                                                   check and mask requirement documents into a material package
   brain start <slug> [--key KEY] [--title T] [--doc PATH ...] [--package PKG] [--paths a,b]
                                                   claim (or check the claim), branch, Lean intent, run.json
-  brain handoff [--no-push] [--no-label]          publish materials, commit the hand-over, label the MR
+  brain handoff [--no-push] [--no-label]          publish materials, commit the hand-over (with runs/<KEY>/MR.md),
+                                                  set the MR description, label the MR
                                                   (exit 1: pushed but NOT labelled, nothing handed over)
   brain crew-agent [--force | --reset]            install the KiroCrew version of brain-dev (~/.kiro/agents/brain-dev.json)
                                                   KiroCrew does not read .kiro/hooks/: Lean's hooks ride on this spec;
@@ -35,11 +36,11 @@ import stat
 import sys
 import time
 
-from . import __version__, brainlint, claims, config, entries, lean, reflect, runrec, usage
+from . import __version__, brainlint, claims, config, entries, lean, mrdesc, reflect, runrec, usage
 from .common import (BrainError, JIRA_RE, SLUG_RE, USER_RE, branch_name, git, git_out, iso, load_json,
                      parse_branch, repo_root, run, utcnow, write_json)
 from .intake import package as intake
-from .rest import GitLab, Jira, jira_user_id, read_token
+from .rest import GitLab, HttpError, Jira, jira_user_id, read_token
 
 KIT_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kit")
 TEMPLATES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "templates")
@@ -194,6 +195,7 @@ def cmd_install(a):
             cfg["req_prefix"] = a.prefix
         write_json(kit_cfg, cfg)
         print("Wrote %s: check tracker/req_prefix, gitlab, bot_users and pins, then commit it." % config.KIT_CONFIG)
+    _exclude_run_records(repo, config.merged(config.DEFAULTS, load_json(kit_cfg)))
     bd = os.path.join(repo, load_json(kit_cfg).get("brain_dir", "brain"))
     os.makedirs(bd, exist_ok=True)
     for name in config.DEFAULTS["brain_files"]:
@@ -210,6 +212,26 @@ def cmd_install(a):
                 f.write(line + "\n")
     print("brain-kit %s installed in %s. Next: `brain doctor`." % (__version__, repo))
     return 0
+
+
+def _exclude_run_records(repo, cfg):
+    """Lean counts every file outside fingerprint_exclude as code: a park.json or MR.md the run writes after `lean
+    release` would make Lean refuse the RELEASE approval the bridge sends back. Add runs/** (and Lean's own defaults
+    when lean.json's list leaves them out) to aidlc-docs/lean.json; never remove an entry. The file is human-owned."""
+    if not lean.installed(repo):
+        return
+    want = mrdesc.runs_exclude(cfg)
+    try:
+        added = lean.merge_fingerprint_exclude(repo, [want])
+    except BrainError as e:
+        print("WARN: %s; fingerprint_exclude not changed. Add \"%s\" to it by hand, or Lean counts the run records "
+              "(park.json, MR.md) as code and refuses the RELEASE approval." % (e, want))
+        return
+    if added:
+        print("Added %s to %s fingerprint_exclude: Lean does not count the run records (park.json, MR.md) as code, so "
+              "writing them after `lean release` does not void the RELEASE approval. Nothing was removed. %s is "
+              "human-owned (the agent cannot edit it): review and commit it." % (
+                  ", ".join('"%s"' % p for p in added), lean.CONFIG, lean.CONFIG))
 
 
 # ---------- doctor ----------
@@ -247,6 +269,9 @@ def doctor_checks(repo, cfg, fetch=True) -> list:
         last = ((p.stdout + p.stderr).strip().splitlines() or ["(no output)"])[-1].strip(" -")
         # Lean is a guardrail, not the gate (CI and GitLab are): its findings warn, they do not block.
         add(("OK" if p.returncode == 0 else "WARN", "AI-DLC Lean doctor: %s" % ("ok" if p.returncode == 0 else last)))
+        why = mrdesc.write_problem(repo, cfg)
+        add(("FAIL", "%s fingerprint_exclude: %s。%s" % (lean.CONFIG, why, mrdesc.exclude_fix(cfg))) if why else
+            ("OK", "Lean does not count %s/ as code (%s fingerprint_exclude)" % (cfg["runs_dir"], lean.CONFIG)))
     else:
         add(("FAIL", "AI-DLC Lean not installed"))
     agent = os.path.join(repo, ".kiro", "agents", "brain-dev.md")
@@ -690,6 +715,44 @@ def runner_kit_problems(repo) -> list:
     return probs
 
 
+def handoff_description(repo, cfg, key):
+    """Write runs/<KEY>/MR.md from the records (mrdesc.build / render) and, when it changed, amend it into the
+    hand-over commit just made: the MR head stays the one hand-over commit the bridge takes (one parent, it changes
+    run.json). Returns the description, or None after a warning when it could not be written (the hand-over goes
+    on without it; the working tree is left clean)."""
+    from .commands.trace_cmd import default_vouchers
+    md = mrdesc.md_path(cfg, key)
+    try:
+        text = mrdesc.render(mrdesc.build(repo, cfg, key, vouchers_dir=default_vouchers(repo),
+                                          allowed_signers=os.environ.get("BRAIN_ALLOWED_SIGNERS") or None))
+        mrdesc.write(repo, cfg, key, text)
+        git(repo, "add", "--", md)
+        if git(repo, "diff", "--cached", "--quiet", "--", md, check=False).returncode != 0:
+            git(repo, "commit", "-q", "--amend", "--no-edit")
+    except Exception as e:  # noqa: BLE001  the description helps the reviewers; it does not hold up the hand-over
+        git(repo, "reset", "-q", "--", md, check=False)
+        if git(repo, "cat-file", "-e", "HEAD:%s" % md, check=False).returncode == 0:
+            git(repo, "checkout", "-q", "HEAD", "--", md, check=False)
+        elif os.path.lexists(os.path.join(repo, md)):
+            os.remove(os.path.join(repo, md))
+        print("WARN: %s not written (%s): the hand-over goes on without the MR description."
+              % (md, str(e).replace(repo, ".")))
+        return None
+    print("Wrote %s from the records into the hand-over commit (`brain mr-desc` regenerates it)." % md)
+    return text
+
+
+def _create_mr(gl, project, branch, target, title, desc):
+    """A new MR with the description; when GitLab refuses it with one, without (and a warning)."""
+    if desc is None:
+        return gl.create_mr(project, branch, target, title, [])
+    try:
+        return gl.create_mr(project, branch, target, title, [], description=desc)
+    except HttpError as e:
+        print("WARN: GitLab did not take the MR description (%s); opening the MR without it." % e)
+        return gl.create_mr(project, branch, target, title, [])
+
+
 def cmd_handoff(a):
     repo = repo_root()
     cfg = config.load(repo)
@@ -702,12 +765,17 @@ def cmd_handoff(a):
         raise BrainError("hand-over note not ready (%s/%s/aidlc-state.md): %s"
                          % (lean.DOCS, rec["intent"], "; ".join(probs)))
     rel = os.path.relpath(rp, repo)
-    dirty = _dirty(repo, ignore=(rel,))
+    md = mrdesc.md_path(cfg, rec["key"])
+    dirty = _dirty(repo, ignore=(rel, md))     # MR.md is generated again below
     if dirty:
         raise BrainError("commit your work first:\n  " + "\n  ".join(dirty))
     missing = runner_kit_problems(repo)
     if missing:
         raise BrainError("the team runner could not run this branch: " + "; ".join(missing))
+    why = mrdesc.write_problem(repo, cfg, rec["key"])
+    if why:
+        raise BrainError("not handed over: Lean would refuse this run's RELEASE approval later. %s。%s"
+                         % (why, mrdesc.exclude_fix(cfg)))
     if not a.no_push:
         for w in publish_materials(_store(repo, a.store), rec):
             print("WARN: " + w)
@@ -715,8 +783,10 @@ def cmd_handoff(a):
     write_json(rp, rec)
     git(repo, "add", "--", rel)
     git(repo, "commit", "-q", "-m", "%s: hand off to team runner" % rec["key"])
+    desc = handoff_description(repo, cfg, rec["key"])
     if a.no_push or not _has_origin(repo):
-        print("Committed the hand-over; not pushed. Push %s and add label '%s' to its MR." % (br, cfg["handoff_label"]))
+        print("Committed the hand-over; not pushed. Push %s and add label '%s' to its MR%s." % (
+            br, cfg["handoff_label"], " (its description is %s)" % md if desc is not None else ""))
         return 0
     git(repo, "push", "-q", "-u", "origin", br)
     if a.no_label:
@@ -730,7 +800,13 @@ def cmd_handoff(a):
     head = git_out(repo, "rev-parse", "HEAD")
     mr = gl.mr_for_branch(proj, br)
     if not mr:
-        mr = gl.create_mr(proj, br, cfg["default_branch"], "%s %s" % (rec["key"], b["slug"].replace("-", " ")), [])
+        mr = _create_mr(gl, proj, br, cfg["default_branch"], "%s %s" % (rec["key"], b["slug"].replace("-", " ")), desc)
+    elif desc is not None:
+        try:
+            gl.edit_mr(proj, mr["iid"], description=desc)
+        except BrainError as e:
+            print("WARN: the description of MR !%s was not set (%s); it is in %s on the branch. The hand-over goes on."
+                  % (mr["iid"], e, md))
     # The bridge only takes a hand-over whose label is newer than the push GitLab recorded, and whose MR head is
     # this hand-over commit. GitLab records the MR version a moment after the push: wait for it, then look at the
     # MR head once more right before labelling.

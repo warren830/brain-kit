@@ -172,6 +172,24 @@ class GitLab(Rest):
             body["description"] = description
         return self.call("POST", "/projects/%s/merge_requests" % q(project), body=body)
 
+    def edit_mr(self, project, iid, description=None, title=None):
+        """Set an MR's description and/or title (PUT /projects/:id/merge_requests/:iid). Needs a token that may
+        edit the MR (its author, a Developer or more): the bridge's Reporter account may not."""
+        body = {}
+        if description is not None:
+            body["description"] = description
+        if title is not None:
+            body["title"] = title
+        if not body:
+            raise BrainError("edit_mr: nothing to change")
+        return self.call("PUT", "/projects/%s/merge_requests/%d" % (q(project), int(iid)), body=body)
+
+    def edit_note(self, project, iid, note_id, text):
+        """Replace the text of a note on an MR (PUT .../merge_requests/:iid/notes/:note_id). GitLab lets an account
+        edit its own notes (a Reporter too); HttpError 404 when the note is gone."""
+        return self.call("PUT", "/projects/%s/merge_requests/%d/notes/%d" % (q(project), int(iid), int(note_id)),
+                         body={"body": text})
+
     def edit_labels(self, project, iid, add=(), remove=()):
         body = {}
         if add:

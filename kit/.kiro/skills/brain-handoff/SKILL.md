@@ -18,9 +18,10 @@ must stand on its own.
    diff (what changed, AC → test → verify result, decisions, assumptions, approvals, how to review). It is generated
    from the records, never hand-written: when it reads wrong, fix the record (requirements.md, the plan's Tests
    table, decisions.md, the Session notes) and run it again. If it refuses because `runs/` counts as code in
-   `aidlc-docs/lean.json`, tell the person; only they can change that file.
+   `aidlc-docs/lean.json`, tell the person; only they can change that file (`brain handoff` refuses until then).
 5. Commit the work with MR.md (Lean's commit gate may ask for `lean verify` first).
-6. Tell the person to run `brain handoff`. Do not push or label the MR yourself.
+6. Tell the person to run `brain handoff`: it writes MR.md again into its hand-over commit and makes it the MR
+   description. Do not push or label the MR yourself.
 
 After the hand-over, stop editing this branch locally unless the runner hands it back (label removed and a comment
 on the MR). Two writers on one branch cause lost work.

@@ -67,21 +67,26 @@ Write `runs/<KEY>/park.json` and nothing else for the question:
 ## 6. Done
 When checks pass and review is done: make sure every rejected or corrected decision has a proposal (reflect
 warns about rejections nobody wrote down), then run `lean release`, fill in its Open items, run `lean request RELEASE`.
-Then write the MR description: `brain mr-desc --write` writes `runs/<KEY>/MR.md` from the records (what changed, AC
-evidence, decisions, assumptions, approvals, how to review). It is generated, never written or edited by you: if it
-reads wrong, fix the record it came from (requirements.md, the plan's Tests table, decisions.md, release.md) and run
-it again. Commit MR.md with the work. If `brain mr-desc --write` refuses because `runs/` counts as code in
-`aidlc-docs/lean.json`, do not work around it: say so in the acceptance question and go on without MR.md. Then park
-for acceptance: `"kind": "acceptance", "options": [], "lean_request": "RELEASE <hash>"`, with the AC ids the acceptor
-should look at and the line `变更说明见 runs/<KEY>/MR.md` in the question, and `review_items`: every decision you took yourself (decisions.md rows with
+Then park for acceptance: `"kind": "acceptance", "options": [], "lean_request": "RELEASE <hash>"`, with the AC ids the
+acceptor should look at and the line `变更说明见 runs/<KEY>/MR.md` in the question, and `review_items`: every decision you took yourself (decisions.md rows with
 `Who` = `agent`) and every assumption `A-n` from requirements.md, each with its id and one line (at most 200
 characters, no line breaks):
 ```json
 "review_items": [{"id": "D-7", "text": "退款按自然日计（需求没写；最常见的做法）"},
                  {"id": "A-3", "text": "旧订单没有退款单号时不显示退款按钮"}]
 ```
-Session notes `Status: ready for acceptance`; push; end the turn. The product's answer comes back through the
-bridge as Lean's approval line:
+Set Session notes `Status: ready for acceptance` and commit them with park.json. Then write the MR description:
+`brain mr-desc --write` writes `runs/<KEY>/MR.md` from the committed records (what changed, AC evidence, decisions,
+assumptions, approvals, the question it waits on, how to review), so run it after that commit and commit MR.md
+right after it (MR.md leaves itself out of what it describes: committing it does not make it stale). It is
+generated, never written or edited by you: if it reads wrong, fix the record it came from (requirements.md, the
+plan's Tests table, decisions.md, release.md), commit, and run it again. Push both commits; end the turn.
+The bridge posts MR.md as a separate 「变更说明」 comment before your acceptance question and edits that comment when
+MR.md changes at a later push: whenever you commit more work or records, run `brain mr-desc --write` again and commit
+MR.md before you push. Never copy MR.md into park.json's question: the line above is enough. If `brain mr-desc
+--write` refuses because `runs/` counts as code in `aidlc-docs/lean.json`, do not work around it: say so in the
+acceptance question and go on without MR.md (the bridge then says on the MR that there is none).
+The product's answer comes back through the bridge as Lean's approval line:
 - `answer D-n approve`: everything, review items included, is accepted.
 - `answer D-n reject A-3,D-7 <note>`: the listed items are rejected, the rest stand. Treat each as a correction:
   change the work, add a decisions.md line citing the decision id, the voucher id and the item id, and write a

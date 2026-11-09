@@ -55,5 +55,6 @@ When the person says to hand over, or you must wait more than a working day:
    by you: if something reads wrong or is missing, fix the record it comes from (requirements.md, the plan's Tests
    table, decisions.md) and run it again. If it refuses because `runs/` counts as code in `aidlc-docs/lean.json`,
    tell the person (only they can change that file) and go on without it.
-3. Commit your work with MR.md. Then the person runs `brain handoff` (it checks the note, pushes, labels the MR).
+3. Commit your work with MR.md. Then the person runs `brain handoff` (it checks the note, writes MR.md again into the
+   hand-over commit, pushes, sets the MR description, labels the MR).
 The team runner re-verifies everything you claimed (tests, reviews), so write facts with evidence.

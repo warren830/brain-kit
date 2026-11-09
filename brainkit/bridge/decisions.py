@@ -27,6 +27,11 @@ What counts is one pure function, check_answer(), which an outside signer can im
                  different answers from different people in one round are not delivered (conflict)
   audit trail    a signed answer voucher in brain-intake, and a reply comment on the MR
 Run-written text is posted inside a code block: GitLab quick actions and @mentions in it do nothing.
+
+Before an acceptance question (kind acceptance, or lean_request RELEASE) the bridge posts runs/<KEY>/MR.md at the MR
+head (`brain mr-desc`'s 变更说明) as a separate comment, made inert (mrdesc.inert), and edits that comment of its own
+when MR.md changes at a later push (ledger mr_desc_notes). It is never part of the question note (check_answer
+compares that one word for word), and nothing about it holds up the questions and answers.
 """
 from __future__ import annotations
 
@@ -40,7 +45,7 @@ from datetime import timedelta
 from .. import sign
 from ..common import SHA_RE, BrainError, iso, plain, utcnow, write_json
 from ..intake import checks
-from ..rest import gl_time, head_pushed_at
+from ..rest import HttpError, gl_time, head_pushed_at
 
 KINDS = ("clarify", "design", "plan", "acceptance", "action", "other")
 LEAN_KINDS = ("REQUIREMENTS", "DESIGN", "PLAN", "RELEASE")   # INCEPTION: ask REQUIREMENTS and DESIGN separately
@@ -96,6 +101,35 @@ ASKING_STALE_S = 300
 ADDED_COLUMNS = ("qnote_id", "told_id", "sign_told")
 # fields of a voucher that change from one attempt to the next; the rest says what is signed
 VOUCHER_TIME_FIELDS = ("issued_at", "expires_at", "voucher_id")
+
+
+# the bridge's 「变更说明」 comment: its first line (no question, answer or conflict note reads like it) and how much of
+# a run's MR.md it carries (render() keeps one to about 120 lines; a bigger one is a bot's, and is cut)
+DESC_TITLE = "**变更说明**"
+DESC_MAX_CHARS = 60000
+
+
+def description_note(key, runs_dir, sha, raw) -> str:
+    """The bridge's 「变更说明」 comment for runs/<KEY>/MR.md at commit `sha`. `raw`: the file's bytes, None when the
+    run did not write it (then one line says so). The file comes from a bot's commit: it is made inert
+    (mrdesc.inert: no mention, quick action, HTML, image or approval-like line acts) and cut to DESC_MAX_CHARS."""
+    from .. import mrdesc
+    path = "%s/%s/%s" % (runs_dir, key, mrdesc.MR_FILE)
+    if raw is None:
+        return ("%s：run 没有写 `%s`（提交 %s）。验收前请直接看 MR 的改动和 `%s/%s/` 下的记录。"
+                % (DESC_TITLE, path, sha[:12], runs_dir, key))
+    text = raw.decode("utf-8", "replace").replace("\r\n", "\n").strip("\n")
+    cut = ""
+    if len(text) > DESC_MAX_CHARS:
+        text, cut = text[:DESC_MAX_CHARS], "\n\n（MR.md 太长，这里只贴了前 %d 个字符，全文见文件。）" % DESC_MAX_CHARS
+    return ("%s（`%s`，提交 %s：run 从记录生成，桥原样转贴；文件变了，这条评论跟着改）\n\n%s%s"
+            % (DESC_TITLE, path, sha[:12], mrdesc.inert(text), cut))
+
+
+def is_acceptance(park) -> bool:
+    """An acceptance question: park kind acceptance, or a RELEASE approval (whatever kind park.json names)."""
+    return isinstance(park, dict) and (park.get("kind") == "acceptance" or
+                                       str(park.get("lean_request") or "").startswith("RELEASE "))
 
 
 def validate_park(park) -> list:
@@ -576,12 +610,15 @@ class DecisionLoop:
     # ---------- questions ----------
 
     def watch(self):
-        """Post new park.json questions from dispatched runs."""
+        """Post new park.json questions from dispatched runs (an acceptance question with the run's 变更说明 before
+        it), and keep the 变更说明 comments current."""
         db = self._ddb()
         posted = 0
         for row in self.ledger.runs_in("dispatched"):
             mr = self.gl.mr(row["project"], row["iid"])
             head = mr.get("sha", "")
+            if head:
+                self.sync_description(row, head)       # an MR.md changed at this push: its comment follows
             if head == row["last_sha"]:
                 continue
             kit = self.kit(row["project"])
@@ -652,6 +689,8 @@ class DecisionLoop:
                     did, row["run_id"], "\n".join("- " + x for x in probs)))
                 seen()
                 continue
+            if kind == "acceptance" or is_acceptance(park):
+                self.sync_description(row, head, kit=kit, post=True)     # its own comment, before the question
             try:
                 note = self.gl.comment(row["project"], row["iid"], question_text(did, row["run_id"], park, who,
                                                                                  kind, head, ph))
@@ -673,6 +712,66 @@ class DecisionLoop:
             posted += 1
             self.out("asked %s for %s (%s)" % (did, row["run_id"], ", ".join(who)))
         return posted
+
+    # ---------- the 变更说明 comment (runs/<KEY>/MR.md) ----------
+
+    def sync_description(self, row, head, kit=None, post=False):
+        """Bring the bridge's 变更说明 comment on the run's MR up to runs/<KEY>/MR.md at `head`: post it (post=True,
+        or wanted before and not on the MR yet), edit it when MR.md changed, or just note the head when it did not.
+        -> "posted" | "edited" | "current" | None (nothing to do, another bridge is posting it, or it failed). Never
+        raises: a failure is logged and tried again next round; the questions and answers go on without it."""
+        try:
+            led, project, iid = self.ledger, row["project"], int(row["iid"])
+            d = led.mr_desc_note(project, iid)
+            if d is None:
+                if not post:
+                    return None                       # no acceptance question asked on this MR yet
+                led.want_mr_desc_note(project, iid, row["run_id"])
+                d = led.mr_desc_note(project, iid)
+            if d["state"] == "posted" and d["sha"] == head:
+                return "current"
+            return self._sync_description(row, head, kit if kit is not None else self.kit(project), d)
+        except Exception as e:  # noqa: BLE001  the description helps people read the MR; it never holds a decision up
+            self.out("%s: 变更说明 not posted or updated this round: %s" % (row["run_id"], e))
+            return None
+
+    def _sync_description(self, row, head, kit, d):
+        from .. import mrdesc
+        led, project, iid = self.ledger, row["project"], int(row["iid"])
+        raw = self.gl.file_raw(project, mrdesc.md_path(kit, row["req"]), head)
+        h = hashlib.sha256(raw).hexdigest() if raw is not None else "missing"
+        text = description_note(row["req"], kit["runs_dir"], head, raw)
+        if d["state"] == "posted":
+            if d["md_hash"] == h:
+                led.mr_desc_checked(project, iid, d["note_id"], h, head)
+                return "current"
+            nid = int(d["note_id"] or 0)
+            if nid > 0:
+                try:
+                    self.gl.edit_note(project, iid, nid, text)
+                except HttpError as e:
+                    if e.status != 404:
+                        raise
+                    self.out("%s: the 变更说明 comment %d is gone; posting it again" % (row["run_id"], nid))
+                else:
+                    led.mr_desc_checked(project, iid, d["note_id"], h, head)
+                    self.out("%s: 变更说明 updated (%s @ %s)" % (row["run_id"], h[:12], head[:12]))
+                    return "edited"
+            led.mr_desc_gone(project, iid, d["note_id"])
+        if not led.claim_mr_desc_post(project, iid, stale_after=ASKING_STALE_S):
+            return None                                   # another bridge process is posting it now
+        try:
+            note = self.gl.comment(project, iid, text)
+        except BaseException:
+            led.release_mr_desc_post(project, iid)
+            raise
+        try:
+            nid = int((note or {}).get("id") or 0)
+        except (TypeError, ValueError):
+            nid = 0
+        led.set_mr_desc_note(project, iid, nid if nid > 0 else None, h, head)
+        self.out("%s: 变更说明 posted (%s @ %s)" % (row["run_id"], h[:12], head[:12]))
+        return "posted"
 
     # ---------- answers ----------
 

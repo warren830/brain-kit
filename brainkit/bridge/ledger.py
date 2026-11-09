@@ -33,9 +33,19 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE INDEX IF NOT EXISTS runs_req ON runs(req);
 CREATE TABLE IF NOT EXISTS pending_vouchers (
   ref TEXT PRIMARY KEY, voucher TEXT NOT NULL, created TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mr_desc_notes (
+  project TEXT NOT NULL, iid INTEGER NOT NULL, run_id TEXT, note_id INTEGER, md_hash TEXT, sha TEXT,
+  state TEXT NOT NULL, created TEXT NOT NULL, updated TEXT NOT NULL,
+  PRIMARY KEY (project, iid));
 """
 # pending_vouchers: the voucher last sent to a signer that did not answer in time, by what it is for (a hand-over
 # check, a decision). The next round asks for that same voucher, so a late signature is used, not left over.
+# mr_desc_notes: the bridge's own 「变更说明」 comment on an MR (runs/<KEY>/MR.md, posted before an acceptance
+# question and edited when MR.md changes). note_id: the comment; md_hash: sha256 of the MR.md it shows ("missing":
+# the run wrote none); sha: the MR head it was last checked at. state: wanted (to be posted), posting (one bridge
+# process posts it now; taken over once stale), posted. A ledger from before this table gets it when it is opened
+# (CREATE TABLE IF NOT EXISTS); columns added later go in MR_DESC_ADDED_COLUMNS.
+MR_DESC_ADDED_COLUMNS = ()
 
 
 class _Rows:
@@ -101,6 +111,20 @@ class Ledger:
         self.lock = self.db.lock
         self.sleep = time.sleep
         self.db.executescript(SCHEMA)
+        self._add_columns("mr_desc_notes", MR_DESC_ADDED_COLUMNS)
+
+    def _add_columns(self, table, columns):
+        """Columns a newer brain-kit added to `table`, added to a ledger file made before them ((name, type) pairs)."""
+        if not columns:
+            return
+        with self.lock:
+            have = {r[1] for r in self.db.execute("PRAGMA table_info(%s)" % table)}
+            for name, kind in columns:
+                if name not in have:
+                    try:
+                        self.db.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, name, kind))
+                    except sqlite3.OperationalError:      # another process added it meanwhile
+                        pass
 
     def close(self):
         self.db.close()
@@ -248,6 +272,48 @@ class Ledger:
 
     def drop_pending_voucher(self, ref):
         self.db.execute("DELETE FROM pending_vouchers WHERE ref=?", (ref,))
+
+    # the bridge's 「变更说明」 comment on an MR (see mr_desc_notes above); every change is compare-and-set
+    def mr_desc_note(self, project, iid):
+        """The MR's description comment row, or None when none is wanted yet."""
+        return self.db.execute("SELECT * FROM mr_desc_notes WHERE project=? AND iid=?", (project, int(iid))).fetchone()
+
+    def want_mr_desc_note(self, project, iid, run_id) -> bool:
+        """Record that the MR gets a description comment (state 'wanted'). False when it has a row already."""
+        now = iso(utcnow())
+        return self.db.execute("INSERT OR IGNORE INTO mr_desc_notes(project,iid,run_id,state,created,updated) "
+                               "VALUES (?,?,?,?,?,?)", (project, int(iid), run_id, "wanted", now, now)).rowcount == 1
+
+    def claim_mr_desc_post(self, project, iid, stale_after=300) -> bool:
+        """Claim posting the comment (wanted -> posting): one bridge process posts it. A claim older than
+        `stale_after` seconds was left by a bridge that stopped while posting: taken over."""
+        now = utcnow()
+        return self.db.execute("UPDATE mr_desc_notes SET state='posting', updated=? WHERE project=? AND iid=? AND "
+                               "(state='wanted' OR (state='posting' AND updated<?))",
+                               (iso(now), project, int(iid), iso(now - timedelta(seconds=stale_after)))).rowcount == 1
+
+    def release_mr_desc_post(self, project, iid):
+        """The post failed: wanted again (posted next round)."""
+        self.db.execute("UPDATE mr_desc_notes SET state='wanted', updated=? WHERE project=? AND iid=? AND "
+                        "state='posting'", (iso(utcnow()), project, int(iid)))
+
+    def set_mr_desc_note(self, project, iid, note_id, md_hash, sha) -> bool:
+        """Posted (posting -> posted): the comment's id (None: GitLab did not say), what it shows, at which head."""
+        return self.db.execute("UPDATE mr_desc_notes SET state='posted', note_id=?, md_hash=?, sha=?, updated=? "
+                               "WHERE project=? AND iid=? AND state='posting'",
+                               (note_id, md_hash, sha, iso(utcnow()), project, int(iid))).rowcount == 1
+
+    def mr_desc_checked(self, project, iid, note_id, md_hash, sha) -> bool:
+        """The posted comment now shows `md_hash` (edited, or the same MR.md at a newer head `sha`)."""
+        return self.db.execute("UPDATE mr_desc_notes SET md_hash=?, sha=?, updated=? WHERE project=? AND iid=? AND "
+                               "state='posted' AND note_id IS ?",
+                               (md_hash, sha, iso(utcnow()), project, int(iid), note_id)).rowcount == 1
+
+    def mr_desc_gone(self, project, iid, note_id) -> bool:
+        """The posted comment cannot be edited (deleted, or GitLab gave no id): wanted again, as a new comment."""
+        return self.db.execute("UPDATE mr_desc_notes SET state='wanted', note_id=NULL, updated=? WHERE project=? AND "
+                               "iid=? AND state='posted' AND note_id IS ?",
+                               (iso(utcnow()), project, int(iid), note_id)).rowcount == 1
 
     def set_run(self, run_id, frm, to, **fields) -> bool:
         sets = ", ".join(["state=?", "updated=?"] + ["%s=?" % k for k in fields])

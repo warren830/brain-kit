@@ -1,6 +1,6 @@
 # MR 变更说明（`brain mr-desc`）
 
-2026-11-09 · 代码：`brainkit/mrdesc.py`、`brainkit/commands/mrdesc_cmd.py` · 测试：`tests/test_mrdesc.py`
+2026-11-09 · 代码：`brainkit/mrdesc.py`、`brainkit/commands/mrdesc_cmd.py`；接进流程：`brainkit/cli.py`（install、doctor、handoff）、`brainkit/bridge/decisions.py`（watch） · 测试：`tests/test_mrdesc.py`、`tests/test_mrdesc_flow.py`
 
 每个 MR 都要写明白改了什么、有什么效果，产品、Builder、别的组不读整个 diff 也能看懂。这份说明由 `brain mr-desc` 从 run 的记录生成，agent 不手写。
 
@@ -33,7 +33,7 @@ brain mr-desc KEY --json       # 结构化数据（给 KiroCrew app 用）
 规则：
 - 每句都来自记录。记录没有就说没有，不猜。
 - 人只出现 GitLab 用户名和记录里已有的化名。邮箱换成化名，家目录换成 `~`（`trace.scrub`）。decisions.md 里认不出的 Who 不显示（可能是真名），只写"没按约定写"。
-- 记录里的文字压成一行，`@`、`<`、图片都失效：不会 @ 人，不会用 HTML 注释藏内容，不会触发 GitLab 快捷命令。
+- 记录里的文字压成一行，`@`、`<`、图片都失效：不会 @ 人，不会用 HTML 注释藏内容，不会触发 GitLab 快捷命令；像审批或回答的行（`approve …`、`answer D-n …`）前面加 `> `，Lean 和桥都不会当真。
 - 不超过约 120 行，长表折叠成"另有 N 条，见 …"。
 - MR.md 不算在它自己描述的改动里，所以写入、提交、再生成，内容不变。
 
@@ -41,17 +41,21 @@ brain mr-desc KEY --json       # 结构化数据（给 KiroCrew app 用）
 
 Lean 把 `fingerprint_exclude`（默认只有 `aidlc-docs/**`、`.kiro/**`）以外的文件都当代码。`runs/<KEY>/MR.md` 和 `park.json` 默认都算。verify 之后写它们，Lean 就认为代码改了：提交被拦，`lean release` 要重来。
 
-已实测：默认配置下，`lean release` 之后写 park.json，桥送回的 `approve RELEASE` 会被 Lean 拒掉（APPROVAL_REFUSED，check `release`）。也就是说，现在的验收流程本身就过不去，跟 MR.md 无关。`aidlc-docs/lean.json` 加上下面这行以后就能记下：
+已实测（`tests/test_mrdesc_flow.py` 的 `ReleaseApprovalAfterPark`，真的 Lean）：默认配置下，`lean release` 之后写 park.json，桥送回的 `approve RELEASE` 会被 Lean 拒掉（APPROVAL_REFUSED，check `release`）；加上 `runs/**` 以后同样的流程能记下（APPROVED）。所以 `aidlc-docs/lean.json` 要有：
 
 ```json
 "fingerprint_exclude": ["aidlc-docs/**", ".kiro/**", "runs/**"]
 ```
 
-这个文件只有人能改。没加的时候，`brain mr-desc --write` 拒绝写（退出码 1，说明原因），只打印照常。
+- `brain install` 会自动并进去：缺什么加什么（`runs/**`；自定义的列表漏了 Lean 的默认项也补上），不删、不改顺序，其它字段原样。它会说加了什么，并提醒：这个文件归人管（AI 改不了），看过再提交。
+- `brain doctor`：没排除 `runs/` 时报 FAIL，并给出修法。
+- `brain handoff`：没排除时不交接（退出码 2），说明原因和修法。
+- `brain mr-desc --write`：没排除时拒绝写（退出码 1），只打印照常。
+- 改了 `fingerprint_exclude` 以后 Lean 的代码指纹会变，之前的 `lean verify` 要重跑。
 
-## 还要接的（给 lead）
+## 接进流程的地方（已接好）
 
-1. **`brain install` / `brain doctor`**（cli.py）：install 时把 `runs/**` 并进 lean.json 的 `fingerprint_exclude`；doctor 在 `mrdesc.write_problem(repo, cfg)` 不为空时报 FAIL。
-2. **`brain handoff`**（cli.py `cmd_handoff`）：写好 run.json 的 `handoff` 并提交以后，跑 `mrdesc.write(repo, cfg, key, mrdesc.render(mrdesc.build(repo, cfg, key)))`。内容变了就 `git add` 再 `git commit --amend --no-edit`，还在推送之前。这样交接提交仍然只有一个，就是改了 run.json 的那个，桥的核对照常通过。生成前先检查 `write_problem`。推送以后，用主人的 token 设 MR 描述：新 MR 走 `create_mr(..., description=text)`；已有的 MR 要在 `rest.GitLab` 里加 `edit_mr(project, iid, description=...)`（`PUT /projects/:id/merge_requests/:iid`）。
-3. **桥**（bridge/decisions.py `watch`）：桥的账号是 Reporter，改不了描述，所以发评论。验收问题（`lean_request RELEASE …`）贴出之前，用 `gl.file_raw(project, "runs/<KEY>/MR.md", head)` 读出来，先过 `mrdesc.inert()`（MR.md 是机器人提交的，内容不可信），再单独发一条评论，开头写"变更说明（runs/<KEY>/MR.md @ <sha12>）"。不要塞进问题评论：问题评论的文字是绑定的，`check_answer` 会逐字比对。以后每次新推送，MR.md 的哈希变了，就改桥自己那条评论。Reporter 能改自己的评论；要在 rest.py 加 `edit_note`，在 ledger 记下评论 id 和哈希。读不到 MR.md 时，在评论里说一句，问题照发。
+1. **`brain install` / `brain doctor`**：见上一节（`lean.merge_fingerprint_exclude`、`mrdesc.write_problem`）。
+2. **`brain handoff`**：提交交接（写 run.json 的 `handoff`）以后、推送以前，用 `mrdesc.build` / `render` 生成 `runs/<KEY>/MR.md`；内容变了就 `git commit --amend` 进同一个交接提交。交接提交仍然只有一个父提交、仍然改了 run.json，桥的核对照常通过。推送以后用主人的 token 设 MR 描述：新 MR 走 `create_mr(..., description=...)`（GitLab 不收这段描述就不带描述开 MR），已有的 MR 走 `rest.GitLab.edit_mr`（`PUT /projects/:id/merge_requests/:iid`）。生成失败或设不上描述只警告，交接照常。
+3. **桥**（`bridge/decisions.py` 的 `watch`）：桥的账号是 Reporter，改不了描述，所以发评论。验收问题（park.json 的 `kind` 是 `acceptance`，或 `lean_request` 是 `RELEASE …`）贴出之前，用 `gl.file_raw` 读 MR 最新提交上的 `runs/<KEY>/MR.md`，过 `mrdesc.inert()`（MR.md 是机器人提交的：@ 提及、HTML、图片、GitLab 快捷命令、像审批或回答的行，比如 `approve RELEASE …`、`answer D-3 approve`，都失效），单独发一条评论，第一行是"**变更说明**（`runs/<KEY>/MR.md`，提交 <sha12>：…）"。它不进问题评论：问题评论的文字是绑定的，`check_answer` 逐字比对。以后每次推送，MR.md 的哈希变了，桥就改自己那条评论（`rest.GitLab.edit_note`；评论被删了就重发一条）。评论 id 和哈希记在桥的 ledger 表 `mr_desc_notes` 里（旧的 ledger 打开时自动建表）。读不到 MR.md 时发一行"run 没有写 runs/<KEY>/MR.md"，以后写了就把这行改成内容。超过 6 万字只贴前面一段。这里出的任何错只记日志、下一轮再试，问题和回答照常。
 4. **KiroCrew app 的需求详情**：调 `brain mr-desc KEY --json --credits <app 的 credits 文件>`，或者直接读分支上的 `runs/<KEY>/MR.md`，渲染 Markdown。数据格式就是 `mrdesc.build()` 的输出（`schema: 1`）。

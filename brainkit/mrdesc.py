@@ -1,7 +1,8 @@
 """`brain mr-desc`: the MR's 变更说明 — what changed, what it does, how to review it — built from the run's records.
 
 Every line comes from a record; what no record holds is said in one line ("还没跑 verify"), never filled in.
-Read-only: build() reads, render() formats; the command's --write is the only writer (runs/<KEY>/MR.md).
+build() reads, render() formats; write() is the only writer (runs/<KEY>/MR.md: `brain mr-desc --write`, and
+`brain handoff` into its hand-over commit). The bridge posts the file as its 「变更说明」 comment through inert().
 
 Sources (working tree, or --ref)
   run.json            runs/<KEY>/run.json: intent, owner, branch, hand-over
@@ -37,9 +38,12 @@ import sys
 from . import ci, lean, reflect, runrec, usage
 from . import trace as T
 from .common import JIRA_RE, USER_RE, BrainError, git, plain
+from .intake import checks
 
 SCHEMA = 1
 MR_FILE = "MR.md"
+# a reply line the bridge reads as an answer (bridge.decisions.ANSWER_RE starts like this): inert() quotes it
+ANSWER_LINE_RE = re.compile(r"(?i)^\s*(?:answer|答|回答)\s+D-[0-9]")
 REQ_DOC = "inception/requirements/requirements.md"
 DESIGN_DOC = "inception/application-design/application-design.md"
 PLANS_DIR = "construction/plans"
@@ -47,7 +51,7 @@ SUMMARY_DOC = "construction/build-and-test/build-and-test-summary.md"
 REVIEW_DOC = "construction/build-and-test/review.md"
 RELEASE_DOC = "operations/release.md"
 DECISIONS_DOC = "decisions.md"
-LEAN_EXCLUDE = ["%s/**" % lean.DOCS, ".kiro/**"]          # Lean's default fingerprint_exclude
+LEAN_EXCLUDE = list(lean.DEFAULT_FINGERPRINT_EXCLUDE)     # Lean's default fingerprint_exclude
 STAGE_NAMES = {"reverse-engineering": "逆向工程", "requirements": "需求分析", "user-stories": "用户故事",
                "application-design": "应用设计", "units": "拆分单元", "functional-design": "功能设计",
                "nfr-design": "非功能设计", "infrastructure-design": "基础设施设计", "code-generation": "代码生成",
@@ -84,11 +88,17 @@ def _one(text, limit=None) -> str:
 
 def inert(text) -> str:
     """Markdown someone else wrote (a runs/<KEY>/MR.md a bot committed), made safe to post on GitLab: no mention, no
-    HTML (an HTML comment would hide what follows), no image loaded, no line that GitLab runs as a quick action.
-    render()'s own output comes back unchanged."""
+    HTML (an HTML comment would hide what follows), no image loaded, no line that GitLab runs as a quick action, and
+    no line that reads as an approval, a rejection or an answer (`approve RELEASE …`, `answer D-3 approve`: quoted
+    with '> ', so neither Lean nor the bridge, nor a person copying it, takes it as one). Idempotent: render()'s own
+    output (it ends with this) comes back unchanged."""
     out = []
     for line in str(text).replace("@", "＠").replace("<", "＜").replace("![", "!［").split("\n"):
-        out.append("\\" + line.lstrip() if line.lstrip().startswith("/") else line)
+        if line.lstrip().startswith("/"):
+            line = "\\" + line.lstrip()
+        elif checks.APPROVAL_LINE_RE.match(line) or ANSWER_LINE_RE.match(line):
+            line = "> " + line
+        out.append(line)
     return "\n".join(out)
 
 
@@ -336,6 +346,23 @@ def write_problem(repo, cfg, key=None):
     return ("%s/ 下的文件（MR.md、park.json）算在 Lean 的代码指纹里：verify 之后写它们，Lean 会当成代码改了（提交被拦，"
             "release 和 RELEASE 审批要重来）。请人在 %s/lean.json 的 fingerprint_exclude 里加上 \"%s/**\"（AI 改不了"
             "这个文件）" % (cfg["runs_dir"], lean.DOCS, cfg["runs_dir"]))
+
+
+def runs_exclude(cfg) -> str:
+    """The fingerprint_exclude pattern for the run records (runs/**): what `brain install` adds to lean.json."""
+    return "%s/**" % cfg["runs_dir"].strip("/")
+
+
+def exclude_fix(cfg) -> str:
+    """How to fix what write_problem() reports (for `brain doctor` and `brain handoff`)."""
+    return ("修法：`brain install <项目目录>` 会把 \"%s\" 加进 %s（只加不删），或者手工加；由人看过再提交（最好经 MR 合进 %s）。"
+            "改了以后 Lean 的代码指纹会变，之前的 lean verify 要重跑" % (runs_exclude(cfg), lean.CONFIG,
+                                                                  cfg["default_branch"]))
+
+
+def md_path(cfg, key) -> str:
+    """runs/<KEY>/MR.md, the repo path of a run's description."""
+    return "%s/%s/%s" % (cfg["runs_dir"], key, MR_FILE)
 
 
 # ---------- Lean: verify, approvals, stage ----------
@@ -1176,7 +1203,7 @@ def render(d) -> str:
 
 def write(repo, cfg, key, text) -> str:
     """Write runs/<KEY>/MR.md (atomically; a symlink there is replaced, never followed). Returns its repo path."""
-    rel = "%s/%s/%s" % (cfg["runs_dir"], key, MR_FILE)
+    rel = md_path(cfg, key)
     d = os.path.join(repo, cfg["runs_dir"], key)
     if not os.path.isdir(d) or os.path.islink(d):
         raise BrainError("%s/%s/ is not a run folder here" % (cfg["runs_dir"], key))
