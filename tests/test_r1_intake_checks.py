@@ -2,6 +2,7 @@
 
 Key-shaped and token-shaped values are built at runtime, so the source holds none (the commit hook scans for them).
 """
+import json
 import os
 import random
 import sys
@@ -369,7 +370,7 @@ class R1_62GitleaksFinds(Base):
         base = os.path.join(self.store, "packages", rep["package"])
         self.assertIn("备用：[密钥-1]", read(os.path.join(base, "extras", "hidden.md")))
         findings = read(os.path.join(base, "findings.md"))
-        self.assertIn("密钥（已打码，请轮换） gitleaks:stripe-access-token×1", findings)
+        self.assertIn("密钥（已打码，请轮换） gitleaks:stripe-access-token×2", findings)    # the body and the hidden area
 
     def test_a_find_outside_the_text_is_listed(self):
         self.file("a.html", '<html><body><p>见 <a href="https://pay.example.com/?k=%s">文档</a></p></body></html>' % self.key)
@@ -405,6 +406,26 @@ class R1_64SecretMessage(Base):
             self.build()
         self.assertIn("（src/a.md=secret）", str(cm.exception))
         self.assertIn("--exclude", str(cm.exception))
+
+
+
+class R1_65FindingsListWhatWasMasked(Base):
+    """findings.md counted only what each file's own scan found: a value masked because another file had it, or one
+    masked in the hidden area, was not listed, and the file read 无."""
+
+    def test_findings(self):
+        self.file("a.md", "# a\n\n客服電話 9123 4567\n")
+        self.file("b.md", "# b\n\n有问题请打 9123 4567\n")                       # a phone only because a.md says so
+        self.file("c.md", "# c\n\n正文<!-- 联系 zhangwei@example.com -->\n")
+        rep = self.build()
+        base = os.path.join(self.store, "packages", rep["package"])
+        self.assertIn("有问题请打 [电话-1]", read(os.path.join(base, "segments", "D02-S001.md")))
+        self.assertIn("联系 [邮箱-1]", read(os.path.join(base, "extras", "hidden.md")))
+        findings = read(os.path.join(base, "findings.md"))
+        self.assertIn("- **D02 src/b.md**：个人信息（已打码） phone×1", findings)
+        self.assertIn("- **D03 src/c.md**：个人信息（已打码） email×1；隐藏内容 1 处", findings)
+        manifest = json.loads(read(os.path.join(base, "manifest.json")))
+        self.assertEqual(manifest["sources"][1]["findings"], {"pii": {"phone": 1}})
 
 
 if __name__ == "__main__":

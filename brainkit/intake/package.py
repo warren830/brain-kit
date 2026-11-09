@@ -304,12 +304,14 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
         r["name"] = meta(r["name"])
     segs, toc, hidden_out, findings = [], [], [], []
     limit = int(kit_intake.get("segment_chars", 6000))
+    shown = {}                                       # sid -> the body's hits as masked (values from other files too)
     for sid, name, info, doc, hits, hidden_hits in converted:
-        text = checks.apply(doc.text, checks.propagate(doc.text, hits, values), mask_business, masker)
+        shown[sid] = checks.propagate(doc.text, hits, values)
+        text = checks.apply(doc.text, shown[sid], mask_business, masker)
         name = meta(name)
         doc.notes = [meta(n) for n in doc.notes]
         info.update(name=name, kind=doc.kind, images=doc.images, hidden=len(doc.hidden), notes=doc.notes,
-                    findings=checks.summarize(hits), segments=[])
+                    segments=[])
         domains = sorted({h.value for h in hits if h.cat == "link"})
         if domains:
             info["link_domains"] = domains
@@ -326,12 +328,16 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
                                                        len(body), h8, "有图（需要人确认）" if has_img else ""))
             if not dry_run:
                 _write(os.path.join(store, "packages", pkg, "segments", fname), content)
+        hidden_found = []
         for where, t in doc.hidden:
             th = checks.propagate(t, checks.scan(t), values)
+            hidden_found += [h for h in th if h.cat != "review"]       # what to check is quoted from the body
             hidden_out.append("## %s · %s\n\n%s\n" % (name, meta(where), checks.apply(t, th, mask_business, masker)))
+        # what was masked in this file: found here, found in another file, or in the hidden area
+        info["findings"] = checks.summarize(shown[sid] + hidden_found)
         sources.append(info)
     for sid, name, info, doc, hits, hidden_hits in converted:
-        f = checks.summarize(hits)
+        f = info["findings"]
         line = "- **%s %s**：" % (sid, info["name"])
         parts = []
         for cat, label in (("pii", "个人信息（已打码）"), ("secret", "密钥（已打码，请轮换）"),
@@ -340,7 +346,7 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
             if f.get(cat):
                 parts.append("%s %s" % (label, ", ".join("%s×%d" % kv for kv in sorted(f[cat].items()))))
         if f.get("review"):
-            notes = [meta(q) for q in checks.review_notes(doc.text, hits)]
+            notes = [meta(q) for q in checks.review_notes(doc.text, shown[sid])]
             parts.append("请你确认 %d 处（可能是人名或密码，也可能只是普通的词，没打码；是人名或密码就改原文再交）：%s"
                          % (sum(f["review"].values()), "、".join("「%s」" % q for q in notes)))
         if doc.hidden:
