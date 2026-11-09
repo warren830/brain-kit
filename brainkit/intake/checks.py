@@ -24,7 +24,8 @@ PHONE_CN_RE = re.compile(r"(?<![0-9])(?:\+?86[-\s]?)?1[3-9][0-9]{9}(?![0-9])")
 # glued to a code (ORD-138-2026-0001 stays)
 PHONE_CN_GROUPED_RE = re.compile(r"(?<![A-Za-z0-9_-])(?:(?:\+|00)?86[ \u00a0-]?|\(\+?86\)[ \u00a0]?)?"
                                  r"1[3-9][0-9]([ \u00a0-])[0-9]{4}\1[0-9]{4}(?![0-9A-Za-z_-])")
-PHONE_HK_PREFIXED_RE = re.compile(r"(?<![0-9])\+?852[-\s]?[2-9][0-9]{3}[-\s]?[0-9]{4}(?![0-9])")
+# +852 9123 4567, 00852-9123-4567, and the usual HK way with the code in brackets: (852) 9123 4567, (+852) 2123 4567
+PHONE_HK_PREFIXED_RE = re.compile(r"(?:(?<![0-9])(?:\+|00)?852|\(\+?852\))[-\s]?[2-9][0-9]{3}[-\s]?[0-9]{4}(?![0-9])")
 PHONE_HK_CONTEXT_RE = re.compile(r"(?i)(電話|电话|手機|手机|聯絡|联系|tel|phone|mobile|whatsapp)[^0-9\n]{0,12}"
                                  r"((?<![0-9])[2-9][0-9]{3}[-\s]?[0-9]{4}(?![0-9]))")
 EMAIL_RE = re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63})+")

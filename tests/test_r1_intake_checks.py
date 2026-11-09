@@ -89,5 +89,25 @@ class R1_50PgpPrivateKey(Base):
         self.assertFalse(os.path.isdir(os.path.join(self.store, "packages")))
 
 
+
+class R1_70HongKongPhone(Base):
+    """(852) 9123 4567, the usual way to write a HK number, was not seen even after 電話 / Tel."""
+
+    def test_bracketed_country_code(self):
+        for text in ("客服電話：(852) 2123 4567", "負責同事 Tel: (852) 9123 4567", "(+852) 9123-4567", "00852 9123 4567",
+                     "+852 9123 4567"):
+            phones = [h.value for h in checks.scan(text) if h.kind == "phone"]
+            self.assertEqual(len(phones), 1, text)
+            self.assertTrue(phones[0].endswith("4567") and "852" in phones[0], (text, phones))
+        self.assertNotIn(("pii", "phone"), kinds("版本 (852) 号文件"))      # no number after the code
+
+    def test_masked_in_the_package(self):
+        self.file("聯絡.md", "# 聯絡\n\n客服電話：(852) 2123 4567\n\n負責同事 Tel: (852) 9123 4567\n")
+        text = self.segments(self.build())
+        for raw in ("2123 4567", "9123 4567", "(852)"):
+            self.assertNotIn(raw, text)
+        self.assertIn("客服電話：[电话-1]", text)
+
+
 if __name__ == "__main__":
     unittest.main()
