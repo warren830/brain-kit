@@ -511,19 +511,31 @@ def run_owner(repo, signed, bots) -> set:
     return {ae.strip().lower(), ce.strip().lower()} - bots - {""}
 
 
+def _bots_commits(commits, who, bots) -> list:
+    """The commits the bot made: authored or committed as one of bot_emails. A bot commit with a person's author line
+    is still the bot's (the hook refuses it; CI judges it by the bot's rules too)."""
+    return [c for c in commits if who[c][0] in bots or who[c][1] in bots]
+
+
 def bot_commit_rules(repo, branch, env, tgt, cfg, hook_cfg, head) -> list:
     """The bot's per-commit rules in a pipeline a person started (their push, GitLab's Rebase, "Run pipeline" or
-    "Retry" on the bot's red head): whoever starts the pipeline, the commits the bot authored in the MR follow the bot's
-    path rules and are committed by the bot or the run's owner (as in bot_push_rules). Without them a person's next
-    push, or a re-run, would turn the bot's red pipeline green."""
+    "Retry" on the bot's red head): whoever starts the pipeline, the commits the bot made in the MR (authored or
+    committed as the bot: _bots_commits) follow the bot's path rules; the ones it committed are authored as the bot,
+    and the ones it authored are committed by the bot or the run's owner (as in bot_push_rules). Without them a
+    person's next push, or a re-run, would turn the bot's red pipeline green."""
     from . import pre_receive
     bots = {e.lower() for e in hook_cfg.get("bot_emails") or []}
     commits = pre_receive.new_commits(tgt.base, head, hook_cfg["default_branch"], cwd=repo)
     who = _who(repo, commits)
-    mine = [c for c in commits if who[c][0] in bots]
+    mine = _bots_commits(commits, who, bots)
     if not mine:
         return []
     probs = pre_receive.bot_path_problems(branch, mine, hook_cfg, cwd=repo)
+    forged = [c for c in mine if who[c][0] not in bots]
+    if forged:
+        probs.append("%s: bot commits are authored as the bot (%s): %s" % (
+            branch, ", ".join(sorted(bots)) or "-",
+            "; ".join("%s authored by %s but committed by the bot" % (c[:12], who[c][0] or "-") for c in forged[:3])))
     odd = [c for c in mine if who[c][1] not in bots]
     if odd:
         b = parse_branch(branch, hook_cfg["branch_prefix"])
@@ -544,9 +556,10 @@ def bot_push_rules(repo, branch, user, env, tgt, cfg, hook_cfg, head) -> list:
     commit in the MR: the owner's own commits (`brain start`, local work, `brain handoff`) are not the bot's push.
     So, as the pre-receive hook judges each push by its pusher, commits are judged by who made them:
       - the branch: what the hook allows the bot (a well-formed <prefix>/<owner>/<KEY>-<slug> branch);
-      - the bot's commits (author in bot_emails), wherever they are in the MR: the bot's path rules (no gates/, CI,
-        .brain/, the kit's own files, ..., no runs/<KEY>/run.json), and committed by the bot or by the run's owner
-        (GitLab's Rebase); a pipeline a person starts applies these too (bot_commit_rules);
+      - the bot's commits (author or committer in bot_emails: _bots_commits), wherever they are in the MR: the bot's
+        path rules (no gates/, CI, .brain/, the kit's own files, ..., no runs/<KEY>/run.json); the ones the bot
+        authored are committed by the bot or by the run's owner (GitLab's Rebase); a pipeline a person starts applies
+        these too (bot_commit_rules);
       - the commits after the hand-over commit (the newest signed hand-over voucher for this branch) that are not the
         bot's: committed by the run's owner, people's rules (their own branch); anyone else is refused, and a bot
         committing another author's work is refused as the hook refuses it;
@@ -563,7 +576,7 @@ def bot_push_rules(repo, branch, user, env, tgt, cfg, hook_cfg, head) -> list:
     bots = {e.lower() for e in hook_cfg.get("bot_emails") or []}
     commits = pre_receive.new_commits(tgt.base, head, default, cwd=repo)
     who = _who(repo, commits)
-    mine = [c for c in commits if who[c][0] in bots]
+    mine = _bots_commits(commits, who, bots)
     if mine:
         probs += pre_receive.bot_path_problems(branch, mine, hook_cfg, cwd=repo)
     b = parse_branch(branch, hook_cfg["branch_prefix"])
