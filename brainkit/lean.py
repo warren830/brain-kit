@@ -112,16 +112,31 @@ def next_steps(text: str) -> list:
     return items
 
 
-def handover_problems(repo, intent) -> list:
-    """Why aidlc-state.md is not yet a usable hand-over note."""
+def team_next_steps(text: str, team: str) -> list:
+    """Items under '### Next (team <team>)' in the Session notes (Lean's per-team subsection)."""
+    m = re.search(r"^#{2,4}[ \t]*Next[ \t]*\([ \t]*team[ \t:]+`?%s`?[ \t]*\)[ \t]*$(.*?)(?=^#{1,6} |\Z)"
+                  % re.escape(team), text, re.M | re.S | re.I)
+    if not m:
+        return []
+    return [s for s in (re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", l).strip() for l in m.group(1).splitlines()) if s]
+
+
+def handover_problems(repo, intent, team=None) -> list:
+    """Why aidlc-state.md is not yet a usable hand-over note (team: a split child's, whose note is its own
+    '### Next (team <unit>)' subsection: the parent's Status and Next are shared by every child)."""
     p = state_path(repo, intent)
     if not os.path.exists(p):
         return ["%s is missing" % os.path.relpath(p, repo)]
     with open(p, encoding="utf-8") as f:
-        return handover_text_problems(f.read())
+        return handover_text_problems(f.read(), team)
 
 
-def handover_text_problems(text: str) -> list:
+def handover_text_problems(text: str, team=None) -> list:
+    if team:
+        if not team_next_steps(text, team):
+            return ["Session notes have no '### Next (team %s)' items: a child of a split keeps its own Status and "
+                    "Next there" % team]
+        return []
     probs = []
     if TEMPLATE_STATUS in text:
         probs.append("Session notes still say '%s': update Status" % TEMPLATE_STATUS)

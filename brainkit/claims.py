@@ -5,6 +5,11 @@ that already exists is refused by git itself, so two people can never claim the 
 checks that claim.json names the person who pushes it. Keys are <req_prefix>-<n>; a new key takes the next free n.
 An intent (intents.py) is a claim with more, optional fields (source, body, acs, refs, hash, closed); old claims
 without them still read. Only the owner changes a claim, with a fast-forward commit (`update`).
+
+Unowned (待认领): `owner` null and `filed_by` the person who filed it (`brain split` files a big requirement's
+children this way). `take` moves the owner from none to the person who pushes, `release` back to none. Both are a
+fast-forward of the tip that was read, so when two people take the same claim the first push wins and the second
+is refused by git (and by the pre-receive hook: nobody takes a claimed one).
 """
 from __future__ import annotations
 
@@ -28,18 +33,27 @@ def _has_origin(repo) -> bool:
 
 
 def claim_doc(key, owner, title, extra=None) -> dict:
+    """owner None: filed for others (待认领); extra must then carry filed_by."""
     doc = {"schema": 1, "key": key, "owner": owner, "title": title[:200], "created_at": iso(utcnow())}
     doc.update(extra or {})
     return doc
 
 
-def _commit(repo, doc, parent=None) -> str:
+def _message(doc, parent, what=None) -> str:
+    if what:
+        return "%s %s by %s" % (what, doc.get("key"), doc.get("owner") or doc.get("filed_by"))
+    if doc.get("owner") is None and "owner" in doc:
+        return "file %s by %s (unclaimed)" % (doc.get("key"), doc.get("filed_by"))
+    return "claim %s by %s" % (doc.get("key"), doc.get("owner"))
+
+
+def _commit(repo, doc, parent=None, what=None) -> str:
     """A commit whose tree is just claim.json (the work tree is not touched); parentless for a new claim."""
     blob = run(["git", "-C", repo, "hash-object", "-w", "--stdin"],
                input_text=json.dumps(doc, ensure_ascii=False, sort_keys=True, indent=2) + "\n").stdout.strip()
     tree = run(["git", "-C", repo, "mktree"], input_text="100644 blob %s\t%s\n" % (blob, CLAIM_FILE)).stdout.strip()
     return run(["git", "-C", repo, "commit-tree", tree] + (["-p", parent] if parent else []) +
-               ["-m", "claim %s by %s" % (doc.get("key"), doc.get("owner"))]).stdout.strip()
+               ["-m", _message(doc, parent, what)]).stdout.strip()
 
 
 def taken_numbers(repo, prefix) -> set:
@@ -83,9 +97,12 @@ def claim(repo, prefix, owner, title, key=None, retries=8, extra=None) -> dict:
         doc = claim_doc(key, owner, title, extra)
         if not _try_create(repo, key, _commit(repo, doc)):
             existing = read(repo, key)
-            if existing and existing.get("owner") == owner:
+            if existing and owner is not None and existing.get("owner") == owner:
                 return existing
-            raise BrainError("%s is already claimed by %s" % (key, (existing or {}).get("owner", "someone")))
+            if unowned(existing):
+                raise BrainError("%s is already filed and not claimed yet (待认领): `brain claim %s` takes it"
+                                 % (key, key))
+            raise BrainError("%s is already claimed by %s" % (key, (existing or {}).get("owner") or "someone"))
         return doc
     n = max(taken_numbers(repo, prefix) or {0}) + 1
     for _ in range(retries):
@@ -123,22 +140,101 @@ def read(repo, key):
         return None
 
 
-def update(repo, key, doc) -> str:
-    """Replace claim.json on claim/<KEY> with a fast-forward commit. The pre-receive hook lets only the owner."""
+def update(repo, key, doc, what=None) -> str:
+    """Replace claim.json on claim/<KEY> with a fast-forward commit. The pre-receive hook lets only the owner (an
+    unowned claim: the person who filed it, or the owner of its parent)."""
     src = _tip(repo, key)
     old = git(repo, "rev-parse", "--verify", "-q", src + "^{commit}", check=False).stdout.strip() if src else ""
     if not old:
         raise BrainError("claim/%s not found" % key)
-    sha = _commit(repo, doc, parent=old)
+    sha = _commit(repo, doc, parent=old, what=what)
+    ok, why = _push_update(repo, key, old, sha)
+    if not ok:
+        raise BrainError("could not update claim %s: %s" % (key, why) if why else
+                         "claim/%s changed meanwhile; try again" % key)
+    return sha
+
+
+def _push_update(repo, key, old, sha) -> tuple:
+    """(True, "") when claim/<KEY> moved from `old` to `sha` (a fast-forward: with an origin the server refuses it
+    when someone else moved the claim first; locally update-ref compares and swaps). (False, why) otherwise; why
+    is "" when the claim moved meanwhile."""
     if _has_origin(repo):
         p = git(repo, "push", "-q", "origin", "%s:%s" % (sha, ref(key)), check=False)
         if p.returncode != 0:
-            raise BrainError("could not update claim %s: %s" % (key, (p.stderr or p.stdout).strip()))
+            msg = (p.stderr + p.stdout).lower()
+            if "rejected" in msg and ("non-fast-forward" in msg or "fetch first" in msg or "stale info" in msg):
+                return False, ""
+            return False, (p.stderr or p.stdout).strip()
         git(repo, "update-ref", "refs/remotes/origin/claim/%s" % key, sha)
         git(repo, "update-ref", ref(key), sha)
-    elif git(repo, "update-ref", ref(key), sha, old, check=False).returncode != 0:
-        raise BrainError("claim/%s changed meanwhile; try again" % key)
-    return sha
+        return True, ""
+    return git(repo, "update-ref", ref(key), sha, old, check=False).returncode == 0, ""
+
+
+def _tip_doc(repo, key) -> tuple:
+    """(tip sha, claim document) of claim/<KEY> as the server has it (fetched first); (None, None) when there is
+    none."""
+    src = _tip(repo, key)
+    old = git(repo, "rev-parse", "--verify", "-q", src + "^{commit}", check=False).stdout.strip() if src else ""
+    if not old:
+        return None, None
+    p = git(repo, "show", "%s:%s" % (old, CLAIM_FILE), check=False)
+    try:
+        doc = json.loads(p.stdout) if p.returncode == 0 else None
+    except ValueError:
+        doc = None
+    return old, doc
+
+
+def unowned(doc) -> bool:
+    """Filed for others and not taken yet (待认领): owner is null (old claims always name one)."""
+    return isinstance(doc, dict) and "owner" in doc and doc["owner"] is None
+
+
+def take(repo, key, me) -> dict:
+    """Make an unowned claim mine: owner none -> me, one fast-forward of the tip read here. The first push wins:
+    when someone took it in between, git refuses ours and the error names them. Returns the new document."""
+    old, doc = _tip_doc(repo, key)
+    if not old:
+        raise BrainError("%s is not filed (no claim/%s)" % (key, key))
+    if not isinstance(doc, dict) or doc.get("key") != key:
+        raise BrainError("claim/%s has no readable claim.json" % key)
+    if doc.get("closed"):
+        raise BrainError("%s is closed (%s)" % (key, (doc["closed"] or {}).get("reason", "")))
+    if doc.get("owner") == me:
+        return doc
+    if not unowned(doc):
+        raise BrainError("%s is claimed by %s" % (key, doc.get("owner") or "someone"))
+    new = dict(doc, owner=me, claimed_at=iso(utcnow()))
+    ok, why = _push_update(repo, key, old, _commit(repo, new, parent=old, what="claim"))
+    if ok:
+        return new
+    _, now = _tip_doc(repo, key)
+    holder = (now or {}).get("owner")
+    if holder and holder != me:
+        raise BrainError("%s was just claimed by %s: their claim reached the server first" % (key, holder))
+    raise BrainError("could not claim %s: %s" % (key, why or "it changed meanwhile; try again"))
+
+
+def release(repo, key, me) -> dict:
+    """Give my claim back (owner -> none): it is 待认领 again. The person who filed it (or, for an old claim, me)
+    stays filed_by."""
+    old, doc = _tip_doc(repo, key)
+    if not old or not isinstance(doc, dict):
+        raise BrainError("%s is not filed (no claim/%s)" % (key, key))
+    if doc.get("closed"):
+        raise BrainError("%s is closed (%s)" % (key, (doc["closed"] or {}).get("reason", "")))
+    if unowned(doc):
+        return doc
+    if doc.get("owner") != me:
+        raise BrainError("%s is claimed by %s; only they may release it" % (key, doc.get("owner") or "someone"))
+    new = {k: v for k, v in doc.items() if k != "claimed_at"}
+    new.update(owner=None, filed_by=doc.get("filed_by") or me)
+    ok, why = _push_update(repo, key, old, _commit(repo, new, parent=old, what="release"))
+    if not ok:
+        raise BrainError("could not release %s: %s" % (key, why or "it changed meanwhile; try again"))
+    return new
 
 
 def validate_doc(doc, key, owner=None) -> list:

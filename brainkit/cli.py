@@ -3,10 +3,17 @@
   brain install <repo> [--lean PATH] [--team NAME] [--prefix OMS]   copy the kit (and AI-DLC Lean) into a project
   brain doctor                                    check this machine and repo before work
   brain claim [--key KEY] --title T               claim a requirement key (tracker "none": next free <prefix>-<n>)
+  brain claim KEY [--release]                     take a requirement filed for others (待认领; first push wins),
+                                                  or give yours back
   brain intake PATH... --key KEY --classification C --consent [--business keep|mask] [--dry-run]
                                                   check and mask requirement documents into a material package
   brain start <slug> [--key KEY] [--title T] [--doc PATH ...] [--package PKG] [--paths a,b]
                                                   claim (or check the claim), branch, Lean intent, run.json
+  brain start [slug] --key CHILD [--on DEP] [--worktree PATH]
+                                                  a split child: its own branch from the parent's, in its own
+                                                  worktree, continuing the parent's Lean intent for its unit
+  brain split PARENT [--dry-run] / brain sync [--from REF]
+                                                  file the approved units as children (commands/split_cmd.py)
   brain handoff [--no-push] [--no-label]          publish materials, commit the hand-over (with runs/<KEY>/MR.md),
                                                   set the MR description, label the MR
                                                   (exit 1: pushed but NOT labelled, nothing handed over)
@@ -81,7 +88,8 @@ def _has_origin(repo) -> bool:
 
 
 def _dirty(repo, ignore=()) -> list:
-    rows = git_out(repo, "status", "--porcelain", "--untracked-files=no").splitlines()
+    # not git_out: its strip() would eat the first row's leading status column (" M path")
+    rows = [r for r in git(repo, "status", "--porcelain", "--untracked-files=no").stdout.splitlines() if r.strip()]
     return [r for r in rows if r[3:].strip() not in ignore]
 
 
@@ -565,8 +573,53 @@ def cmd_claim(a):
     me = _me(repo, cfg)
     if me in cfg["bot_users"]:
         raise BrainError("%s is a bot account" % me)
-    key = _claim(repo, cfg, me, a.key, a.title)
+    if a.target and a.key and a.target != a.key:
+        raise BrainError("name the key once: `brain claim %s` or `brain claim --key %s`" % (a.target, a.key))
+    key = a.target or a.key
+    if a.release:
+        if not key:
+            raise BrainError("--release needs the key: `brain claim --release KEY`")
+        return _release(repo, cfg, me, key)
+    if a.target:
+        from .intents import key_problem
+        key_problem(a.target, cfg["req_prefix"])
+        doc = claims.read(repo, a.target)
+        if doc is not None:
+            if claims.unowned(doc):
+                doc = claims.take(repo, a.target, me)
+                more = " (unit %s of %s; `brain start --key %s` starts it)" % (doc.get("unit"), doc.get("parent"),
+                                                                                a.target) if doc.get("parent") else ""
+                print("Claimed %s for %s%s." % (a.target, me, more))
+                return 0
+            if doc.get("closed"):
+                raise BrainError("%s is closed (%s)" % (a.target, (doc["closed"] or {}).get("reason", "")))
+            if doc.get("owner") != me:
+                raise BrainError("%s is claimed by %s" % (a.target, doc.get("owner") or "someone"))
+            print("%s is already yours." % a.target)
+            return 0
+    key = _claim(repo, cfg, me, key, a.title)
     print("Claimed %s for %s." % (key, me))
+    return 0
+
+
+def _release(repo, cfg, me, key):
+    """Give a claim back (owner -> none, 待认领 again). Refused while I have a run branch for it: the run is mine."""
+    from . import intents
+    branches = [n for n in intents.run_keys(repo, cfg)[0] if n == key]
+    if branches:
+        mine = [l for l in git_out(repo, "for-each-ref", "--format=%(refname:short)",
+                                   "refs/heads/%s/%s/" % (cfg["branch_prefix"], me)).split() if
+                (parse_branch(l, cfg["branch_prefix"]) or {}).get("key") == key]
+        if git(repo, "remote", "get-url", "origin", check=False).returncode == 0:
+            p = git(repo, "ls-remote", "origin", "refs/heads/%s/%s/*" % (cfg["branch_prefix"], me), check=False)
+            mine += [l.split("\t", 1)[1][len("refs/heads/"):] for l in p.stdout.splitlines() if "\t" in l and
+                     (parse_branch(l.split("\t", 1)[1][len("refs/heads/"):], cfg["branch_prefix"]) or {}).get("key")
+                     == key]
+        if mine:
+            raise BrainError("%s has your run branch %s: hand the run over or delete the branch first (here and on "
+                             "origin), then release it" % (key, ", ".join(sorted(set(mine)))))
+    claims.release(repo, key, me)
+    print("Released %s: it is 待认领 again (`brain claim %s` takes it)." % (key, key))
     return 0
 
 
@@ -593,16 +646,30 @@ def cmd_intake(a):
 def cmd_start(a):
     repo = repo_root()
     cfg = config.load(repo)
-    slug = a.slug.lower()
-    if not SLUG_RE.match(slug):
-        raise BrainError("slug must be lowercase letters, digits and '-' (max 40)")
-    if _dirty(repo):
-        raise BrainError("working tree has uncommitted changes; commit or stash first")
     if not lean.installed(repo):
         raise BrainError("AI-DLC Lean is not installed; run `brain install --lean <path>`")
     me = _me(repo, cfg)
     if me in cfg["bot_users"]:
         raise BrainError("%s is a bot account; local runs belong to a person" % me)
+    if cfg["tracker"] == "none" and a.key:
+        from . import intents, split
+        intents.key_problem(a.key, cfg["req_prefix"])
+        child = claims.read(repo, a.key)
+        if isinstance(child, dict) and child.get("parent"):
+            bad = intents.doc_problems(child, content=False)
+            if bad:
+                raise BrainError("claim/%s: %s" % (a.key, "; ".join(bad)))
+            return split.start_child(repo, cfg, a, child, me, __version__)
+    if a.on or a.worktree:
+        raise BrainError("--on and --worktree are for a child of a split (`brain split`); %s is not one" % (a.key or
+                                                                                                         "this"))
+    if not a.slug:
+        raise BrainError("name the run: `brain start <slug> ...` (lowercase letters, digits and '-')")
+    slug = a.slug.lower()
+    if not SLUG_RE.match(slug):
+        raise BrainError("slug must be lowercase letters, digits and '-' (max 40)")
+    if _dirty(repo):
+        raise BrainError("working tree has uncommitted changes; commit or stash first")
     if a.doc and a.package:
         raise BrainError("use --doc (take documents in now) or --package (an existing package), not both")
     if a.doc and (not a.consent or not a.classification):
@@ -620,6 +687,9 @@ def cmd_start(a):
         key = a.key
         if key:
             doc = claims.read(repo, key)
+            if claims.unowned(doc) and not doc.get("closed"):
+                doc = claims.take(repo, key, me)          # filed for others: starting it claims it
+                print("Claimed %s for %s." % (key, me))
             if doc and doc.get("owner") != me:
                 raise BrainError("%s is claimed by %s" % (key, doc.get("owner")))
             if doc and doc.get("closed"):
@@ -885,6 +955,15 @@ def cmd_handoff(a):
     me = _me(repo, cfg)
     if me != rec["owner"]:
         raise BrainError("this run belongs to %s; only the owner hands it off" % rec["owner"])
+    target = cfg["default_branch"]
+    if cfg["tracker"] == "none":
+        from . import split
+        for w in split.handoff_problems(repo, cfg, rec):
+            raise BrainError(w)
+        for w in split.handoff_warnings(repo, cfg, rec):
+            print("WARN: " + w)
+    if rec.get("parent"):
+        return _child_mr(repo, cfg, a, br, b, rec, me)
     probs = lean.handover_problems(repo, rec["intent"])
     if probs:
         raise BrainError("hand-over note not ready (%s/%s/aidlc-state.md): %s"
@@ -931,7 +1010,7 @@ def cmd_handoff(a):
     head = git_out(repo, "rev-parse", "HEAD")
     mr = gl.mr_for_branch(proj, br)
     if not mr:
-        mr = _create_mr(gl, proj, br, cfg["default_branch"], "%s %s" % (rec["key"], b["slug"].replace("-", " ")), desc)
+        mr = _create_mr(gl, proj, br, target, "%s %s" % (rec["key"], b["slug"].replace("-", " ")), desc)
     elif desc is not None:
         try:
             gl.edit_mr(proj, mr["iid"], description=desc)
@@ -955,6 +1034,65 @@ def cmd_handoff(a):
     gl.edit_labels(proj, mr["iid"], add=[label], remove=[cfg["rejected_label"]])
     print("Handed off: MR !%s labelled '%s' at %s. The bridge checks it and the team runner continues." %
           (mr["iid"], label, head[:12]))
+    return 0
+
+
+def _child_mr(repo, cfg, a, br, b, rec, me):
+    """`brain handoff` on a split child (phase 1): its work goes to the parent's owner, not to the team runner. The
+    note is checked (its own `### Next (team <unit>)`), MR.md is written and committed, the branch is pushed and
+    the MR into the parent's run branch is opened or updated with that description. No hand-over record and no
+    label: the bridge takes hand-overs into the default branch only (handing children to the runner is phase 2)."""
+    target = rec["target_branch"]
+    probs = lean.handover_problems(repo, rec["intent"], rec.get("lean_team"))
+    if probs:
+        raise BrainError("hand-over note not ready (%s/%s/aidlc-state.md): %s"
+                         % (lean.DOCS, rec["intent"], "; ".join(probs)))
+    md = mrdesc.md_path(cfg, rec["key"])
+    dirty = _dirty(repo, ignore=(md,))
+    if dirty:
+        raise BrainError("commit your work first:\n  " + "\n  ".join(dirty))
+    try:
+        warnings = handoff_risk_warnings(repo, cfg, rec)
+    except (BrainError, OSError, ValueError) as e:
+        warnings = ["risk paths not checked (%s)" % e]
+    for w in warnings:
+        print("WARN: " + w)
+    desc = None
+    try:
+        from .commands.trace_cmd import default_vouchers
+        desc = mrdesc.render(mrdesc.build(repo, cfg, rec["key"], vouchers_dir=default_vouchers(repo),
+                                          allowed_signers=os.environ.get("BRAIN_ALLOWED_SIGNERS") or None))
+        mrdesc.write(repo, cfg, rec["key"], desc)
+        git(repo, "add", "--", md)
+        if git(repo, "diff", "--cached", "--quiet", "--", md, check=False).returncode != 0:
+            git(repo, "commit", "-q", "-m", "%s: MR description (unit %s of %s)" % (rec["key"], rec.get("unit"),
+                                                                                    rec["parent"]))
+    except Exception as e:  # noqa: BLE001  the description helps the reviewer; it does not hold up the MR
+        git(repo, "reset", "-q", "--", md, check=False)
+        print("WARN: %s not written (%s)." % (md, str(e).replace(repo, ".")))
+    who = "%s's owner" % rec["parent"]
+    if a.no_push or not _has_origin(repo):
+        print("Ready for %s: push %s and open its MR into %s (not pushed). A child is merged by its parent's owner; "
+              "handing it to the team runner comes with phase 2." % (who, br, target))
+        return 0
+    git(repo, "push", "-q", "-u", "origin", br)
+    gl = _gitlab(cfg)
+    if not gl or not cfg["gitlab"]["project"]:
+        print("Pushed %s. GitLab not configured here: open its MR into %s by hand, for %s to review and merge." % (
+            br, target, who))
+        return 0
+    proj = cfg["gitlab"]["project"]
+    mr = gl.mr_for_branch(proj, br)
+    if not mr:
+        mr = _create_mr(gl, proj, br, target, "%s %s (unit %s of %s)" % (rec["key"], b["slug"].replace("-", " "),
+                                                                        rec.get("unit"), rec["parent"]), desc)
+    elif desc is not None:
+        try:
+            gl.edit_mr(proj, mr["iid"], description=desc)
+        except BrainError as e:
+            print("WARN: the description of MR !%s was not set (%s); it is in %s on the branch." % (mr["iid"], e, md))
+    print("Pushed %s; MR !%s goes into %s for %s to review and merge (no runner hand-over for a child yet: phase 2)."
+          % (br, mr["iid"], target, who))
     return 0
 
 
@@ -1256,8 +1394,11 @@ def main(argv=None):
     s.add_argument("--offline", action="store_true", help="skip git fetch")
     s.set_defaults(fn=cmd_doctor)
     s = sub.add_parser("claim")
+    s.add_argument("target", nargs="?", metavar="KEY", help="take this requirement (filed for others) or check it is "
+                                                           "yours")
     s.add_argument("--key")
     s.add_argument("--title", default="")
+    s.add_argument("--release", action="store_true", help="give your claim back: it is 待认领 again")
     s.set_defaults(fn=cmd_claim)
     s = sub.add_parser("intake")
     s.add_argument("doc", nargs="+", help="files or folders (a Feishu/Lark export folder works)")
@@ -1266,8 +1407,11 @@ def main(argv=None):
     _intake_args(s, True)
     s.set_defaults(fn=cmd_intake)
     s = sub.add_parser("start")
-    s.add_argument("slug")
+    s.add_argument("slug", nargs="?", help="branch name part (a split child: default its unit)")
     s.add_argument("--key", help="requirement key (tracker none: omit to claim the next free one)")
+    s.add_argument("--on", metavar="DEP", help="a split child: start from the branch of this dependency, which has "
+                                               "not merged yet")
+    s.add_argument("--worktree", help="a split child: its worktree (default ~/.brain/worktrees/<repo>/<KEY>)")
     s.add_argument("--title")
     s.add_argument("--doc", nargs="+", help="take these documents in now (runs the five gates)")
     s.add_argument("--package", help="attach an existing material package PKG-<KEY>-<n>")

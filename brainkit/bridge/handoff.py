@@ -37,8 +37,8 @@ from datetime import timedelta
 
 from .. import claims, config as kitconfig, lean, runrec, sign
 from ..intake import package as intake
-from ..common import (BrainError, NetworkError, git, git_net, iso, later, load_json, parse_branch, parse_iso, plain,
-                      utcnow, write_json)
+from ..common import (BrainError, NetworkError, git, git_net, iso, later, load_json, parse_branch, parse_iso,
+                      paths_overlap, plain, utcnow, write_json)
 from ..rest import DEFAULT_TOKEN_FILE, GitLab, HttpError, Jira, gl_time, head_pushed_at, jira_user_id, read_token
 from .decisions import DecisionLoop
 from .delivery import one_line
@@ -290,7 +290,9 @@ class Bridge(DecisionLoop):
         if state is None:
             p.append("Lean hand-over note %s/%s/aidlc-state.md missing" % (lean.DOCS, rec["intent"]))
         else:
-            p += ["hand-over note: " + x for x in lean.handover_text_problems(state.decode("utf-8", "replace"))]
+            team = rec.get("lean_team") if rec.get("parent") else None      # a split child: its own subsection
+            p += ["hand-over note: " + x for x in lean.handover_text_problems(state.decode("utf-8", "replace"),
+                                                                                team)]
         if not self.gl.commit_exists(project, rec["brain_commit"]):
             p.append("brain_commit %s does not exist" % rec["brain_commit"][:12])
         # a reservation left by a bridge that stopped while signing does not count once it is stale (reserve_run
@@ -387,7 +389,8 @@ class Bridge(DecisionLoop):
             if row["project"] != project or row["req"] == key:
                 continue
             theirs = [x.rstrip("/") for x in json.loads(row["paths"] or "[]") if x]
-            both = sorted({a for a in mine for t in theirs if a == t or a.startswith(t + "/") or t.startswith(a + "/")})
+            # globs too (a split child's paths are its unit's Paths in unit-of-work.md, e.g. services/api/**)
+            both = sorted({a for a in mine for t in theirs if paths_overlap(a, t)})
             if both:
                 out.append((row["run_id"], both))
         return out

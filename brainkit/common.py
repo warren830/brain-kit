@@ -22,6 +22,29 @@ class BrainError(Exception):
     """A user-facing failure: the message says what is wrong and what to do."""
 
 
+def path_base(spec: str) -> str:
+    """The folder (or file) a repo path or glob is about: the spec itself without './' and trailing '/'; for a glob
+    (*, ?, [), the folder before its first wildcard ('' at the top level). Lean reads a unit's Paths as fnmatch globs,
+    where * also matches '/', so a glob covers everything below that folder."""
+    s = str(spec or "").strip().replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    cut = min([s.find(c) for c in "*?[" if c in s] or [-1])
+    if cut >= 0:
+        s = s[:cut]
+        s = s[:s.rfind("/")] if "/" in s else ""
+    return s.strip("/")
+
+
+def paths_overlap(a: str, b: str) -> bool:
+    """Could one file be under both repo paths / globs? One names the other or a folder that holds it (a glob counts
+    as its folder: path_base). Errs on the side of yes: it feeds warnings."""
+    x, y = path_base(a), path_base(b)
+    if not x or not y:
+        return True
+    return x == y or x.startswith(y + "/") or y.startswith(x + "/")
+
+
 def utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 

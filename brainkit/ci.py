@@ -375,7 +375,14 @@ def check_run(repo, branch, env) -> list:
     vdir, signers = env.get("BRAIN_VOUCHERS_DIR", ""), env.get("BRAIN_ALLOWED_SIGNERS", "")
     vouchers, bad = signed_vouchers(vdir, signers, b["key"], repo, upstream=base, runs_dir=cfg["runs_dir"])
     probs += bad
-    probs += check_route(repo, rec, cfg, tgt, base, vouchers)
+    design = list(vouchers)
+    if rec.get("parent"):
+        # a split child builds one unit of its parent's Lean intent: the design it follows is the parent's, so the
+        # parent's signed DESIGN answers count for its risk paths (hand-over vouchers stay per branch, below)
+        pv, pbad = signed_vouchers(vdir, signers, rec["parent"], repo, upstream=base, runs_dir=cfg["runs_dir"])
+        design += [v for v in pv if v.get("kind") == "answer"]
+        probs += pbad
+    probs += check_route(repo, rec, cfg, tgt, base, design)
     bot_emails = {e.lower() for e in cfg.get("bot_emails", [])}
     people = set(git_out(repo, "log", "--format=%ce%n%ae", "%s..HEAD" % base).lower().split())
     if bot_emails & people:

@@ -194,11 +194,12 @@ def _d(e) -> dict:
     return d if isinstance(d, dict) else {}
 
 
-def _events(tree, intent) -> list:
-    """The intent's Lean audit records of every clone, oldest first."""
+def _events(tree, intent, clone=None) -> list:
+    """The intent's Lean audit records of every clone (`clone`: only the clone whose ledger file ends in
+    -<clone>.jsonl, a split child's own), oldest first."""
     out = []
     for path in tree.files(lean.DOCS + "/audit"):
-        if not path.endswith(".jsonl"):
+        if not path.endswith(".jsonl") or (clone and not path.endswith("-%s.jsonl" % clone)):
             continue
         for line in (tree.read(path) or "").splitlines():
             try:
@@ -661,7 +662,7 @@ def _default_ref(repo, cfg):
     return None
 
 
-def _changes(repo, cfg, key, tree, base):
+def _changes(repo, cfg, key, tree, base, label=None):
     """(changes, why not): the diff from the merge base with the default branch to the tip, by top-level folder."""
     tip = tree.commit or _commit(repo, "HEAD")
     dref = _default_ref(repo, cfg)
@@ -669,7 +670,7 @@ def _changes(repo, cfg, key, tree, base):
         b = _commit(repo, base)
         if not b:
             raise BrainError("--base %s is not a commit here" % base)
-        label = "%s（%s）" % (_one(base, 60), b[:12])
+        label = label or "%s（%s）" % (_one(base, 60), b[:12])
     else:
         if not dref:
             return None, "找不到 %s（也没有 origin/%s），没法算改了什么" % (cfg["default_branch"], cfg["default_branch"])
@@ -832,6 +833,22 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
         missing.append("run.json 里没有有效的 Lean intent，Lean 的记录都读不到")
     events = _events(tree, intent) if intent else []
     lcfg = _lean_cfg(tree)
+    # a split child (brain split): one unit of its parent's intent; its MR goes into the parent's run branch
+    family = None
+    if JIRA_RE.match(str(rec.get("parent") or "")) and isinstance(rec.get("unit"), str) and plain(rec["unit"]):
+        family = {"parent": rec["parent"], "unit": _one(rec["unit"], 40),
+                  "target_branch": _one(rec.get("target_branch"), 100) if plain(rec.get("target_branch")) else None}
+    clone = rec.get("lean_clone") if family and re.match(r"^[0-9a-f]{6}$", str(rec.get("lean_clone") or "")) else None
+    own = _events(tree, intent, clone) if intent and clone else events     # the child's own clone: verify, stage
+    base_label = None
+    if family and base is None and family["target_branch"]:
+        tip = tree.commit or _commit(repo, "HEAD")
+        for r in ("origin/" + family["target_branch"], family["target_branch"]):
+            tref = _commit(repo, r)
+            mb = git(repo, "merge-base", tip, tref, check=False).stdout.strip() if tref and tip else ""
+            if mb:
+                base, base_label = mb, "%s 的分叉点 %s" % (r, mb[:12])
+                break
 
     req = _requirements(tree.read("%s/%s" % (docs, REQ_DOC))) if docs else None
     if docs and req is None:
@@ -841,9 +858,11 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
     elif req is not None and not req["acs"]:
         missing.append("需求里还没有验收标准")
     plans = _plans(tree, docs) if docs else []
+    if family:
+        plans = [p for p in plans if p["unit"] == family["unit"]]
     if docs and not plans:
         missing.append("还没有代码生成计划（不知道哪个测试对应哪条验收标准）")
-    v = _verify(events, tree, docs) if docs else None
+    v = _verify(own, tree, docs) if docs else None
     current, why = _verify_state(repo, tree, v, lcfg, cfg["runs_dir"]) if v else (None, None)
     if docs and not v:
         missing.append("还没跑 verify")
@@ -852,7 +871,13 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
         for aid, ts in p["tests"].items():
             tests.setdefault(aid, []).extend(ts)
     acs = []
+    mine = None
+    if family:       # the unit's ACs: as runs/<KEY>/intent.md lists them, and what its plan's Tests table maps
+        md = tree.read("%s/%s/intent.md" % (cfg["runs_dir"], key)) or ""
+        mine = set(AC_ID_RE.findall("\n".join(_section(_sections(md), "acceptance") or []))) | set(tests)
     for ac in (req or {}).get("acs", []):
+        if mine and ac["id"] not in mine:
+            continue
         ts = tests.get(ac["id"], [])
         shown = []
         for t in ts:
@@ -874,7 +899,7 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
                                                  else ac["given"] or ac["then"], 60),
                     "tests": shown, "result": result})
 
-    ch, why_no_changes = _changes(repo, cfg, key, tree, base)
+    ch, why_no_changes = _changes(repo, cfg, key, tree, base, base_label)
     if why_no_changes:
         missing.append(why_no_changes)
     elif not ch["files"]:
@@ -882,6 +907,8 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
     approvals = _approvals(events, tree, docs, plans, lcfg, req) if docs else {"recorded": [], "missing": [],
                                                                               "design_skipped": False,
                                                                               "released": False}
+    if family:       # the parent's owner releases once every child has merged
+        approvals["missing"] = [m for m in approvals["missing"] if m["kind"] != "RELEASE"]
     if ch and ch["risk"]:
         ch["risk"]["design"] = _design_cover(repo, cfg, rec, key, tree, ch, events, docs, approvals, vouchers_dir,
                                              allowed_signers) if docs else {"state": "unknown",
@@ -909,7 +936,7 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
     if tr_err:
         missing.append("run trace 没读出来（%s）：Brain 引用只按 Lean 记录算" % tr_err)
 
-    stage = _stage(events)
+    stage = _stage(own)
     waiting = None
     if park and park.get("status") == "waiting":
         waiting = "等人在 MR 上回答%s问题" % KIND_LABEL.get(park["kind"], "")
@@ -919,6 +946,7 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
             waiting = "等 %s 审批" % "、".join(req_kinds)
     data = {
         "schema": SCHEMA, "key": key, "ref": tree.label, "intent": intent, "owner": owner, "branch": branch,
+        "family": family,
         "title": _one((req or {}).get("title") or next((_d(e).get("title") for e in events
                                                          if e.get("event") == "INTENT_CREATED"), None) or intent,
                       80) or None,
@@ -1029,6 +1057,10 @@ def render(d) -> str:
     meta = ["分支 `%s`" % _one(d["branch"], 100) if d["branch"] else None,
             "负责人 %s" % d["owner"] if d["owner"] else None, "intent `%s`" % d["intent"] if d["intent"] else None]
     out.append("（%s）" % "；".join(x for x in meta if x))
+    f = d.get("family")
+    if f:
+        out.append("这是 %s 拆出来的小需求：只做单元 `%s`，合进 `%s`；发布由 %s 的负责人在所有小需求合并后做。" % (
+            f["parent"], f["unit"], f["target_branch"] or "大需求的分支", f["parent"]))
 
     # 做了什么 / 没做什么
     body = []

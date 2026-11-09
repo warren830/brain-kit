@@ -3,6 +3,10 @@
 Claim branches (claim/<KEY>): only the person claim.json names may create, change or delete one; an intent's
 text fields (intents.py: source, body, acs, refs, closed) must pass the Brain's content checks - all of them when the
 claim is created, the ones a push changes after that (closing a claim filed under older rules still works).
+Filed for others (待认领, "owner": null): created by the person filed_by names (a split child: only by the owner of
+its parent); its owner may go from none to the person who pushes only (claiming changes nothing else); an owner may
+release it back to none; nobody may take a claimed one. While nobody owns it, whoever filed it or the parent's owner
+may change, close or delete it. key, parent, unit, source and filed_by never change. Bots never claim.
 Rules for run branches (<prefix>/<owner>/<JIRA>-<slug>):
   bot accounts   may push only branches under <prefix>/ (well-formed names), never delete or force-push,
                  never push tags, never change bot_forbidden_paths (gates/, project-agent.yaml, CI, ...), and never
@@ -132,8 +136,33 @@ def _claim_owner(sha, cwd):
     return doc, ""
 
 
+IMMUTABLE = ("key", "parent", "unit", "source", "filed_by")
+_GONE = object()
+
+
+def _ref_claim(key, cwd):
+    """claim.json of claim/<key> as the server has it before this push (None when there is none)."""
+    if not JIRA_RE.match(str(key or "")):
+        return None
+    doc, err = _claim_owner("refs/heads/claim/%s" % key, cwd)
+    return doc if not err and isinstance(doc, dict) else None
+
+
+def _may_manage(before, user, cwd) -> bool:
+    """An unowned claim is managed by whoever filed it and by the owner of its parent."""
+    if before.get("filed_by") == user:
+        return True
+    parent = _ref_claim(before.get("parent"), cwd) if before.get("parent") else None
+    return bool(parent) and parent.get("owner") == user
+
+
+def _unowned(doc) -> bool:
+    return isinstance(doc, dict) and "owner" in doc and doc["owner"] is None
+
+
 def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
-    """claim/<KEY>: created once by the person it names; only that person may change or release it."""
+    """claim/<KEY>: created once by the person it names (or, filed for others, by the person filed_by names); an
+    owner goes from none to the pusher only, back to none by the owner, and nobody takes a claimed one."""
     key = branch[len("claim/"):]
     if not JIRA_RE.match(key):
         return ["%s: claim branches are claim/<PREFIX>-<n>" % branch]
@@ -142,16 +171,59 @@ def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
     before = None
     if old != ZERO_SHA:
         before, err = _claim_owner(old, cwd)
-        holder = (before or {}).get("owner")
-        if holder != user:
+        holder = (before or {}).get("owner") if isinstance(before, dict) else None
+        if not _unowned(before) and holder != user:
             return ["%s: claimed by %s; only they may change or release it" % (branch, holder or "unknown")]
+        if _unowned(before) and new == ZERO_SHA and not _may_manage(before, user, cwd):
+            return ["%s: not claimed yet; only %s (who filed it) or the parent's owner may delete it"
+                    % (branch, before.get("filed_by") or "who filed it")]
     if new == ZERO_SHA:
         return []
     doc, err = _claim_owner(new, cwd)
     if err:
         return ["%s: %s" % (branch, err)]
-    if not isinstance(doc, dict) or doc.get("key") != key or doc.get("owner") != user:
+    if not isinstance(doc, dict) or doc.get("key") != key:
         return ["%s: claim.json must name key %s and owner %s" % (branch, key, user)]
+    owner = doc.get("owner")
+    if before is None:                                  # a new claim
+        if _unowned(doc):
+            if doc.get("filed_by") != user:
+                return ["%s: claim.json must name owner %s, or no owner and filed_by %s" % (branch, user, user)]
+            if doc.get("parent"):
+                parent = _ref_claim(doc["parent"], cwd)
+                if not parent or parent.get("owner") != user:
+                    return ["%s: a child of %s is filed by %s's owner (%s), not %s" % (
+                        branch, doc["parent"], doc["parent"], (parent or {}).get("owner") or "nobody", user)]
+        elif owner != user:
+            return ["%s: claim.json must name key %s and owner %s" % (branch, key, user)]
+    else:
+        changed = sorted(k for k in IMMUTABLE if doc.get(k, _GONE) != before.get(k, _GONE)
+                         and not (k == "filed_by" and k not in before and _unowned(doc) and doc.get(k) == user))
+        if changed:
+            return ["%s: %s never change%s" % (branch, ", ".join(changed), "s" if len(changed) == 1 else "")]
+        if not _unowned(before):                        # owned by the pusher (checked above)
+            if _unowned(doc):                           # released: only the owner goes back to none
+                rest = sorted(k for k in set(doc) | set(before) if k not in ("owner", "claimed_at", "filed_by")
+                              and doc.get(k, _GONE) != before.get(k, _GONE))
+                if rest:
+                    return ["%s: a release changes only the owner (it also changed %s)" % (branch, ", ".join(rest))]
+            elif owner != user:
+                return ["%s: claimed by %s; nobody may take a claimed one (its owner may keep it or release it)"
+                        % (branch, user)]
+        elif owner is None and "owner" in doc:          # still unowned: changed by who filed it or the parent's owner
+            if not _may_manage(before, user, cwd):
+                return ["%s: not claimed yet; only %s (who filed it) or the parent's owner may change it"
+                        % (branch, before.get("filed_by") or "who filed it")]
+        elif owner == user:                             # claimed: none -> the pusher, nothing else changes
+            if before.get("closed"):
+                return ["%s: closed; a closed requirement is not claimed" % branch]
+            rest = sorted(k for k in set(doc) | set(before) if k not in ("owner", "claimed_at")
+                          and doc.get(k, _GONE) != before.get(k, _GONE))
+            if rest:
+                return ["%s: claiming changes only the owner (it also changed %s)" % (branch, ", ".join(rest))]
+        else:
+            return ["%s: an owner may go from none to the person who pushes only (%s pushed owner %s)"
+                    % (branch, user, owner if owner is not None else "missing")]
     from . import intents  # an intent's text reaches the run's agent: same checks as `brain intent add`
     # an update is checked for what it changes: text the claim was accepted with stays as it was filed
     bad = intents.doc_problems(doc, before=before if isinstance(before, dict) else None)
