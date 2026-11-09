@@ -17,7 +17,8 @@ For each spool/requests/<RUN-ID>.json not yet handled:
   failed, closed or merged: the bridge signs a requirement's next run only once no run of it is open) is removed
   first; one of a later run, or one runnerd did not make, is never touched (the request fails and says where).
 config: {"spool_dir", "cache_dir", "runs_root", "allowed_signers", "clone_url": "ssh://git@gitlab.example/{project}.git",
-         "interval": 30, "git_timeout": 300 (seconds for one fetch or pull), "clone_timeout": 3600, "tries": 3,
+         "interval": 30 (seconds; "30" too), "git_timeout": 300 (seconds for one fetch or pull), "clone_timeout": 3600,
+         "tries": 3,
          "branch_prefix": "" (only this branch prefix; default: the one the signed voucher names),
          "kit_dir": the installed brain-kit whose kit/.kiro/brain/lean-hook.py the sessions' hooks run (default: this
          one), "agent_spec": "~/.kiro/agents/brain-run.json" (its hooks must run that adapter: cli.runner_hook_problems)}
@@ -305,7 +306,7 @@ def main(argv=None):
             print("brain-runnerd: this round failed: %s" % e, file=sys.stderr)
         if a.cmd == "once":
             return 0
-        time.sleep(cfg.get("interval", 30))
+        time.sleep(_timeout(cfg, "interval", 30.0))     # seconds: 30 or "30", as the bridge reads its interval
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ adapter's park.json allowance and the bridge's park.json questions. Each class n
   R1-10  the park.json allowance took one spelling only: ./runs/<KEY>/park.json, runs//..., runs/<KEY>/./park.json and
          an absolute path through a symlinked folder (/tmp for /private/tmp) went to Lean, which blocks them as code.
   R1-11  park.json refs given as a string passed validate_park, and the question showed it one character at a time.
+  R1-12  `brain-runnerd loop` crashed after its first round on "interval": "30".
 """
 import importlib.util
 import json
@@ -325,6 +326,34 @@ class R111RefsAreAList(unittest.TestCase):
         self.assertEqual(r3.notes(t, start="**D-"), [])
         self.assertIn("refs must be a list of strings", r3.notes(t, start="D-1 无法发出")[0])
         self.assertTrue(r3.to_run(t)[0].startswith("问题没发出："))
+
+
+# ---------- R1-12: runnerd's interval ----------
+
+class _Slept(Exception):
+    pass
+
+
+class R112RunnerdInterval(unittest.TestCase):
+    def test_interval_in_seconds_as_the_bridge_reads_it(self):
+        d = tmpdir(self)
+        conf = os.path.join(d, "runnerd.json")
+        for given, want in (("30", 30.0), (" 2.5 ", 2.5), (45, 45.0), ("30s", 30.0), (None, 30.0)):
+            cfg = {"spool_dir": os.path.join(d, "spool"), "cache_dir": os.path.join(d, "cache"),
+                   "runs_root": os.path.join(d, "runs"), "allowed_signers": os.path.join(d, "allowed"),
+                   "clone_url": "file:///nowhere/{project}.git"}
+            if given is not None:
+                cfg["interval"] = given
+            write_json(conf, cfg)
+            slept = []
+
+            def nap(s):
+                slept.append(s)
+                raise _Slept()
+            with mock.patch.object(runnerd.time, "sleep", side_effect=nap), self.assertRaises(_Slept):
+                runnerd.main(["--config", conf, "loop"])          # one round, then the sleep
+            self.assertEqual(slept, [want], given)
+            self.assertIsInstance(slept[0], float)
 
 
 if __name__ == "__main__":
