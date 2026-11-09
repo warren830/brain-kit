@@ -213,5 +213,18 @@ class StartChild(T.Family):
         self.assertIsNone(self.claim("PAY-4")["owner"])
 
 
+    def test_r1_43_a_worktree_that_is_a_file_is_refused(self):
+        self.inception()
+        self.ok("alice", self.alice, "split", "PAY-1")                     # PAY-4 jobs has no dependencies
+        f = os.path.join(self.p.d, "notes.txt")
+        T.write(self.p.d, "notes.txt", "x\n")
+        out = self.refused("bob", self.bob, "start", "--key", "PAY-4", "--worktree", f)
+        self.assertIn("brain: %s is a file, not a folder" % f, out)
+        self.assertIsNone(self.claim("PAY-4")["owner"])                   # refused before anything was written
+        self.assertEqual(sh("git", "-C", self.bob, "branch", "--list", "ai/bob/*").stdout, "")
+        with open(f, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "x\n")
+
+
 if __name__ == "__main__":
     unittest.main()

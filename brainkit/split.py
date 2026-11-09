@@ -906,7 +906,14 @@ def start_child(repo, cfg, a, doc, me, version) -> int:
         raise BrainError("slug must be lowercase letters, digits and '-' (max 40)")
     br = branch_name(cfg["branch_prefix"], me, key, slug)
     wt = os.path.abspath(os.path.expanduser(a.worktree)) if getattr(a, "worktree", None) else worktree_path(repo, key)
-    if os.path.exists(wt) and os.listdir(wt):
+    if os.path.exists(wt) and not os.path.isdir(wt):
+        raise BrainError("%s is a file, not a folder: pass --worktree a folder that does not exist yet (or is empty)"
+                         % wt)
+    try:
+        used = os.path.exists(wt) and bool(os.listdir(wt))
+    except OSError as e:
+        raise BrainError("cannot read the worktree folder %s: %s" % (wt, e))
+    if used:
         raise BrainError("%s exists and is not empty: remove it (`git worktree remove %s`) or pass --worktree" % (
             wt, wt))
     fields, warns = child_fields(pkey, pdoc.get("title"), info, units[unit], keys, _parent_rec(sp), sp["commit"])
