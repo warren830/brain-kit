@@ -18,12 +18,15 @@ Sources
   Brain usage       brainkit.usage: entries loaded at brain_commit, cited ids, stale and unknown citations
   credits           passed in by the KiroCrew app, optional. Kiro reports no token counts (input/output/cache = 0)
 
-Git (docs/eval.md §2 has every rule, each with a test in tests/test_qa_r2_trace.py): how the run was merged
-(landing, rules M1-M6: merge commit, squash + merge commit, fast-forward, rebase, squash, branch gone), which commits
-are the run's own (the range, rules C1-C3, and on the default branch run_stretch, rules R1-R5), and which time is used
-(a commit's "at" is its author date; a merge's is the committer date of the commit that landed it). Branch copies
-(local, origin) that are older, ahead or diverged are named in src.git.tip_note. The run's own commits are never
-counted as hotfixes; a revert, or a person's commit naming the key with a fix word, is never the run's own.
+Git (docs/eval.md §2 has every rule, each with a test in tests/test_qa_r2_trace.py or tests/test_qa_r3_trace.py):
+how the run was merged (landing, rules M1-M6: merge commit, squash + merge commit, a merge made on another branch
+(M1b), fast-forward, rebase, squash, branch gone), which commits are the run's own (the range, rules C1-C3, and on the
+default branch run_stretch, rules R1-R5), which `brain handoff` handed it over (handover, rules H1-H4: the one the
+bridge accepted), and which time is used (a commit's "at" is its author date; a merge's is the committer date of the
+commit that landed it). Branch copies (local, origin) that are older, ahead or diverged are named in
+src.git.tip_note. The run's own commits are never counted as hotfixes; after the hand-over, a revert or a person's
+commit naming the key with a fix word is never the run's own; a hotfix changes something outside brain/, runs/ and
+aidlc-docs/ (A1, A2).
 
 People: only GitLab usernames and pseudonyms already in the sources. Git and Lean identities (emails, names, hosts)
 become a pseudonym G-<6 hex> of the email; Lean's audit file names (<host>-<6 hex>.jsonl) become L-<6 hex>; emails
@@ -45,6 +48,7 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 
 from . import lean, reflect, sign, usage
+from .bridge.ledger import RESERVED
 from .common import BrainError, JIRA_RE, USER_RE, git, iso, utcnow
 
 SCHEMA = 1
@@ -352,6 +356,46 @@ def _has(repo, rev, path) -> bool:
     return git(repo, "cat-file", "-e", "%s:%s" % (rev, path), check=False).returncode == 0
 
 
+def _handoff_in(text):
+    """The hand-over request in a run.json text (a non-empty object), or None."""
+    try:
+        r = json.loads(text or "null")
+    except ValueError:
+        return None
+    h = r.get("handoff") if isinstance(r, dict) else None
+    return h if isinstance(h, dict) and h else None
+
+
+def _asks(texts) -> list:
+    """Indexes of the run.json versions (oldest first) that ask for a hand-over: the hand-over is set and differs
+    from the version before (each `brain handoff` writes a new one)."""
+    out, prev = [], None
+    for i, text in enumerate(texts):
+        h = _handoff_in(text)
+        if h and h != prev:
+            out.append(i)
+        prev = h
+    return out
+
+
+def _subject(repo, sha) -> str:
+    return (_g(repo, "log", "-1", "--format=%s", sha) or "").strip()
+
+
+def _outside(cfg, files) -> list:
+    """The files that are not the Brain, a run's records or Lean's records (brain/, runs/, aidlc-docs/)."""
+    mine = tuple(d.rstrip("/") + "/" for d in (cfg["brain_dir"], cfg["runs_dir"], lean.DOCS))
+    return [f for f in files if not f.startswith(mine)]
+
+
+def _changed(repo, sha) -> list:
+    """The files a commit changes against its first parent (a merge too: what it brought into the branch)."""
+    ps = _parents(repo, sha)
+    args = [ps[0], sha] if ps else ["--root", sha]
+    out = _raw(repo, "diff-tree", "-r", "-z", "--no-commit-id", "--name-only", "--no-renames", *args) or ""
+    return [x for x in out.split("\0") if x]
+
+
 def _refs(repo) -> dict:
     """{ref name: sha} of the local branches and origin's, in one `git for-each-ref`."""
     out = _g(repo, "for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/remotes/origin/") or ""
@@ -464,18 +508,24 @@ def run_stretch(repo, cfg, dref, start, key, intent, branch, floor=None, pids=No
           branch's commits (`pids`: a rebased copy) is the run's;
       R2  a merge commit is the run's when it was made on the run branch (subject "Merge ... into <branch>": main or
           origin merged into the branch) or by the bot (kit.json bot_emails); any other merge ends the stretch;
-      R3  a person's (not the bot's) revert ("This reverts commit", 'Revert "') or commit whose message names KEY
-          with a fix word (FIX_RE), and anyone's commit that touches another run's runs/<KEY2>/, end the stretch:
-          never the run's (the bot works only on its run: its reverts and fixes are the run's, R4);
+      R3  after the hand-over (the last commit whose run.json asks for one: `brain handoff`), a person's (not the
+          bot's) revert ("This reverts commit", 'Revert "') or commit whose message names KEY with a fix word
+          (FIX_RE) ends the stretch: never the run's (the bot works only on its run: its reverts and fixes are the
+          run's, R4). Before it they are the owner's local half (R5). Anyone's commit that touches another run's
+          runs/<KEY2>/ ends the stretch wherever it is;
       R4  a commit that touches runs/<KEY>/ or aidlc-docs/<intent>/, or that the bot made, is the run's;
       R5  any other commit (a person's push that names nothing) is the run's only when a later commit is (R1, R2, R4).
     The stretch is S up to its last own commit."""
     parent = (_parents(repo, start) or [None])[0]
-    shas = (_g(repo, "rev-list", "--first-parent", "--reverse", ("%s..%s" % (parent, dref)) if parent else dref)
-            or "").split()
+    rng = ("%s..%s" % (parent, dref)) if parent else dref
+    shas = (_g(repo, "rev-list", "--first-parent", "--reverse", rng) or "").split()
     shas = shas[shas.index(start):] if start in shas else []
     if not shas:
         return [], set()
+    rp = "%s/%s/run.json" % (cfg["runs_dir"], key)
+    asked = (_g(repo, "log", "--first-parent", "--reverse", "--format=%H", rng, "--", rp) or "").split()
+    pos = {h: i for i, h in enumerate(shas)}
+    handed = max([pos.get(asked[i], -1) for i in _asks(_blobs(repo, ["%s:%s" % (h, rp) for h in asked]))] or [-1])
     pid = _pid_of(repo, shas[:n + 5]) if pids else {}
     if floor and floor not in shas:   # the branch's commit came in through a second parent
         floor = merge_of(repo, floor, dref)
@@ -497,7 +547,8 @@ def run_stretch(repo, cfg, dref, start, key, intent, branch, floor=None, pids=No
                 if not (bot or (m and branch and m.group("into") == branch)):
                     return shas[:last + 1], copies
                 own = True
-            elif (not bot and (REVERT_RE.search(c["msg"]) or (key_re.search(c["msg"]) and FIX_RE.search(c["msg"])))) \
+            elif (i > handed and not bot and (REVERT_RE.search(c["msg"]) or (key_re.search(c["msg"]) and
+                                                                            FIX_RE.search(c["msg"])))) \
                     or any(f.startswith(runs) and JIRA_RE.match(f[len(runs):].split("/", 1)[0])
                            and f[len(runs):].split("/", 1)[0] != key for f in c["files"]):   # R3
                 return shas[:last + 1], copies
@@ -539,9 +590,9 @@ def _same_changes(repo, base, tip, squash) -> str:
         "the squash commit differs from the branch's changes (conflicts resolved, or the branch moved on)"
 
 
-def landing(repo, cfg, dref, key, intent, branch, copies, refs=None):
+def landing(repo, cfg, dref, key, intent, branch, copies, refs=None, _depth=0):
     """How the run reached the default branch, without asking GitLab (docs/eval.md §2, rules M1-M6), or None.
-    {"merge": {commit, at, how, src, own?, note?}, "tip": the run's last commit as merged, "tip_src",
+    {"merge": {commit, at, how, src, own?, note?, via?}, "tip": the run's last commit as merged, "tip_src",
      "notes": [what was not used], "exclude": [commits whose history is not the run's]}.
     S = the first commit on the default branch's first-parent line that brought runs/<KEY>/run.json."""
     rp = "%s/%s/run.json" % (cfg["runs_dir"], key)
@@ -555,7 +606,21 @@ def landing(repo, cfg, dref, key, intent, branch, copies, refs=None):
                if branch and len(ps) >= 2 and subject == GITLAB_MERGE % (branch, cfg["default_branch"])), None)
     sp = _parents(repo, s)
     if not mc and len(sp) >= 2 and _has(repo, sp[1], rp):
-        mc = (s, sp, "the merge commit %s that brought %s" % (s[:12], rp))
+        subject = _subject(repo, s)
+        into = MERGE_INTO_RE.match(subject)
+        if into and into.group("into") not in (cfg["default_branch"], branch):
+            # M1b: S was made on another branch ("Merge branch 'main' into '<other run>'": that run brought main in)
+            # and then fast-forwarded into the default branch: not this run's merge. The run came in through S's
+            # second parent: its merge is looked for on that commit's first-parent line
+            inner = landing(repo, cfg, sp[1], key, intent, branch, copies, refs, _depth + 1) if _depth < 4 else None
+            if inner:
+                inner["merge"]["via"] = "%s's first-parent line runs through %s, \"%s\" (made on %s, then " \
+                                        "fast-forwarded): the run came in through its second parent %s" % (
+                                            dref if not _depth else dref[:12], s[:12], subject[:120],
+                                            into.group("into"), sp[1][:12])
+                return inner
+        else:
+            mc = (s, sp, "the merge commit %s that brought %s" % (s[:12], rp))
     if mc:
         h, (m1, p2), found = mc[0], mc[1][:2], mc[2]
         mp = _parents(repo, p2) if tip else []
@@ -684,7 +749,7 @@ def git_history(repo, cfg, rec, ref, key, refs=None):
     copies = copies_of(repo, branch, ref, refs)
     tip, tip_how, tip_note = freshest(repo, copies)
     out = {"tip": tip, "tip_src": tip_how, "tip_note": tip_note, "default_ref": dref, "merge": None, "commits": None,
-           "range": None, "handover_commit": None, "park": None}
+           "range": None, "handover_commit": None, "park": None, "requests": [], "_log": [], "_rp": rp}
     land = landing(repo, cfg, dref, key, intent, branch, copies, refs)
     if land:
         out["merge"] = land["merge"]
@@ -714,27 +779,17 @@ def git_history(repo, cfg, rec, ref, key, refs=None):
                         "records_only": bool(c["files"]) and all(f.startswith((lean.DOCS + "/", cfg["runs_dir"] + "/"))
                                                                   for f in c["files"]),
                         "merge": len(c["parents"]) > 1, "after_handover": None, "src": "git log " + out["range"]})
-    # the hand-over commit (the first whose run.json has a handoff) and park.json's versions: one read for all
+    # the hand-over requests (each `brain handoff` commit: run.json asks for a new one) and park.json's versions, in
+    # one read; which request handed the run over is decided with the bridge's records (handover(), rules H1-H4)
     rps = [c for c in log if rp in c["files"]]
     pps = [c for c in log if pp in c["files"]]
     texts = _blobs(repo, ["%s:%s" % (c["sha"], rp) for c in rps] + ["%s:%s" % (c["sha"], pp) for c in pps])
-    hand = None
-    for c, text in zip(rps, texts):
-        try:
-            r = json.loads(text or "null")
-        except ValueError:
-            continue
-        if isinstance(r, dict) and r.get("handoff"):
-            hand = c["sha"]
-            break
-    out["handover_commit"] = hand
-    if hand:
-        before = _ancestry(log, hand)
-        for c in commits:
-            c["after_handover"] = c["sha"] not in before
-    elif not rec.get("handoff"):
-        for c in commits:
-            c["after_handover"] = False
+    for i in _asks(texts[:len(rps)]):
+        c, h = rps[i], _handoff_in(texts[i])
+        out["requests"].append({"commit": c["sha"], "at": _utc(h.get("requested_at")) or c["authored"],
+                                "by": h["by"] if isinstance(h.get("by"), str) and USER_RE.match(h["by"]) else None,
+                                "src": "%s@%s" % (rp, c["sha"][:12]), "_h": h})
+    out["_log"], out["_exclude"] = log, rng[1:]
     out["commits"] = commits
     park, last = [], None
     for c, text in zip(pps, texts[len(rps):]):
@@ -767,14 +822,78 @@ def _park_row(raw, src, at, commit=None):
             "question_sha256": _sha(q.encode())[:12] if isinstance(q, str) else None, "src": src}
 
 
+def handover(repo, hist, rec_handoff, led, vouchers) -> dict:
+    """Which `brain handoff` handed the run over (docs/eval.md §2, rules H1-H4). A request is a commit of the run
+    whose run.json asks for a new hand-over (hist["requests"], oldest first); `led` is None when no ledger was read.
+      H1  the bridge accepted a hand-over: a hand-over voucher (its signature not bad), a ledger hand-over row
+          'accepted', or a ledger run (not one being signed); the first of them. The hand-over is the last request
+          at or before its commit: the commit itself or one of its ancestors; for a rebased copy, the request whose
+          run.json hand-over is the same; else the last request made before the bridge accepted it.
+      H2  nothing accepted, and the ledger has the bridge refusing a request: not handed over (the runner never had
+          the run; what the owner did next is the local half).
+      H3  nothing accepted, the ledger has no row for any request, and the bot made no commit after the first one:
+          not handed over (`brain handoff` stopped before the label, exit 1; or the bridge has not checked it yet).
+      H4  no record from the bridge: the last request before the bot's first commit after a request (an earlier one
+          did not go through); no bot commit: the last request. Without the run's commits: what run.json says.
+    -> {"value", "commit", "at", "rule", "how", "bridge_accepted", "requests"}."""
+    reqs, log, commits = hist.get("requests") or [], hist.get("_log") or [], hist.get("commits")
+    in_log = {c["sha"] for c in log}
+    rec_at = _utc(rec_handoff.get("requested_at")) if rec_handoff else None
+    acc = []
+    for v in vouchers:
+        if v.get("kind") == "handoff" and isinstance(v.get("sha"), str) and v.get("_sig") != "bad":
+            acc.append((_utc(v.get("issued_at")) or "~", v["sha"], "hand-over voucher %s" % v.get("_src")))
+    for h in (led or {}).get("handoffs", []):
+        if h["state"] == "accepted":
+            acc.append((_utc(h["updated"]) or "~", str(h["sha"]).split("#", 1)[0], "bridge ledger handoffs (accepted)"))
+    for r in (led or {}).get("runs", []):
+        if r["state"] != RESERVED:
+            acc.append((_utc(r["created"]) or "~", str(r["sha"]), "bridge ledger runs (%s)" % r["run_id"]))
+    out = {"requests": len(reqs), "bridge_accepted": True if acc else (False if led is not None else None)}
+    if acc:
+        at, sha, src = min(acc)
+        cands = []
+        if sha in in_log:
+            before = _ancestry(log, sha)
+            cands = [r for r in reqs if r["commit"] in before]
+        elif reqs and _commit(repo, sha):
+            h = _handoff_in(_show(repo, sha, hist["_rp"]))
+            cands = [r for r in reqs if h and r["_h"] == h] or [r for r in reqs if _ancestor(repo, r["commit"], sha)]
+        if not cands and at != "~":
+            cands = [r for r in reqs if r["at"] and r["at"] <= at]
+        r = cands[-1] if cands else None
+        return dict(out, value=True, commit=r["commit"] if r else (sha if sha in in_log else None),
+                    at=r["at"] if r else rec_at, rule="H1",
+                    how="the bridge accepted the hand-over at %s (%s)" % (sha[:12], src))
+    if led is not None and any(h["state"] == "rejected" for h in led.get("handoffs", [])):
+        return dict(out, value=False, commit=None, at=None, rule="H2",
+                    how="the bridge refused the hand-over and accepted none: the run stayed local")
+    pos = {c["sha"]: i for i, c in enumerate(commits or [])}
+    asked = [(pos[r["commit"]], r) for r in reqs if r["commit"] in pos]
+    bot = next((i for i, c in enumerate(commits or []) if c["by"] == "bot" and asked and i > asked[0][0]), None)
+    if led is not None and not led.get("handoffs") and asked and bot is None:
+        return dict(out, value=False, commit=None, at=None, rule="H3",
+                    how="the bridge ledger has no record of a hand-over and the runner made no commit after it")
+    if asked:
+        r = [x for i, x in asked if bot is None or i < bot][-1]
+        return dict(out, value=True, commit=r["commit"], at=r["at"], rule="H4",
+                    how="no hand-over record from the bridge: the last `brain handoff` commit %s"
+                        % ("before the runner's first commit" if bot is not None else "(the runner made no commit)"))
+    return dict(out, value=bool(rec_handoff), commit=None, at=rec_at, rule="H4" if rec_handoff else None,
+                how="run.json's handoff (the run's commits are not here)" if rec_handoff else "run.json has no handoff")
+
+
 def after_merge(repo, cfg, key, merge, commits, dref, as_of, refs=None):
     """Reverts, hotfix commits and defect claims within WINDOW_DAYS after the merge. Messages are read, not kept.
     "After the merge" = on the default branch and not in the merge's history (no `git log --since`: one commit with
     an older committer date would stop the walk); the window is then judged by each commit's committer date. The
-    run's own commits (the branch's, and its copies on the default branch) are never a hotfix. A claim counts as a
+    run's own commits (the branch's, and its copies on the default branch) are never a hotfix, and neither is a
+    commit that changes only the Brain, run records or Lean records (brain/, runs/, aidlc-docs/: `brain reflect
+    --apply` and its MR name the key, and a gap's title often holds a fix word); those are listed in `ignored`. A
+    commit at the very second of the merge is after it when it is not in the merge's history. A claim counts as a
     defect only when it reports one (source product or alert, or an old claim without a source)."""
     if not merge or not merge.get("at"):
-        return {"value": None, "window_closed": None, "window_end": None, "evidence": [],
+        return {"value": None, "window_closed": None, "window_end": None, "evidence": [], "ignored": [],
                 "src": "no merge found", "rules": None}
     start = _dt(merge["at"])
     end = start + timedelta(days=WINDOW_DAYS)
@@ -782,20 +901,26 @@ def after_merge(repo, cfg, key, merge, commits, dref, as_of, refs=None):
     until = min(end, as_of)            # judged "as of": later commits are not looked at
     own = {c["sha"] for c in commits or []} | {merge["commit"]} | set(merge.get("own") or [])
     key_re = re.compile(r"(?<![A-Za-z0-9-])%s(?![0-9])" % re.escape(key))
-    ev = []
+    ev, ignored = [], []
     log = _g(repo, "log", "--format=%x01%H%x00%cI%x00%B", dref, "^" + merge["commit"]) or ""
     for chunk in log.split("\x01")[1:]:
         h, cd, body = (chunk.split("\0", 2) + ["", ""])[:3]
         if h in own:
             continue
         at = _utc(cd)
-        if not at or _dt(at) <= start or _dt(at) > until:
+        if not at or _dt(at) < start or _dt(at) > until:
             continue
         rv = [s for s in REVERTS_RE.findall(body) if any(o.startswith(s) for o in own)]
-        if rv:
-            ev.append({"sha": h, "at": at, "rule": "reverts %s" % rv[0][:12], "src": "git log %s" % dref})
-        elif key_re.search(body) and FIX_RE.search(body):
-            ev.append({"sha": h, "at": at, "rule": "names %s with a fix word" % key, "src": "git log %s" % dref})
+        rule = "reverts %s" % rv[0][:12] if rv else "names %s with a fix word" % key if (
+            key_re.search(body) and FIX_RE.search(body)) else None
+        if not rule:
+            continue
+        row = {"sha": h, "at": at, "rule": rule, "src": "git log %s" % dref}
+        if _outside(cfg, _changed(repo, h)):
+            ev.append(row)
+        else:
+            ignored.append(dict(row, why="changes only %s/, %s/ or %s/" % (cfg["brain_dir"], cfg["runs_dir"],
+                                                                          lean.DOCS)))
     refs = _refs(repo) if refs is None else refs
     claims = sorted(r for r in refs if r.startswith(("refs/heads/claim/", "refs/remotes/origin/claim/")) and
                     r.rsplit("/", 1)[-1] != key)
@@ -812,14 +937,17 @@ def after_merge(repo, cfg, key, merge, commits, dref, as_of, refs=None):
             continue
         at = _utc(doc.get("created_at"))
         title = str(doc.get("title") or "")
-        if at and start < _dt(at) <= until and key_re.search(title) and FIX_RE.search(title):
+        if at and start <= _dt(at) <= until and key_re.search(title) and FIX_RE.search(title):
             seen.add(k2)
             ev.append({"claim": "claim/" + k2, "at": at, "rule": "defect claim names %s" % key, "src": r})
     return {"value": True if ev else (False if closed else None), "window_closed": closed, "window_end": iso(end),
             "evidence": sorted(ev, key=lambda x: (x["at"], x.get("sha", x.get("claim")))),
+            "ignored": sorted(ignored, key=lambda x: (x["at"], x["sha"])),
             "rules": "revert of a run commit; a commit after the merge (not one of the run's own) naming %s with "
-                     "hotfix/fix/bug/defect/revert/修复/热修/回滚/缺陷; a new claim/<KEY> reporting a defect (source "
-                     "product or alert, or none) whose title names %s with such a word" % (key, key),
+                     "hotfix/fix/bug/defect/revert/修复/热修/回滚/缺陷; either one only when it changes something "
+                     "outside %s/, %s/ and %s/; a new claim/<KEY> reporting a defect (source product or alert, or "
+                     "none) whose title names %s with such a word" % (key, cfg["brain_dir"], cfg["runs_dir"],
+                                                                       lean.DOCS, key),
             "src": "git log %s ^%s, claim/* refs" % (dref, merge["commit"][:12])}
 
 
@@ -932,7 +1060,9 @@ def proposals_of(text, path) -> dict:
 
 # ---------- bridge ledger and vouchers ----------
 
-def ledger_rows(path, key):
+def ledger_rows(path, key, shas=()):
+    """The bridge ledger's rows for this requirement: its runs, the hand-over checks of their MRs and of the commits
+    in `shas` (the run's `brain handoff` commits: a refused hand-over has no run), and the runs' decisions."""
     if not os.path.exists(path):
         raise BrainError("bridge ledger %s not found" % path)
     uri = "file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(path))
@@ -945,10 +1075,17 @@ def ledger_rows(path, key):
             "ORDER BY created, run_id", (key,))] if "runs" in tables else []
         handoffs = []
         if "handoffs" in tables:
+            cols = "SELECT project, iid, sha, state, run_id, voucher_id, reason, created, updated FROM handoffs "
             for pi in sorted({(r["project"], r["iid"]) for r in runs}):
-                handoffs += [dict(r) for r in db.execute(
-                    "SELECT project, iid, sha, state, run_id, voucher_id, reason, created, updated FROM handoffs "
-                    "WHERE project=? AND iid=? ORDER BY created, sha", pi)]
+                handoffs += [dict(r) for r in db.execute(cols + "WHERE project=? AND iid=? ORDER BY created, sha", pi)]
+            have = {(h["project"], h["iid"], h["sha"]) for h in handoffs}
+            todo = sorted({s for s in shas if isinstance(s, str) and s})
+            for k in range(0, len(todo), 400):   # sha = "<commit>#<label event>"
+                q = cols + "WHERE (CASE WHEN instr(sha, '#') > 0 THEN substr(sha, 1, instr(sha, '#') - 1) ELSE sha " \
+                           "END) IN (%s) ORDER BY created, sha" % ",".join("?" * len(todo[k:k + 400]))
+                handoffs += [dict(r) for r in db.execute(q, todo[k:k + 400])
+                             if (r["project"], r["iid"], r["sha"]) not in have]
+            handoffs.sort(key=lambda h: (str(h["created"]), str(h["sha"])))
         decisions = []
         if "decisions" in tables and runs:
             q = "SELECT id, run_id, kind, lean_request, state, answer, answerer, voucher_id, sha, created, updated " \
@@ -1053,6 +1190,50 @@ def cost_of(recs, why=NOT_PASSED) -> dict:
             "tokens_why": NO_TOKENS, "src": "passed in by the KiroCrew app"}
 
 
+# ---------- an open run: when it last moved, what it waits on ----------
+
+OPEN_QUESTION = ("open", "posting", "asking")
+
+
+def last_activity(events, hist, led, vouchers) -> dict:
+    """{"at", "src"}: the latest time anything happened on the run (a commit made or landed, a Lean record, a park
+    question, a bridge ledger row changed, a voucher issued), or at None."""
+    marks = [(e["_at"], e["_src"]) for e in events if e.get("_at")]
+    marks += [(x, c["src"]) for c in hist["commits"] or [] for x in (c["at"], c["committed_at"]) if x]
+    marks += [(q["at"], q["src"]) for q in hist["park"] or [] if q.get("at")]
+    for table in ("runs", "handoffs", "decisions"):
+        for r in (led or {}).get(table, []):
+            for x in (r.get("created"), r.get("updated")):
+                if _utc(x):
+                    marks.append((_utc(x), "bridge ledger %s" % table))
+    marks += [(_utc(v.get("issued_at")), str(v.get("_src"))) for v in vouchers if _utc(v.get("issued_at"))]
+    marks = [m for m in marks if m[0] and not DATE_RE.match(m[0])]
+    at, src = max(marks) if marks else (None, None)
+    return {"at": at, "src": src}
+
+
+def waiting_on(repo, cfg, key, tree, hist, decisions):
+    """What an unmerged run waits on: its park.json now (at the run's tip) when it is waiting, or an open bridge
+    question. {"kind", "ask", "lean_request", "since", "decision", "src"} or None."""
+    pp = "%s/%s/park.json" % (cfg["runs_dir"], key)
+    text = _show(repo, hist["tip"], pp) if hist.get("tip") else tree.read(pp)
+    row = _park_row(text, "%s@%s" % (pp, hist["tip"][:12]) if hist.get("tip") else "%s (%s)" % (pp, tree.label),
+                    None)
+    open_q = [d for d in decisions if d["source"] == "bridge" and not d.get("choice") and d.get("state") in
+              OPEN_QUESTION]
+    if row and row["status"] == "waiting":
+        same = [q for q in hist["park"] or [] if (q["kind"], q["lean_request"], q["question_sha256"]) ==
+                (row["kind"], row["lean_request"], row["question_sha256"]) and q["status"] == "waiting"]
+        return {"kind": row["kind"], "ask": row["ask"], "lean_request": row["lean_request"],
+                "since": same[0]["at"] if same else None,
+                "decision": open_q[-1]["id"] if open_q else None, "src": row["src"]}
+    if open_q:
+        d = open_q[-1]
+        return {"kind": d.get("kind"), "ask": None, "lean_request": d.get("lean_request"), "since": d.get("asked_at"),
+                "decision": d["id"], "src": "bridge ledger decisions"}
+    return None
+
+
 # ---------- the trace ----------
 
 def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits=None, as_of=None,
@@ -1081,7 +1262,6 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
     owner = rec.get("owner") if isinstance(rec.get("owner"), str) and USER_RE.match(rec.get("owner")) else None
     branch = rec.get("branch") if isinstance(rec.get("branch"), str) and rec.get("branch") else None
     handoff = rec.get("handoff") if isinstance(rec.get("handoff"), dict) else None
-    handoff_at = _utc(handoff.get("requested_at")) if handoff else None
     missing = ["%s: %s is not a %s (ignored)" % (run_src, f, what) for f, what in (
         ("intent", "string"), ("branch", "string"), ("brain_commit", "string"), ("handoff", "JSON object"))
         if rec.get(f) is not None and not isinstance(rec[f], dict if f == "handoff" else str)]
@@ -1097,7 +1277,7 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
     refs = _refs(repo)
     hist = git_history(repo, cfg, rec, ref, key, refs) if branch else {
         "tip": None, "tip_src": None, "tip_note": None, "default_ref": default_ref(repo, cfg, ref, refs), "merge": None,
-        "commits": None, "range": None, "handover_commit": None, "park": None}
+        "commits": None, "range": None, "handover_commit": None, "park": None, "requests": [], "_log": [], "_rp": rp}
     if hist["tip"] is None:
         missing.append("run branch %s (not found locally, on origin, or as a merge on the default branch)"
                        % branch)
@@ -1107,7 +1287,7 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
 
     led = None
     if ledger_path:
-        led = ledger_rows(ledger_path, key)
+        led = ledger_rows(ledger_path, key, [r["commit"] for r in hist["requests"]])
     else:
         missing.append("bridge ledger (--ledger not given)")
     vouchers = []
@@ -1117,6 +1297,16 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
         missing.append("vouchers (--vouchers not given and no intake store)")
     run_ids = sorted({r["run_id"] for r in (led or {}).get("runs", [])} |
                      {v["run_id"] for v in vouchers if v.get("run_id")})
+
+    # ----- the hand-over (rules H1-H4): which `brain handoff` the runner got, if any -----
+    hand = handover(repo, hist, handoff, led, vouchers)
+    handed, handoff_at = hand["value"], hand["at"]
+    hist["handover_commit"] = hand["commit"]
+    if hist["commits"] is not None:
+        log_shas = {c["sha"] for c in hist["_log"]}
+        before = _ancestry(hist["_log"], hand["commit"]) if handed and hand["commit"] in log_shas else None
+        for c in hist["commits"]:
+            c["after_handover"] = False if not handed else (c["sha"] not in before) if before is not None else None
 
     # ----- decisions -----
     decisions = md_decisions(dec_text, dec_path, cfg.get("bot_users", [])) if dec_text is not None else []
@@ -1229,9 +1419,9 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
                                "voucher_id": None, "judgment_point": False, "after_handover": None,
                                "src": ["passed in by the KiroCrew app (manual)"]})
     for h in humans:
-        if h["after_handover"] is None and h["at"] and handoff_at:
+        if h["after_handover"] is None and h["at"] and handed and handoff_at:
             h["after_handover"] = h["at"] > handoff_at
-        elif h["after_handover"] is None and handoff is None and h["at"]:
+        elif h["after_handover"] is None and not handed:
             h["after_handover"] = False
     humans.sort(key=lambda h: (h["at"] or "", h["kind"], h.get("decision") or "", h.get("sha") or ""))
 
@@ -1243,15 +1433,16 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
     turns = {}
     for e in events:
         if e.get("event") in ("SESSION_START", "SUBAGENT_START", "HUMAN_TURN", "HOST_TURN", "SUBAGENT_PROMPT"):
-            half = "unknown" if not handoff_at and handoff else (
-                "after_handover" if handoff_at and e["_at"] and e["_at"] > handoff_at else "before_handover")
+            half = "unknown" if handed and not handoff_at else (
+                "after_handover" if handed and e["_at"] and e["_at"] > handoff_at else "before_handover")
             t = turns.setdefault(e["event"], {})
             t[half] = t.get(half, 0) + 1
-    handovers = []
-    if handoff:
-        handovers.append({"at": handoff_at, "kind": "requested", "by": handoff.get("by")
+    handovers = [{"at": r["at"], "kind": "requested", "by": r["by"], "commit": r["commit"],
+                  "taken": handed and r["commit"] == hand["commit"], "src": r["src"]} for r in hist["requests"]]
+    if handoff and not handovers:
+        handovers.append({"at": _utc(handoff.get("requested_at")), "kind": "requested", "by": handoff.get("by")
                           if isinstance(handoff.get("by"), str) and USER_RE.match(handoff["by"]) else None,
-                          "commit": hist["handover_commit"], "src": run_src + " handoff"})
+                          "commit": hist["handover_commit"], "taken": handed, "src": run_src + " handoff"})
     for h in (led or {}).get("handoffs", []):
         handovers.append({"at": _utc(h["updated"]), "kind": "bridge " + str(h["state"]), "run_id": h["run_id"],
                           "mr_iid": h["iid"], "sha": str(h["sha"]).split("#", 1)[0],
@@ -1290,18 +1481,27 @@ def build(repo, cfg, key, ref=None, ledger_path=None, vouchers_dir=None, credits
                  "how": merged["how"] if merged else None,
                  "src": merged["src"] if merged else "no merge into %s found" % (hist["default_ref"] or
                                                                                    cfg["default_branch"]),
-                 "note": merged.get("note") if merged else None, "bridge_state": led_states}
+                 "note": merged.get("note") if merged else None, "bridge_state": led_states,
+                 "via": merged.get("via") if merged else None}
     if not merged and led_states and "merged" in led_states:
         merged_at["note"] = "the bridge ledger says the MR was merged, but %s here has no merge of it (fetch it?)" % (
             hist["default_ref"] or cfg["default_branch"])
     outcome = {
-        "handed_over": {"value": bool(handoff), "at": handoff_at,
-                        "bridge_accepted": any(h["kind"] == "bridge accepted" for h in handovers) if led else None,
-                        "src": run_src + " handoff" + ("; bridge ledger handoffs" if led else "")},
+        "handed_over": {"value": handed, "at": handoff_at, "bridge_accepted": hand["bridge_accepted"],
+                        "requested": bool(handoff or hist["requests"]), "requests": hand["requests"],
+                        "commit": hand["commit"], "rule": hand["rule"], "how": hand["how"],
+                        "src": run_src + " handoff; the run's `brain handoff` commits" +
+                               ("; bridge ledger handoffs and runs" if led is not None else "") +
+                               ("; hand-over vouchers" if any(v.get("kind") == "handoff" for v in vouchers) else "")},
         "accepted": accepted,
         "merged_at": merged_at,
         "reverted_or_hotfixed_within_14d": after_merge(repo, cfg, key, merged, hist["commits"], hist["default_ref"],
                                                        as_of_dt, refs),
+        "bridge_runs": [{"run_id": r["run_id"], "state": r["state"], "created": _utc(r["created"]),
+                         "updated": _utc(r["updated"]), "src": "bridge ledger runs"}
+                        for r in led["runs"]] if led is not None else None,
+        "last_activity": last_activity(events, hist, led, vouchers),
+        "waiting_on": None if merged else waiting_on(repo, cfg, key, tree, hist, decisions),
     }
 
     if credits is None:
@@ -1389,14 +1589,28 @@ def render(t) -> str:
         "（一次通过）" if o["accepted"]["first_time"] else ("（驳回 %d 次）" % o["accepted"]["rejections"]
                                                        if o["accepted"]["rejections"] else ""),
         m["value"] or "没有", "（%s）" % m["how"] if m.get("how") else ""))
+    ho = o["handed_over"]
+    if ho.get("requested") and (not ho["value"] or (ho.get("requests") or 0) > 1):
+        out.append("  交接：%s（`brain handoff` %d 次；%s）" % ("交接的是 %s" % ho["commit"][:12] if ho["value"] and
+                                                         ho.get("commit") else "是" if ho["value"] else "没有交接",
+                                                         ho.get("requests") or 0, ho.get("how")))
+    if m.get("via"):
+        out.append("  " + m["via"])
     if m.get("note"):
         out.append("  " + m["note"])
+    w = o.get("waiting_on")
+    if w:
+        out.append("  在等：%s%s（从 %s 起）" % (w["kind"] or "?", " " + w["lean_request"] if w["lean_request"] else "",
+                                         w["since"] or "?"))
+    if o.get("last_activity", {}).get("at") and not m["value"]:
+        out.append("  最后一次有动静：%s" % o["last_activity"]["at"])
     r = o["reverted_or_hotfixed_within_14d"]
     if r["window_end"]:
         out.append("14 天内回滚/热修/缺陷：%s（窗口到 %s%s）" % (
             {True: "有", False: "没有", None: "还不知道"}[r["value"]], r["window_end"],
             "，已结束" if r["window_closed"] else "，还没结束"))
         out += ["  %s %s %s" % (x["at"], (x.get("sha") or x.get("claim", ""))[:12], x["rule"]) for x in r["evidence"]]
+        out += ["  不算：%s %s %s（%s）" % (x["at"], x["sha"][:12], x["rule"], x["why"]) for x in r.get("ignored") or []]
     if t["missing"]:
         out.append("")
         out.append("没读到：" + "；".join(t["missing"]))

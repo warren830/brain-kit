@@ -113,9 +113,13 @@ class AnswerIsBoundToItsQuestion(unittest.TestCase):
         self.assertEqual(decision(t)["state"], "void")
         self.assertTrue(any(n["body"].startswith("D-1 作废") and why in n["body"] for n in t.notes_db[5]),
                         [n["body"] for n in t.notes_db[5]])
-        self.assertEqual(len(t.sends()), 1)                       # the hand-over only: no answer reached the run
+        # no answer reached the run: after the hand-over, at most the notice that D-1 is void (QA r3 #3: it is told
+        # to push again; a deleted question is left to people)
+        later = [s["message"] for s in t.sends()[1:]]
+        self.assertTrue(all(m.startswith("问题作废：D-1") for m in later) and len(later) <= 1, later)
         t.reply(5, "alice", "answer D-1 A")
         self.assertEqual(t.bridge.collect(), 0)                   # and never later
+        self.assertEqual([s["message"] for s in t.sends()[1:]], later)
 
     def test_first_line_names_the_commit_and_park(self):
         sha, q = self.ask()

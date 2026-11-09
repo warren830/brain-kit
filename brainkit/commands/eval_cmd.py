@@ -1,6 +1,7 @@
 """`brain eval`: Eval v1 over all runs (brainkit/evaluate.py).
 
-  brain eval [--ref REF] [--since DATE] [--json] [--credits FILE] [--ledger PATH] [--vouchers DIR]
+  brain eval [--ref REF] [--since DATE] [--json] [--credits FILE] [--ledger PATH] [--vouchers DIR] [--stuck-hours N]
+              runs: the tree's (merged), the unmerged ones on <prefix>/* branches here, and the ledger's
   brain eval gaps [--file] [same options]     knowledge / test / golden-case gaps worth filing; --file files them
                                               as intents (source eval-gap) when brainkit.intents is installed
 """
@@ -20,7 +21,8 @@ GAP_KIND = {"knowledge": "knowledge", "test": "test", "golden": "other"}
 def _data(a, repo, cfg):
     return EV.collect(repo, cfg, ref=a.ref, since=a.since, ledger_path=a.ledger,
                       vouchers_dir=a.vouchers or default_vouchers(repo), credits=load_credits(a.credits),
-                      as_of=a.as_of, allowed_signers=a.allowed_signers, min_runs=a.min_runs)
+                      as_of=a.as_of, allowed_signers=a.allowed_signers, min_runs=a.min_runs,
+                      stuck_hours=a.stuck_hours)
 
 
 def _intents_add():
@@ -113,6 +115,8 @@ def _eval_args(s, suppress=False):
     s.add_argument("--since", help="only this period: from this date (YYYY-MM-DD)", **d)
     s.add_argument("--min-runs", type=int, help="loaded by this many runs and never cited = withdraw candidate",
                    **(d or {"default": 3}))
+    s.add_argument("--stuck-hours", type=float, help="an unmerged run with nothing new for this many hours is stuck "
+                   "(review queue; default %g)" % EV.STUCK_HOURS, **(d or {"default": EV.STUCK_HOURS}))
 
 
 def register(sub):

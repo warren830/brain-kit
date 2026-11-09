@@ -26,6 +26,10 @@ brain-push-rules:
     - if: '$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^ai\//'
   script:
     - git clone -q --depth 1 --branch "${BRAIN_KIT_REF}" "${BRAIN_KIT_REPO}" /tmp/brain-kit
+    # in a pipeline the bot's push started, the hand-over voucher tells the owner's commits from the bot's
+    - git clone -q --depth 1 "${BRAIN_INTAKE_VOUCHERS_REPO}" /tmp/brain-intake
+    - export BRAIN_VOUCHERS_DIR=/tmp/brain-intake/vouchers
+    - export BRAIN_ALLOWED_SIGNERS=/tmp/brain-kit/deploy/allowed_signers
     - python3 /tmp/brain-kit/bin/brain-ci push-rules
 
 # The Brain's rules on every MR (Brain MRs from `brain reflect`, and anything else touching brain/):

@@ -25,19 +25,23 @@ The kit config is read from the default branch, never from the MR branch.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
+import re
 import signal
-import subprocess
 import sys
 import threading
 import time
+from datetime import timedelta
 
 from .. import claims, config as kitconfig, lean, runrec, sign
 from ..intake import package as intake
-from ..common import BrainError, git, iso, later, load_json, parse_branch, plain, utcnow, write_json
+from ..common import (BrainError, NetworkError, git, git_net, iso, later, load_json, parse_branch, parse_iso, plain,
+                      utcnow, write_json)
 from ..rest import DEFAULT_TOKEN_FILE, GitLab, HttpError, Jira, gl_time, head_pushed_at, jira_user_id, read_token
 from .decisions import DecisionLoop
+from .delivery import one_line
 from .kirocrew import KiroCrew
 from .ledger import OPEN_RUN_STATES, Ledger
 
@@ -54,7 +58,12 @@ BRIDGE_DEFAULTS = {
     "contract_ttl_hours": 72,
     "interval": 60,
     "publish_vouchers": False,
-    "publish_timeout": 60,      # seconds for each git push / pull of the vouchers repo (brain-intake)
+    "publish_timeout": 60,      # seconds for each git push / pull of the brain-intake clones (vouchers, materials)
+    "kit_ttl": 0,               # seconds a project's kit.json from main is used before it is read again (0: interval)
+    # GitLab GraphQL (who edited a reply) cannot be read: the answer waits; the MR is told after this many rounds in a
+    # row, or this many minutes since the first
+    "edit_check_rounds": 3,
+    "edit_check_wait_minutes": 30,
     "intake_dir": "",
     "runner_runs_root": "",
     "kirocrew": {"base": "http://127.0.0.1:5476", "app": "brain-bridge", "secret_file": "",
@@ -74,6 +83,25 @@ def load_bridge_config(path) -> dict:
     if not cfg["projects"]:
         raise BrainError("bridge config: projects is empty")
     return cfg
+
+
+# runnerd could not prepare a workspace (spool/failed/<RUN>.json): how often the bridge asks it again after a failure
+# it calls transient (runnerd itself tries such a request up to its own `tries` first), and how long after it gave up
+REQUEUES, REQUEUE_AFTER_S = 2, 300
+SETUP_TELL_AFTER = 3        # rounds of failed KiroCrew session setup before the MR is told (it is retried each round)
+# a run waiting for a person (a question open, being posted, or an answer whose delivery is unknown) holds no
+# session at work: it does not count against max_inflight / max_per_repo
+WAITING_DECISION_STATES = ("open", "posting", "asking", "delivery_unknown")
+
+
+def _paths_meet(path, pattern) -> bool:
+    """Does a run's expected path (a file or a folder) meet a risk-path pattern (ci.glob_match's rules)?"""
+    from ..ci import glob_match
+    pat = pattern.strip()
+    if glob_match(path, pat) or glob_match(path + "/x", pat):
+        return True
+    lit = re.split(r"[*?\[]", pat, 1)[0]
+    return bool(lit) and lit.startswith(path + "/")
 
 
 def _event_order(ev):
@@ -105,6 +133,12 @@ class Bridge(DecisionLoop):
         self.ids = authz.get("users", {})
         self.roles = authz.get("roles", {})
         self._kit = {}
+        self._kit_at = {}
+        self.clock = time.monotonic        # the kit cache's clock (tests set their own)
+        try:
+            self._ids_mtime = os.stat(cfg["identities"]).st_mtime
+        except OSError:
+            self._ids_mtime = None
 
     @property
     def reservation_ttl(self) -> float:
@@ -115,7 +149,18 @@ class Bridge(DecisionLoop):
 
     # ---------- config from the default branch ----------
 
+    @property
+    def kit_ttl(self) -> float:
+        return sign.seconds(self.cfg.get("kit_ttl"), None) or sign.seconds(self.cfg.get("interval"), 60.0)
+
     def kit(self, project) -> dict:
+        """kit.json from the project's default branch, read again once it is kit_ttl old (a change on main takes
+        effect within a round or so; brain-authz identities are read again when their file changes)."""
+        now = self.clock()
+        if project in self._kit and now - self._kit_at.get(project, now) >= self.kit_ttl:
+            del self._kit[project]
+            self._gitlab_me = None              # kit.json bridge_user is checked against the token again
+            self._reload_identities()
         if project not in self._kit:
             default = (self.gl.project(project) or {}).get("default_branch") or ""
             if not default:
@@ -130,7 +175,19 @@ class Bridge(DecisionLoop):
             if probs:
                 raise BrainError("%s: kit config: %s" % (project, "; ".join(probs)))
             self._kit[project] = cfg
+            self._kit_at[project] = now
         return self._kit[project]
+
+    def _reload_identities(self):
+        try:
+            m = os.stat(self.cfg["identities"]).st_mtime
+            if m == self._ids_mtime:
+                return
+            authz = load_json(self.cfg["identities"])
+        except (OSError, ValueError) as e:
+            self.out("identities %s not read again (the ones read before stay): %s" % (self.cfg["identities"], e))
+            return
+        self.ids, self.roles, self._ids_mtime = authz.get("users", {}), authz.get("roles", {}), m
 
     # ---------- checks ----------
 
@@ -297,8 +354,13 @@ class Bridge(DecisionLoop):
         d = self.cfg.get("intake_dir")
         if not d:
             return ["the run uses material packages but the bridge has no intake_dir"]
+        pulled = ""
         if os.path.isdir(os.path.join(d, ".git")):
-            git(d, "pull", "-q", "--ff-only", check=False)
+            try:
+                p = git_net(d, "pull", "-q", "--ff-only", timeout=self.git_timeout, check=False)
+                pulled = "" if p.returncode == 0 else (p.stderr or p.stdout).strip()[:300] or "git pull failed"
+            except NetworkError as e:
+                pulled = str(e)
         probs = []
         for m in materials:
             pdir = os.path.join(d, "packages", m["package"])
@@ -308,7 +370,14 @@ class Bridge(DecisionLoop):
             if intake.manifest_digest(pdir) != m["manifest_sha256"]:
                 probs.append("material %s in brain-intake differs from run.json" % m["package"])
             probs += ["material %s: %s" % (m["package"], x) for x in intake.verify_package(pdir)]
+        if probs and pulled:
+            # the clone could not be brought up to date: not a reason to reject; checked again next round
+            raise NetworkError("brain-intake (%s) could not be updated: %s" % (d, pulled))
         return probs
+
+    @property
+    def git_timeout(self) -> float:
+        return sign.seconds(self.cfg.get("publish_timeout"), 60.0)
 
     def overlaps(self, project, key, paths) -> list:
         """Open runs in the same project whose expected paths overlap these."""
@@ -450,11 +519,50 @@ class Bridge(DecisionLoop):
         self.gl.edit_labels(project, iid, add=[kit["running_label"]], remove=[kit["handoff_label"],
                                                                                 kit["rejected_label"]])
         note = "AI 已接手：%s，凭证 %s，从 %s 继续。" % (run_id, voucher["voucher_id"], sha[:12]) + overlap_note
-        self.gl.comment(project, iid, note)
+        hits = self._risk_hits_quietly(project, kit, f["key"], f["expected_paths"])
+        if hits:
+            note += ("\n\n注意：预计改动碰到风险路径（%s），还没有桥签的设计审批（DESIGN）：run 改这些路径之前会先在这里请求设计"
+                     "审批；本地 Lean 里的设计审批不算。" % "、".join(one_line(x, 100) for x in hits[:5]))
+        self._learn_me(self.gl.comment(project, iid, note))
         if kit["tracker"] == "jira" and self.jira:
             self.jira.comment(f["key"], note + " MR !%d" % iid)
         self.out("accepted %s!%d @%s -> %s" % (project, iid, sha[:12], run_id))
         return "accepted"
+
+    # ---------- risk paths at hand-over ----------
+
+    def risk_paths_hit(self, project, kit, key, paths) -> list:
+        """The risk-path patterns (kit risk_paths_file on the default branch) that the run's expected paths meet,
+        when the bridge has signed no DESIGN approval for `key` yet: brain-run-check (ci.check_route) wants one for
+        a change there, and a local Lean approval is not one. A hint for the hand-over; CI decides."""
+        paths = [str(x).strip().rstrip("/") for x in paths or [] if str(x).strip().rstrip("/")]
+        if not paths:
+            return []
+        raw = self.gl.file_raw(project, kit.get("risk_paths_file") or "gates/risk-paths", kit["default_branch"])
+        if not raw:
+            return []
+        pats = [x.split("#", 1)[0].strip() for x in raw.decode("utf-8", "replace").splitlines()]
+        hits = [x for x in pats if x and plain(x) and len(x) <= 200 and any(_paths_meet(e, x) for e in paths)]
+        return [] if not hits or self.design_approved(key) else hits
+
+    def _risk_hits_quietly(self, project, kit, key, paths) -> list:
+        try:
+            return self.risk_paths_hit(project, kit, key, paths)
+        except (BrainError, ValueError) as e:
+            self.out("%s: risk paths not read: %s" % (key, e))
+            return []
+
+    def design_approved(self, key) -> bool:
+        """Has the bridge signed an approving DESIGN answer for any run of `key` (its own vouchers)?"""
+        for path in glob.glob(os.path.join(self.cfg["vouchers_dir"], "RUN-%s-*" % key, "*.json")):
+            try:
+                v = (load_json(path) or {}).get("voucher") or {}
+            except (OSError, ValueError, AttributeError):
+                continue
+            if isinstance(v, dict) and v.get("kind") == "answer" and v.get("choice") == "approve" and \
+                    str(v.get("lean_request") or "").startswith("DESIGN "):
+                return True
+        return False
 
     def publish(self, run_id, voucher_id):
         """Commit and push the voucher to the brain-intake repo (the bridge is its only writer). Safe to repeat: a
@@ -469,24 +577,15 @@ class Bridge(DecisionLoop):
             self._git_remote(vd, "push", "-q", check=True)
 
     def _git_remote(self, repo, *args, check=False):
-        """A git command that talks to the vouchers repo's remote: never waits for a password prompt, and is
-        stopped after publish_timeout seconds (a hung push must not hold the bridge's round)."""
-        timeout = sign.seconds(self.cfg.get("publish_timeout"), 60.0)
-        cmd = ["git", "-C", repo] + list(args)
-        try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                               env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
-        except subprocess.TimeoutExpired:
-            raise BrainError("%s did not finish within %gs" % (" ".join(cmd), timeout))
-        if check and p.returncode != 0:
-            raise BrainError("command failed (%d): %s\n%s" % (p.returncode, " ".join(cmd),
-                                                              (p.stderr or p.stdout).strip()))
-        return p
+        """A git command that talks to the vouchers repo's remote (common.git_net): never waits for a password
+        prompt, and is stopped after publish_timeout seconds (a hung push must not hold the bridge's round)."""
+        return git_net(repo, *args, timeout=self.git_timeout, check=check)
 
     # ---------- dispatch ----------
 
-    def message(self, v) -> str:
-        """Numbers and hashes only: no requirement text, no approval lines, nothing that can break a line."""
+    def message(self, v, extra=()) -> str:
+        """Numbers and hashes only: no requirement text, no approval lines, nothing that can break a line. `extra`:
+        lines the bridge adds (the risk paths the run is about to meet), from main only."""
         for k in ("voucher_id", "run_id", "branch", "sha", "key", "intent"):
             if not plain(v.get(k)):
                 raise BrainError("voucher field %s is not a plain one-line value" % k)
@@ -494,55 +593,246 @@ class Bridge(DecisionLoop):
                 "按 brain-run 的接手步骤继续：先读 runs/%s/run.json 和 %s/%s/aidlc-state.md；"
                 "本地记录里写的结果一律重新验证。"
                 % (v["voucher_id"], v["run_id"], sign.digest(v)[:16], v["branch"], v["sha"][:12], v["key"],
-                   lean.DOCS, v["intent"]))
+                   lean.DOCS, v["intent"])) + "".join("\n" + x for x in extra if plain(x))
 
     def dispatch(self):
-        ready_dir = os.path.join(self.cfg["spool_dir"], "ready")
-        sent = 0
+        """Send ready runs into KiroCrew (admission limits apply). First, what a stop, a crash or a KiroCrew error
+        left half-sent is settled (recover_runs). A run runnerd could not prepare is asked for again or told on the
+        MR (spool/failed). One run that fails does not hold up the others: the errors are raised at the end."""
+        errors, sent = [], 0
+        try:
+            self.recover_runs()
+        except Exception as e:  # noqa: BLE001
+            errors.append("recover: %s" % e)
         for row in self.ledger.runs_in("spooled"):
-            rf = os.path.join(ready_dir, row["run_id"] + ".json")
-            if not os.path.exists(rf):
+            try:
+                r = self._dispatch_one(row)
+            except Exception as e:  # noqa: BLE001 - logged by the caller; looked at again next round
+                errors.append("%s: %s" % (row["run_id"], e))
                 continue
-            if self.ledger.count("dispatched") >= self.cfg["max_inflight"]:
-                self.out("admission: %d runs in flight; %s waits" % (self.cfg["max_inflight"], row["run_id"]))
+            if r == "full":
                 break
-            if self.ledger.count("dispatched", row["project"]) >= self.cfg["max_per_repo"]:
-                continue
-            ready = load_json(rf)
-            v = json.loads(row["voucher"])  # the bridge's own copy, not the shared spool
-            expect = os.path.realpath(os.path.join(self.cfg["runner_runs_root"], row["run_id"])) \
-                if self.cfg.get("runner_runs_root") else None
-            if expect and os.path.realpath(str(ready.get("path", ""))) != expect:
-                self.ledger.set_run(row["run_id"], "spooled", "failed")
-                self.out("%s: workspace path %r is not %s" % (row["run_id"], ready.get("path"), expect))
-                continue
-            if ready.get("head") != v["sha"]:
-                self.ledger.set_run(row["run_id"], "spooled", "failed")
-                self.out("%s: workspace head %s != contract sha" % (row["run_id"], ready.get("head")))
-                continue
-            if not self.ledger.set_run(row["run_id"], "spooled", "ready", path=ready["path"]):
-                continue
-            slot = row["run_id"].lower()
-            kit = self.kit(row["project"])
-            kc = self.cfg["kirocrew"]
-            try:
-                self.kc.create_slot(slot, kc["agent"], kit["model"], kc.get("memory_mode", "incognito"))
-                self.kc.set_project(slot, ready["path"])
-            except BrainError as e:
-                self.ledger.set_run(row["run_id"], "ready", "spooled")  # nothing was sent: retry next round
-                self.out("%s: session setup failed, will retry: %s" % (row["run_id"], e))
-                continue
-            try:
-                self.kc.send(slot, self.message(v), v["voucher_id"])
-            except BrainError as e:
-                # The send may or may not have landed: never resend automatically (deliver once).
-                self.ledger.set_run(row["run_id"], "ready", "send_unknown", slot=slot)
-                self.out("%s: send outcome unknown, check slot %s by hand: %s" % (row["run_id"], slot, e))
-                continue
-            self.ledger.set_run(row["run_id"], "ready", "dispatched", slot=slot)
-            self.out("dispatched %s to KiroCrew slot %s" % (row["run_id"], slot))
-            sent += 1
+            sent += 1 if r == "dispatched" else 0
+        if errors:
+            raise BrainError("dispatch: not done this round: " + "; ".join(errors))
         return sent
+
+    def active_runs(self, project=None) -> int:
+        """Dispatched runs at work (in `project`): one that waits for a person holds no session at work."""
+        self._ddb()
+        q, args = "SELECT COUNT(*) FROM runs r WHERE r.state='dispatched'", []
+        if project is not None:
+            q, args = q + " AND r.project=?", [project]
+        q += (" AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.run_id=r.run_id AND d.state IN (%s))"
+              % ",".join("?" * len(WAITING_DECISION_STATES)))
+        return self.ledger.db.execute(q, tuple(args) + WAITING_DECISION_STATES).fetchone()[0]
+
+    def _dispatch_one(self, row) -> str:
+        """-> dispatched | unknown (the send's outcome is not known: the MR was told) | waiting | full."""
+        rid = row["run_id"]
+        rf = os.path.join(self.cfg["spool_dir"], "ready", rid + ".json")
+        if not os.path.exists(rf):
+            self._runnerd_failed(row)
+            return "waiting"
+        if self.active_runs() >= self.cfg["max_inflight"]:
+            self.out("admission: %d runs in flight; %s waits" % (self.cfg["max_inflight"], rid))
+            self._tell_queued(row, self.cfg["max_inflight"], None)
+            return "full"
+        if self.active_runs(row["project"]) >= self.cfg["max_per_repo"]:
+            self._tell_queued(row, self.cfg["max_per_repo"], row["project"])
+            return "waiting"
+        ready = load_json(rf)
+        v = json.loads(row["voucher"])  # the bridge's own copy, not the shared spool
+        expect = os.path.realpath(os.path.join(self.cfg["runner_runs_root"], rid)) \
+            if self.cfg.get("runner_runs_root") else None
+        if expect and os.path.realpath(str(ready.get("path", ""))) != expect:
+            self.out("%s: workspace path %r is not %s" % (rid, ready.get("path"), expect))
+            self._fail_run(row, "运行机报的工作区不在运行机的 runs 目录里")
+            return "waiting"
+        if ready.get("head") != v["sha"]:
+            self.out("%s: workspace head %s != contract sha" % (rid, ready.get("head")))
+            self._fail_run(row, "运行机建的工作区不在合同的提交上")
+            return "waiting"
+        kit = self.kit(row["project"])
+        if not self.ledger.set_run(rid, "spooled", "ready", path=ready["path"]):
+            return "waiting"
+        slot = rid.lower()
+        try:
+            existed = self._setup_slot(slot, kit, ready["path"])
+        except Exception as e:  # noqa: BLE001 - nothing was sent: retried next round
+            self.ledger.set_run(rid, "ready", "spooled")
+            self.out("%s: session setup failed, will retry: %s" % (rid, e))
+            if self.ledger.bump("setup:" + rid, rid) >= SETUP_TELL_AFTER:
+                self.tell_mr_once("setup:" + rid, row["project"], row["iid"], "%s 还没开始：KiroCrew 开会话失败（%s）。桥每轮"
+                                  "重试；一直不行的话请负责人看一下 KiroCrew 和 agent %s。"
+                                  % (rid, one_line(e, 200), self.cfg["kirocrew"].get("agent")), run_id=rid)
+            return "waiting"
+        except BaseException:
+            self.ledger.set_run(rid, "ready", "spooled")    # a stop while KiroCrew set the slot up: nothing sent
+            raise
+        vid = v["voucher_id"]
+        msg = self.message(v, extra=self._risk_lines(row, kit))
+        ob, new = self.ledger.outbox_put(vid, rid, slot, "handover:" + rid, msg)
+        if new and existed and self._landed(slot, vid):
+            self.ledger.outbox_set(vid, "sending", "sent")  # an older bridge sent it before it stopped
+            r = "sent"
+        else:
+            r = self._push(vid, slot, msg) if new else self._settle(ob)
+        return self._handover_sent(row, slot, r)
+
+    def _setup_slot(self, slot, kit, path) -> bool:
+        """Open the run's KiroCrew slot and set its project. -> whether the slot was there already (a setup a stop
+        cut off: KiroCrew, or the brain app, refuses to open it twice)."""
+        kc, existed = self.cfg["kirocrew"], False
+        try:
+            self.kc.create_slot(slot, kc["agent"], kit["model"], kc.get("memory_mode", "incognito"))
+        except BrainError:
+            try:
+                existed = isinstance(self.kc.slot(slot), dict)
+            except Exception:  # noqa: BLE001
+                existed = False
+            if not existed:
+                raise
+            self.out("slot %s was opened before (a setup that was cut off); going on" % slot)
+        self.kc.set_project(slot, path)
+        return existed
+
+    def _risk_lines(self, row, kit) -> list:
+        try:
+            paths = json.loads(row["paths"] or "[]")
+        except ValueError:
+            paths = []
+        hits = self._risk_hits_quietly(row["project"], kit, row["req"], paths)
+        if not hits:
+            return []
+        return ["风险路径：预计改动（run.json 的 expected_paths）碰到 %s 里的 %s，桥还没有签过 %s 的设计审批（DESIGN）。本地 Lean "
+                "里的设计审批不算：改这些路径之前，先 `lean request DESIGN`，在 park.json 写 \"lean_request\": \"DESIGN "
+                "<hash>\" 停下来，由桥在 MR 上问；不然 brain-run-check 不会过。"
+                % (kit.get("risk_paths_file") or "gates/risk-paths", "、".join(one_line(x, 100) for x in hits[:5]),
+                   row["req"])]
+
+    def _handover_sent(self, row, slot, r) -> str:
+        rid = row["run_id"]
+        if r == "sent":
+            if self.ledger.set_run(rid, "ready", "dispatched", slot=slot) or \
+                    self.ledger.set_run(rid, "send_unknown", "dispatched", slot=slot):
+                self.out("dispatched %s to KiroCrew slot %s" % (rid, slot))
+                return "dispatched"
+            return "waiting"
+        if r == "unknown":
+            self.ledger.set_run(rid, "ready", "send_unknown", slot=slot)
+            self.out("%s: send outcome unknown (slot %s)" % (rid, slot))
+            self.tell_mr_once("send_unknown:" + rid, row["project"], row["iid"], (
+                "%s 的接手消息不知道送到没有：KiroCrew 出错%s。桥每轮看一下 KiroCrew 会话 %s：确认没送到就用同一个 sendId 再送一次，"
+                "送到了就照常继续；看不了会话的话，请负责人在 KiroCrew 里看一下它。")
+                % (rid, "（%s）" % one_line(self.send_error, 200) if self.send_error else "", slot), run_id=rid)
+            return "unknown"
+        return "waiting"
+
+    def recover_runs(self):
+        """Runs a stop, a crash or a KiroCrew error left half-dispatched:
+          ready         slot setup was cut off (no outbox row: back to spooled once the row is stale; a stop gives it
+                        back on its way out), or the hand-over's send (settled from the outbox);
+          send_unknown  settled from the outbox each round (an older bridge's row gets its message rebuilt from the
+                        voucher, and the MR is told once).
+        (Notices whose send was cut off are settled in collect: recover_answers.) One run that fails does not hold
+        up the others."""
+        errors = []
+        for row in self.ledger.runs_in("ready", "send_unknown"):
+            try:
+                if row["state"] == "ready":
+                    self._recover_ready(row)
+                else:
+                    self._recover_send_unknown(row)
+            except Exception as e:  # noqa: BLE001
+                errors.append("%s: %s" % (row["run_id"], e))
+        if errors:
+            raise BrainError("; ".join(errors))
+
+    def _recover_ready(self, row):
+        ob = self.ledger.outbox(row["voucher_id"])
+        if ob is None:
+            if self._stale(row["updated"]):
+                self.ledger.set_run(row["run_id"], "ready", "spooled")
+                self.out("%s: its slot setup was cut off; dispatched again" % row["run_id"])
+            return
+        self._handover_sent(row, ob["slot"], self._settle(ob))
+
+    def _recover_send_unknown(self, row):
+        rid, slot = row["run_id"], row["slot"] or row["run_id"].lower()
+        ob = self.ledger.outbox(row["voucher_id"])
+        if ob is None:                  # an older bridge's: its message rebuilt from the voucher
+            msg = self.message(json.loads(row["voucher"] or "{}"))
+            self.ledger.outbox_put(row["voucher_id"], rid, slot, "handover:" + rid, msg)
+            self.ledger.outbox_set(row["voucher_id"], "sending", "unknown")
+            self._handover_sent(dict(row, state="ready"), slot, "unknown")           # the MR hears once
+            ob = self.ledger.outbox(row["voucher_id"])
+        if self._settle(ob) == "sent" and self.ledger.set_run(rid, "send_unknown", "dispatched", slot=slot):
+            self.out("%s: its hand-over had landed (or was sent again); dispatched" % rid)
+
+    def _tell_queued(self, row, limit, project):
+        n = self.active_runs(project)
+        self.tell_mr_once("queued:" + row["run_id"], row["project"], row["iid"], "%s 在排队：%s已经有 %d 个 run 在跑（上限 "
+                          "%d），有空位后桥自动开始，不用做什么。" % (row["run_id"], "这个项目" if project else "运行机上", n,
+                                                                   limit), run_id=row["run_id"])
+
+    def _read_failed(self, run_id):
+        p = os.path.join(self.cfg["spool_dir"], "failed", run_id + ".json")
+        if not os.path.exists(p):
+            return None
+        try:
+            f = load_json(p)
+        except (OSError, ValueError):
+            return {"error": "spool/failed/%s.json cannot be read" % run_id}
+        return f if isinstance(f, dict) else {"error": "spool/failed/%s.json is not an object" % run_id}
+
+    def _runnerd_failed(self, row):
+        """runnerd wrote spool/failed/<RUN>.json. While runnerd still tries (a transient failure, not final):
+        nothing. A transient failure it gave up on: asked again (the request's "attempt" goes up; at most REQUEUES
+        times, REQUEUE_AFTER_S after it gave up), and the MR hears once. Anything else: the run is failed, and the
+        MR is told why and what to do."""
+        rid = row["run_id"]
+        f = self._read_failed(rid)
+        if f is None:
+            return
+        asked = self.ledger.count_of("requeue:" + rid)
+        try:
+            attempt = int(f.get("attempt") or 0)
+        except (TypeError, ValueError):
+            attempt = 0
+        if attempt < asked or not f.get("final", True):
+            return                                  # runnerd has not looked at the newer request yet, or still tries
+        err = one_line(f.get("error") or "unknown error", 300)
+        if f.get("transient") and asked < REQUEUES:
+            try:
+                at = parse_iso(str(f.get("at")))
+            except ValueError:
+                at = None
+            if at is not None and utcnow() - at < timedelta(seconds=REQUEUE_AFTER_S):
+                return
+            rp = os.path.join(self.cfg["spool_dir"], "requests", rid + ".json")
+            req = load_json(rp)
+            req["attempt"] = asked + 1
+            write_json(rp, req, mode=0o640)
+            self.ledger.bump("requeue:" + rid, rid)
+            self.out("%s: runnerd failed (%s); asked again (%d/%d)" % (rid, err, asked + 1, REQUEUES))
+            self.tell_mr_once("runnerd-retry:" + rid, row["project"], row["iid"], "%s 的工作区还没建成：运行机这几次都没做成"
+                              "（%s）。桥已经请运行机过一会儿再试，不用做什么；还不行的话这里会再说。" % (rid, err), run_id=rid)
+            return
+        self._fail_run(row, "运行机建工作区失败（%s）" % err)
+
+    def _fail_run(self, row, why):
+        """The run cannot start: failed, and the MR is told once (labels: rejected instead of running)."""
+        rid = row["run_id"]
+        if not self.ledger.set_run(rid, "spooled", "failed"):
+            return
+        self.tell_mr_once("failed:" + rid, row["project"], row["iid"], "%s 没能开始：%s。处理好以后在分支上重新运行 "
+                          "`brain handoff`（它提交交接、推送并打标签），桥会重新接手。" % (rid, why), run_id=rid)
+        try:
+            kit = self.kit(row["project"])
+            self.gl.edit_labels(row["project"], row["iid"], add=[kit["rejected_label"]], remove=[kit["running_label"]])
+        except BrainError as e:
+            self.out("%s: labels not changed: %s" % (rid, e))
 
     # ---------- reconcile ----------
 
@@ -551,17 +841,26 @@ class Bridge(DecisionLoop):
         n = self.ledger.drop_stale(self.reservation_ttl)
         if n:
             self.out("dropped %d stale reservation(s) / hand-over check(s) left by a stopped bridge" % n)
+        errors = []
         for row in self.ledger.runs_in("dispatched", "spooled", "ready", "send_unknown"):
-            mr = self.gl.mr(row["project"], row["iid"])
-            if mr.get("state") in ("merged", "closed"):
-                if row["state"] == "dispatched" and row["slot"] and self.kc:
-                    try:
-                        self.kc.stop(row["slot"])
-                    except BrainError as e:
-                        self.out("%s: stop failed: %s" % (row["run_id"], e))
-                # "merged" and "closed" stay apart: Eval counts deliveries, not abandoned runs
-                self.ledger.set_run(row["run_id"], row["state"], mr.get("state"))
-                self.out("%s %s" % (mr.get("state"), row["run_id"]))
+            try:
+                self._reconcile_one(row)
+            except Exception as e:  # noqa: BLE001 - one MR GitLab will not show must not hold up the others
+                errors.append("%s: %s" % (row["run_id"], e))
+        if errors:
+            raise BrainError("reconcile: not done this round: " + "; ".join(errors))
+
+    def _reconcile_one(self, row):
+        mr = self.gl.mr(row["project"], row["iid"])
+        if mr.get("state") in ("merged", "closed"):
+            if row["state"] == "dispatched" and row["slot"] and self.kc:
+                try:
+                    self.kc.stop(row["slot"])
+                except BrainError as e:
+                    self.out("%s: stop failed: %s" % (row["run_id"], e))
+            # "merged" and "closed" stay apart: Eval counts deliveries, not abandoned runs
+            self.ledger.set_run(row["run_id"], row["state"], mr.get("state"))
+            self.out("%s %s" % (mr.get("state"), row["run_id"]))
 
 
 def build(cfg_path, transport=None):
@@ -617,14 +916,16 @@ def _main(a):
                     continue
                 try:
                     getattr(br, step)()
-                except BrainError as e:
+                except Exception as e:  # noqa: BLE001
                     if a.cmd != "loop":
                         raise
-                    # one bad round (network, GitLab, Midway) must not stop the bridge: log, go on, retry next round
-                    print("brain-bridge: %s failed this round: %s" % (step, e), file=sys.stderr)
+                    # one bad round (network, GitLab, Midway, one run's odd data) must not stop the bridge: log, go
+                    # on, retry next round. A stop (SIGTERM, Ctrl-C) is not an Exception and ends the loop.
+                    print("brain-bridge: %s failed this round: %s%s" % (
+                        step, "" if isinstance(e, BrainError) else type(e).__name__ + ": ", e), file=sys.stderr)
             if a.cmd != "loop":
                 return 0
-            time.sleep(br.cfg["interval"])
+            time.sleep(sign.seconds(br.cfg.get("interval"), 60.0))
     except BrainError as e:
         print("brain-bridge: %s" % e, file=sys.stderr)
         return 2

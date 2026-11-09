@@ -70,6 +70,43 @@ class Runnerd(unittest.TestCase):
         self.request(owner="bob")
         self.fails("do not agree")
 
+    def test_a_kit_branch_prefix_other_than_ai(self):
+        """QA r3: runnerd parsed the branch with the default prefix only; the signed voucher names the branch."""
+        sh("git", "-C", self.origin, "branch", "feat/alice/PAY-1-refund", self.sha)
+        self.request(branch="feat/alice/PAY-1-refund")
+        self.assertEqual(runnerd.once(self.cfg, out=lambda *_: None), 1)
+        self.assertTrue(os.path.exists(os.path.join(self.cfg["spool_dir"], "ready", "RUN-PAY-1-1.json")))
+        self.cfg["branch_prefix"] = "ai"                         # runnerd.json may pin one
+        self.request(run_id="RUN-PAY-1-2", branch="feat/alice/PAY-1-refund")
+        self.assertEqual(runnerd.once(self.cfg, out=lambda *_: None), 1)
+        self.assertIn("do not agree", load_json(os.path.join(self.cfg["spool_dir"], "failed",
+                                                             "RUN-PAY-1-2.json"))["error"])
+
+    def test_a_workspace_left_at_the_contract_sha_is_used_and_one_with_changes_is_not(self):
+        self.request()
+        self.assertEqual(runnerd.once(self.cfg, out=lambda *_: None), 1)
+        path = load_json(os.path.join(self.cfg["spool_dir"], "ready", "RUN-PAY-1-1.json"))["path"]
+        os.unlink(os.path.join(self.cfg["spool_dir"], "ready", "RUN-PAY-1-1.json"))   # as a stopped runnerd left it
+        self.assertEqual(runnerd.once(self.cfg, out=lambda *_: None), 1)
+        self.assertEqual(load_json(os.path.join(self.cfg["spool_dir"], "ready", "RUN-PAY-1-1.json"))["path"], path)
+        os.unlink(os.path.join(self.cfg["spool_dir"], "ready", "RUN-PAY-1-1.json"))
+        with open(os.path.join(path, "src", "a.py"), "w") as f:
+            f.write("changed\n")
+        self.fails("already exists and has changes")
+        self.assertEqual(runnerd.once(self.cfg, out=lambda *_: None), 0)            # final: not tried again
+
+    def test_a_failed_request_the_bridge_asks_for_again_is_tried_again(self):
+        self.request(owner="bob")
+        self.fails("do not agree")
+        p = os.path.join(self.cfg["spool_dir"], "requests", "RUN-PAY-1-1.json")
+        self.request()
+        req = load_json(p)
+        req["attempt"] = 1                                       # what the bridge writes when it asks again
+        write_json(p, req)
+        self.assertEqual(runnerd.once(self.cfg, out=lambda *_: None), 1)
+        self.assertTrue(os.path.exists(os.path.join(self.cfg["spool_dir"], "ready", "RUN-PAY-1-1.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.cfg["spool_dir"], "failed", "RUN-PAY-1-1.json")))
+
 
 if __name__ == "__main__":
     unittest.main()

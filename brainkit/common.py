@@ -66,6 +66,39 @@ def git_out(repo, *args) -> str:
     return git(repo, *args).stdout.strip()
 
 
+class NetworkError(BrainError):
+    """A git command that talks to a remote failed or did not finish in time: worth trying again later."""
+
+
+NET_TIMEOUT = 120.0
+
+
+def git_net(repo, *args, timeout=NET_TIMEOUT, check=True):
+    """A git command that talks to a remote (clone, fetch, pull, push). It never waits for a password prompt, and
+    it is stopped after `timeout` seconds together with everything it started (ssh, a credential helper: they run
+    in its own process group), so a hung connection cannot hold the caller. NetworkError when it times out, or when
+    it fails and `check` is set; otherwise its CompletedProcess."""
+    cmd = ["git", "-C", repo] + list(args)
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, env=env,
+                         start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except BaseException as e:   # the timeout, or a stop (SIGTERM) while it ran: nothing it started stays behind
+        try:
+            os.killpg(p.pid, 9)
+        except (OSError, AttributeError):
+            p.kill()
+        p.communicate()
+        if isinstance(e, subprocess.TimeoutExpired):
+            raise NetworkError("%s did not finish within %gs" % (" ".join(cmd), timeout))
+        raise
+    out, err = out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+    if check and p.returncode != 0:
+        raise NetworkError("command failed (%d): %s\n%s" % (p.returncode, " ".join(cmd), (err or out).strip()))
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
 def repo_root(start=None) -> str:
     p = run(["git", "-C", start or os.getcwd(), "rev-parse", "--show-toplevel"], check=False)
     if p.returncode != 0:

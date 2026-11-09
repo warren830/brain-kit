@@ -46,7 +46,26 @@ KIT_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 TEMPLATES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "templates")
 CREW_AGENT_SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "crew", "brain-dev.json")
 CREW_HOOK = ".kiro/brain/lean-hook.py"
+# The adapter version the team runner needs: 2 lets the run write its own runs/<KEY>/park.json in every Lean approval
+# state (kit/.kiro/brain/lean-hook.py, ADAPTER_VERSION).
+CREW_HOOK_VERSION = 2
 VENDORED_LEAN = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor", "aidlc-lean")
+
+
+def crew_hook_version(text) -> int:
+    """ADAPTER_VERSION of a hook adapter's source (0: none, an adapter older than the park.json allowance)."""
+    m = re.search(r"^ADAPTER_VERSION = ([0-9]+)\b", text or "", re.M)
+    return int(m.group(1)) if m else 0
+
+
+def crew_hook_problem(text) -> str:
+    """Why this adapter source is too old for the team runner, or ''."""
+    have = crew_hook_version(text)
+    if have >= CREW_HOOK_VERSION:
+        return ""
+    return ("%s is an older adapter (version %d, needs %d): the team runner could not write runs/<KEY>/park.json, its "
+            "only way to ask a person, before the Lean approvals; run `brain install` and commit it on main through an "
+            "MR" % (CREW_HOOK, have, CREW_HOOK_VERSION))
 
 
 def crew_agent_path():
@@ -272,6 +291,16 @@ def doctor_checks(repo, cfg, fetch=True) -> list:
         why = mrdesc.write_problem(repo, cfg)
         add(("FAIL", "%s fingerprint_exclude: %s。%s" % (lean.CONFIG, why, mrdesc.exclude_fix(cfg))) if why else
             ("OK", "Lean does not count %s/ as code (%s fingerprint_exclude)" % (cfg["runs_dir"], lean.CONFIG)))
+        hook = os.path.join(repo, CREW_HOOK)
+        if os.path.isfile(hook):
+            with open(hook, encoding="utf-8", errors="replace") as f:
+                why = crew_hook_problem(f.read())
+            add(("FAIL", why) if why else
+                ("OK", "%s lets a run write its own %s/<KEY>/park.json whatever Lean's approvals (version %d)"
+                 % (CREW_HOOK, cfg["runs_dir"], CREW_HOOK_VERSION)))
+        else:
+            add(("FAIL", "%s missing in this repo (run `brain install`): KiroCrew sessions, the team runner's too, run "
+                         "Lean through it" % CREW_HOOK))
     else:
         add(("FAIL", "AI-DLC Lean not installed"))
     agent = os.path.join(repo, ".kiro", "agents", "brain-dev.md")
@@ -453,7 +482,7 @@ def crew_checks(repo) -> list:
                                   % ", ".join(custom)))
         except ValueError:
             out.append(("FAIL", "~/.kiro/agents/brain-dev.json is not valid JSON"))
-    if not os.path.exists(os.path.join(repo, CREW_HOOK)):
+    if not os.path.exists(os.path.join(repo, CREW_HOOK)) and not lean.installed(repo):   # else doctor_checks says it
         out.append(("FAIL", "%s missing in this repo (run `brain install`)" % CREW_HOOK))
     be = run(["kirocrew", "config", "get", "agent.acp_backend"], check=False).stdout.strip().splitlines()
     be = be[-1].strip() if be else ""
@@ -712,7 +741,70 @@ def runner_kit_problems(repo) -> list:
                       (CREW_HOOK, "the KiroCrew hook adapter (brain install wrote it)")):
         if git(repo, "ls-files", "--error-unmatch", "--", path, check=False).returncode != 0:
             probs.append("%s is not committed: %s; commit it on main through an MR" % (path, why))
+        elif path == CREW_HOOK:
+            p = git(repo, "show", ":" + CREW_HOOK, check=False)       # the committed (staged) file, not the disk's
+            why_old = crew_hook_problem(p.stdout if p.returncode == 0 else "")
+            if why_old:
+                probs.append(why_old)
     return probs
+
+
+def _risk_matches(path, pats, prefix=False) -> bool:
+    """Does `path` fall under a risk-paths pattern? prefix=True: `path` is a folder or glob from run.json
+    expected_paths ("src/pay"), which names everything below it too."""
+    from . import ci
+    cands = [path] + ([path.rstrip("/") + "/"] if prefix else [])
+    return any(ci.glob_match(c, x) for c in cands for x in pats)
+
+
+def handoff_risk_warnings(repo, cfg, rec) -> list:
+    """[] or what the owner (and the hand-over note) must know: this run changes, or plans to change (run.json
+    expected_paths), files under gates/risk-paths and no DESIGN approval signed by the bridge covers them yet. brain-ci
+    check-run needs one for the MR; a DESIGN approved in the owner's own Lean chat does not count. So the runner asks
+    for it through the bridge (lean request DESIGN, park.json with lean_request DESIGN) before it writes more code."""
+    from . import ci
+    from .commands.trace_cmd import default_vouchers
+    ref = next((r for r in ("origin/" + cfg["default_branch"], cfg["default_branch"])
+                if git(repo, "rev-parse", "--verify", "-q", r + "^{commit}", check=False).returncode == 0), None)
+    text = git(repo, "show", "%s:%s" % (ref, cfg["risk_paths_file"]), check=False).stdout if ref else ""
+    if not text and os.path.isfile(os.path.join(repo, cfg["risk_paths_file"])):
+        with open(os.path.join(repo, cfg["risk_paths_file"]), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    pats = [x for x in (line.split("#", 1)[0].strip() for line in (text or "").splitlines()) if x]
+    if not pats:
+        return []
+    base = git(repo, "merge-base", ref, "HEAD", check=False).stdout.strip() if ref else ""
+    changed = [p for p in (ci.changed_paths(repo, base, "HEAD") if base else []) if _risk_matches(p, pats)]
+    planned = [p for p in rec.get("expected_paths") or [] if isinstance(p, str) and _risk_matches(p, pats, True)]
+    if not changed and not planned:
+        return []
+    vdir, signers = default_vouchers(repo), os.environ.get("BRAIN_ALLOWED_SIGNERS") or ""
+    if changed and vdir and signers and os.path.isfile(signers):
+        design = "%s/%s/inception/application-design/application-design.md" % (lean.DOCS, rec["intent"])
+        try:
+            vouchers, _ = ci.signed_vouchers(vdir, signers, rec["key"], repo, upstream=base or None)
+            approvals = [v for v in ci.latest_design_answers(repo, vouchers) if v.get("choice") == "approve"]
+            if any(not ci.design_approval_covers(repo, v, design, changed) for v in approvals):
+                return []
+        except (BrainError, OSError, ValueError) as e:
+            print("WARN: bridge-signed DESIGN approvals not checked here (%s)" % e)
+    shown = ", ".join((changed or planned)[:5])
+    out = ["this run %s risk paths (%s; %s) and no DESIGN approval signed by the bridge covers %s yet: brain-ci "
+           "check-run will fail the MR until one does. A DESIGN approved in your own Lean chat does not count. The "
+           "runner asks for it through the bridge (lean request DESIGN, then park.json with lean_request DESIGN) "
+           "before it writes more code." % ("changes" if changed else "plans to change (run.json expected_paths)",
+                                            shown, cfg["risk_paths_file"], "them" if len(changed or planned) > 1
+                                            else "it")]
+    note = lean.state_path(repo, rec["intent"])
+    steps = []
+    if os.path.isfile(note):
+        with open(note, encoding="utf-8", errors="replace") as f:
+            steps = lean.next_steps(f.read())
+    if not any("DESIGN" in s for s in steps):
+        out.append("the hand-over note (%s, ### Next) does not say so; its first item should be: \"Ask for the "
+                   "DESIGN approval through the bridge (risk paths %s) before more code\"" % (
+                       os.path.relpath(note, repo), shown))
+    return out
 
 
 def handoff_description(repo, cfg, key):
@@ -776,6 +868,12 @@ def cmd_handoff(a):
     if why:
         raise BrainError("not handed over: Lean would refuse this run's RELEASE approval later. %s。%s"
                          % (why, mrdesc.exclude_fix(cfg)))
+    try:
+        warnings = handoff_risk_warnings(repo, cfg, rec)
+    except (BrainError, OSError, ValueError) as e:     # a warning only: it never holds up the hand-over
+        warnings = ["risk paths not checked (%s)" % e]
+    for w in warnings:
+        print("WARN: " + w)
     if not a.no_push:
         for w in publish_materials(_store(repo, a.store), rec):
             print("WARN: " + w)

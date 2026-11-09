@@ -50,6 +50,9 @@ in any stage. Ask; do not work around a block.
 When the person says to hand over, or you must wait more than a working day:
 1. Bring `aidlc-docs/<intent>/aidlc-state.md` Session notes up to date: Status, Next (numbered, concrete),
    Open questions, Notes for the next session. Anything not written there is lost.
+   If the change touches a path listed in `gates/risk-paths`, the first Next item is "Ask for the DESIGN approval
+   through the bridge (risk paths <paths>) before more code": CI wants a DESIGN approval signed by the bridge, and
+   one typed in this chat does not count (`brain handoff` warns when it is missing).
 2. Run `brain mr-desc --write`: it writes the MR description `runs/<KEY>/MR.md` from the records (what changed,
    AC evidence, decisions, assumptions, approvals, how to review). Read it. It is generated, never written or edited
    by you: if something reads wrong or is missing, fix the record it comes from (requirements.md, the plan's Tests

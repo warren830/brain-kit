@@ -192,7 +192,9 @@ class EditedRepliesAndConflicts(unittest.TestCase):
         n["body"], n["updated_at"], n["last_edited_by"] = "answer D-1 approve", tb.tick(), "dave"
         self.assertEqual(t.bridge.collect(), 1)
 
-    def test_12_graphql_unavailable_fails_closed_and_says_so_once(self):
+    def test_12_graphql_unavailable_fails_closed_for_the_round(self):
+        """GitLab GraphQL down at a touched reply's first sight: it does not count that round, and nothing about it
+        is recorded; read again next round (QA r3: a transient failure is not a permanent dead end)."""
         t = fixture(self)
         t.dispatched()
         t.park()
@@ -201,13 +203,10 @@ class EditedRepliesAndConflicts(unittest.TestCase):
         t.notes_db[5][-1]["updated_at"] = tb.tick()
         t.graphql_down = True
         self.assertEqual(t.bridge.collect(), 0)
+        self.assertEqual(state(t), "open")
         t.graphql_down = False
-        self.assertEqual(t.bridge.collect(), 0)                             # what the MR was told stands
-        told = [x["body"] for x in t.notes_db[5] if x["body"].startswith("D-1：")]
-        self.assertEqual(len(told), 1, told)
-        self.assertIn("查不到", told[0])
-        t.reply(5, "alice", "answer D-1 A")
-        self.assertEqual(t.bridge.collect(), 1)
+        self.assertEqual(t.bridge.collect(), 1)                             # never edited: delivered
+        self.assertFalse([x["body"] for x in t.notes_db[5] if x["body"].startswith("D-1：")])
 
     def test_12_a_reply_changed_after_the_bridge_read_it(self):
         """The text hash taken at first sight covers later edits (here: during a conflict round)."""

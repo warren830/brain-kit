@@ -94,7 +94,8 @@ class RunnerNeedsTheHookAdapterInGit(unittest.TestCase):
         probs = cli.runner_kit_problems(repo)
         self.assertEqual(len(probs), 1)
         self.assertIn("lean-hook.py", probs[0])
-        commit_file(repo, cli.CREW_HOOK, "# adapter\n")
+        with open(os.path.join(cli.KIT_SRC, cli.CREW_HOOK), encoding="utf-8") as f:     # the shipped adapter
+            commit_file(repo, cli.CREW_HOOK, f.read())
         self.assertEqual(cli.runner_kit_problems(repo), [])
         sh("git", "-C", repo, "rm", "-q", "--cached", cli.CREW_HOOK)       # on disk only again
         self.assertTrue(cli.runner_kit_problems(repo))

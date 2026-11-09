@@ -66,9 +66,10 @@ class BridgeTest(unittest.TestCase):
                     "vouchers_dir": os.path.join(d, "vouchers"), "spool_dir": os.path.join(d, "spool"),
                     "ledger": os.path.join(d, "ledger.sqlite"), "max_inflight": 12, "max_per_repo": 3,
                     "contract_ttl_hours": 72, "kirocrew": {"agent": "brain-run", "memory_mode": "incognito"}}
+        # git_timeout: a fetch of these local repos takes well under a second; a hung one ends after 3 s
         self.runner_cfg = {"spool_dir": self.cfg["spool_dir"], "cache_dir": os.path.join(d, "cache"),
                            "runs_root": os.path.join(d, "runs"), "allowed_signers": self.allowed,
-                           "clone_url": self.origin}
+                           "clone_url": self.origin, "git_timeout": 3}
         os.makedirs(self.runner_cfg["runs_root"])
         self.mrs = {5: self.mr(5, BRANCH, self.sha)}
         self.events = {5: [self.ev("alice", "add")]}
@@ -76,6 +77,7 @@ class BridgeTest(unittest.TestCase):
         self.mr_state = {}
         self.overrides = {}
         self.fail_send = False
+        self.slot_msgs = {}           # what landed in each KiroCrew slot (user rows with meta.sendId)
         self.notes_db = {}
         self.issues = {}
         self.versions = {}
@@ -152,6 +154,8 @@ class BridgeTest(unittest.TestCase):
         def send(m, qy, body):
             if self.fail_send:
                 return 500, {"error": "boom"}
+            self.slot_msgs.setdefault(body["slot"], []).append(
+                {"role": "user", "content": body["message"], "meta": dict(body.get("meta") or {})})
             return 200, {"ok": True}
 
         def token(m, qy, body):
@@ -186,6 +190,13 @@ class BridgeTest(unittest.TestCase):
         f.on("POST", r"/api/chat", send)
         f.on("POST", r"/api/graphql", graphql)
         return f
+
+    def serve_slots(self):
+        """KiroCrew's GET /api/chat/slots/<slot>: the slot's messages (what landed), idle. Without it the bridge
+        cannot read a slot, as when KiroCrew is down."""
+        self.fake.on("GET", r"/api/chat/slots/([^/]+)", lambda m, qy, b: (
+            200, {"key": m.group(1), "messages": list(self.slot_msgs.get(m.group(1), [])), "running": False,
+                  "queue": []}))
 
     def add_note(self, m, qy, b, author="brain-bridge"):
         iid = int(m.group(1)) if m else qy

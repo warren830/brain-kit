@@ -5,8 +5,11 @@ status the bot cannot write; see the main plan §6).
                           no material packages committed; risk paths changed only with an approved design
                           (risk paths read from the target branch); bot commits need a hand-over voucher.
   brain-ci push-rules     the pre-receive rules, run in the MR pipeline instead (GitLab Free / no server hooks):
-                          the pipeline's user (GITLAB_USER_LOGIN) and the MR's new commits are judged as one push.
+                          a person's pipeline (GITLAB_USER_LOGIN) judges the MR's new commits as their one push; a
+                          bot's pipeline judges each commit by who made it, from the hand-over voucher on
+                          (bot_push_rules; needs BRAIN_VOUCHERS_DIR / BRAIN_ALLOWED_SIGNERS).
                           Weaker than the hook: it stops the merge, not the push.
+  Vouchers name commits; after GitLab's Rebase a voucher counts for the rebased commit (rebased_commit).
   brain-ci brain-lint      the Brain's rules (brain lint) against the MR's diff base, config from the target branch.
                           Run it on every MR: Brain MRs (brain/<KEY>-reflect-<n>) and anything else that touches brain/.
   brain-ci verify-voucher FILE --allowed-signers F
@@ -33,11 +36,84 @@ def load_voucher(path):
     return data["voucher"], data["sig"]
 
 
-def signed_vouchers(vouchers_dir, allowed_signers, key, repo):
-    """(good, bad): signed vouchers for runs of `key` whose sha is in this branch's history."""
+SHA40_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _has_commit(repo, sha) -> bool:
+    return git(repo, "cat-file", "-e", sha + "^{commit}", check=False).returncode == 0
+
+
+def _fetch_commit(repo, sha):
+    """Best effort: fetch a commit the branch no longer holds (after a rebase). GitLab keeps every MR head it has
+    seen (keep-around refs) and serves it by id; nothing happens when there is no origin or the server refuses."""
+    if git(repo, "remote", "get-url", "origin", check=False).returncode != 0:
+        return
+    try:
+        subprocess.run(["git", "-C", repo, "fetch", "-q", "--no-tags", "origin", sha], capture_output=True,
+                       timeout=120, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def commit_changes(repo, *revs) -> list:
+    """[(change id, sha)] of the non-merge commits `git log <revs>` lists, oldest first. The change id is what a rebase
+    keeps of a commit: its author (email and time) and, per file, its name and mode lines and the lines it removes and
+    adds, verbatim (whitespace counts). Not the hunk positions and context lines (they move when the base moves), not
+    the committer (the person who rebased) or the message."""
+    p = subprocess.run(["git", "-C", repo, "log", "--topo-order", "--reverse", "--no-merges", "-p", "--binary",
+                        "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--diff-algorithm=myers",
+                        "--format=%x00%H %ae %at"] + list(revs), capture_output=True)
+    if p.returncode != 0:
+        raise BrainError("git log %s failed: %s" % (" ".join(revs), p.stderr.decode("utf-8", "replace").strip()))
+    out = []
+    for chunk in p.stdout.split(b"\0")[1:]:
+        head, _, diff = chunk.partition(b"\n")
+        sha, _, who = head.decode("utf-8", "replace").partition(" ")
+        h = hashlib.sha256(who.lower().encode("utf-8") + b"\n")
+        for line in diff.split(b"\n"):
+            if line and not line.startswith((b"@@", b"index ", b" ")):
+                h.update(line + b"\n")
+        out.append((h.hexdigest(), sha))
+    return out
+
+
+def rebased_commit(repo, sha, upstream, rec_path, _head=None):
+    """The commit of HEAD's history that is commit `sha` rebased, or None. Vouchers name a commit (the hand-over
+    commit, the MR head a question was asked at); GitLab's Rebase gives every commit of the branch a new sha. A voucher
+    still counts for the rebased commit when the rebase replayed the same work up to it:
+      - the commits from `upstream` (the MR's diff base) to `sha`, merges left out, and the first as many commits from
+        `upstream` to HEAD have the same change ids in the same order (commit_changes: same author and time, same
+        lines removed and added per file), and the last of them stands for `sha`;
+      - `rec_path` (runs/<KEY>/run.json) is the same blob in both: the record that was handed over.
+    So a commit cannot be moved before or after the vouched one, edited, added or dropped there, and a rebase that
+    resolved a conflict in that part of the branch loses the voucher (merge the target branch in instead: merging
+    keeps every sha). `sha` is fetched from origin when this clone does not have it."""
+    if not SHA40_RE.match(str(sha or "")) or not upstream:
+        return None
+    if not _has_commit(repo, sha):
+        _fetch_commit(repo, sha)
+        if not _has_commit(repo, sha):
+            return None
+    then = commit_changes(repo, sha, "--not", upstream)
+    if not then or then[-1][1] != sha:
+        return None                                     # a merge, or a commit already on the target branch
+    now = _head if _head is not None else commit_changes(repo, "HEAD", "--not", upstream)
+    if len(now) < len(then) or [c for c, _ in now[:len(then)]] != [c for c, _ in then]:
+        return None
+    eq = now[len(then) - 1][1]
+    a = git(repo, "rev-parse", "-q", "--verify", "%s:%s" % (sha, rec_path), check=False).stdout.strip()
+    b = git(repo, "rev-parse", "-q", "--verify", "%s:%s" % (eq, rec_path), check=False).stdout.strip()
+    return eq if a and a == b else None
+
+
+def signed_vouchers(vouchers_dir, allowed_signers, key, repo, upstream=None, runs_dir="runs"):
+    """(good, bad): signed vouchers for runs of `key` whose sha is in this branch's history. With `upstream` (the MR's
+    diff base) a voucher whose commit was rebased counts for the rebased commit (rebased_commit): it comes back as a
+    copy whose `sha` is that commit and `rebased_from` the signed one."""
     good, bad = [], []
     if not vouchers_dir or not allowed_signers:
         return good, bad
+    head_changes = []
     for path in sorted(glob.glob(os.path.join(vouchers_dir, "RUN-%s-*" % key, "*.json"))):
         try:
             v, s = load_voucher(path)
@@ -52,7 +128,15 @@ def signed_vouchers(vouchers_dir, allowed_signers, key, repo):
         if v.get("eval_oracle"):  # golden-task answers from the oracle never count for a real MR
             continue
         if git(repo, "merge-base", "--is-ancestor", str(v.get("sha", "")), "HEAD", check=False).returncode != 0:
-            continue
+            if not upstream:
+                continue
+            if not head_changes:
+                head_changes.append(commit_changes(repo, "HEAD", "--not", upstream))
+            eq = rebased_commit(repo, str(v.get("sha", "")), upstream, runrec.path(runs_dir, key).replace(os.sep, "/"),
+                                _head=head_changes[0])
+            if not eq:
+                continue
+            v = dict(v, sha=eq, rebased_from=v.get("sha"))
         good.append(v)
     return good, bad
 
@@ -289,7 +373,7 @@ def check_run(repo, branch, env) -> list:
         probs.append("a run branch changed the Brain (%s): write brain-proposal blocks in decisions.md instead; "
                      "`brain reflect` turns them into a Brain MR for the file owners" % ", ".join(touched[:5]))
     vdir, signers = env.get("BRAIN_VOUCHERS_DIR", ""), env.get("BRAIN_ALLOWED_SIGNERS", "")
-    vouchers, bad = signed_vouchers(vdir, signers, b["key"], repo)
+    vouchers, bad = signed_vouchers(vdir, signers, b["key"], repo, upstream=base, runs_dir=cfg["runs_dir"])
     probs += bad
     probs += check_route(repo, rec, cfg, tgt, base, vouchers)
     bot_emails = {e.lower() for e in cfg.get("bot_emails", [])}
@@ -334,7 +418,80 @@ def push_rules(repo, branch, user, env) -> list:
     # the hook compares with refs/heads/<default>; point it at the target branch inside this CI checkout
     git(repo, "update-ref", "refs/heads/" + hook_cfg["default_branch"], tgt.ref)
     head = git_out(repo, "rev-parse", "HEAD")
-    return pre_receive.decide([(tgt.base, head, "refs/heads/" + branch)], user, hook_cfg, cwd=repo)
+    if (user or "").lower() not in {u.lower() for u in hook_cfg["bot_users"]}:
+        return pre_receive.decide([(tgt.base, head, "refs/heads/" + branch)], user, hook_cfg, cwd=repo)
+    return bot_push_rules(repo, branch, user, env, tgt, cfg, hook_cfg, head)
+
+
+def handover_commit(repo, branch, key, env, upstream, runs_dir="runs"):
+    """(commit, why not): the commit of this branch's newest signed hand-over voucher (BRAIN_VOUCHERS_DIR, verified
+    with BRAIN_ALLOWED_SIGNERS), on HEAD's history or rebased (rebased_commit); (None, reason) without one."""
+    vdir, signers = env.get("BRAIN_VOUCHERS_DIR", ""), env.get("BRAIN_ALLOWED_SIGNERS", "")
+    if not vdir or not signers:
+        return None, "BRAIN_VOUCHERS_DIR / BRAIN_ALLOWED_SIGNERS are not set in this job"
+    vouchers, bad = signed_vouchers(vdir, signers, key, repo, upstream=upstream, runs_dir=runs_dir)
+    shas = [v["sha"] for v in vouchers if v.get("kind") == "handoff" and v.get("branch") == branch]
+    if not shas:
+        return None, "no signed hand-over voucher for %s whose commit is in this branch's history%s" % (
+            branch, " (%s)" % "; ".join(bad[:3]) if bad else "")
+    depth = {s: int(git_out(repo, "rev-list", "--count", s)) for s in set(shas)}
+    return max(depth, key=lambda s: (depth[s], s)), ""
+
+
+def bot_push_rules(repo, branch, user, env, tgt, cfg, hook_cfg, head) -> list:
+    """push-rules in a pipeline the bot's push started. The pipeline's user is the last pusher, not the author of every
+    commit in the MR: the owner's own commits (`brain start`, local work, `brain handoff`) are not the bot's push.
+    So, as the pre-receive hook judges each push by its pusher, commits are judged by who made them:
+      - the branch: what the hook allows the bot (a well-formed <prefix>/<owner>/<KEY>-<slug> branch);
+      - the bot's commits (author in bot_emails), wherever they are in the MR: the bot's path rules (no gates/, CI,
+        .brain/, ..., no runs/<KEY>/run.json), and committed by the bot or by the run's owner (GitLab's Rebase);
+      - the commits after the hand-over commit (the newest signed hand-over voucher for this branch) that are not the
+        bot's: committed by the run's owner (the author of the hand-over commit), people's rules (their own branch);
+        anyone else is refused, and a bot committing another author's work is refused as the hook refuses it;
+      - the commits before it are the owner's, judged when they pushed them.
+    Without a hand-over voucher nothing tells the owner's commits from the bot's: the pipeline fails and says why.
+    Weaker than the hook: it sees commits, not pushes (an author line can be forged; the hook refuses that)."""
+    from . import pre_receive
+    probs = pre_receive.decide([(head, head, "refs/heads/" + branch)], user, hook_cfg, cwd=repo)
+    if probs:
+        return probs
+    default = hook_cfg["default_branch"]
+    bots = {e.lower() for e in hook_cfg.get("bot_emails") or []}
+    commits = pre_receive.new_commits(tgt.base, head, default, cwd=repo)
+    who = {}
+    for c in commits:
+        ae, _, ce = git_out(repo, "log", "-1", "--format=%ae%x00%ce", c).partition("\0")
+        who[c] = (ae.strip().lower(), ce.strip().lower())
+    mine = [c for c in commits if who[c][0] in bots]
+    if mine:
+        probs += pre_receive.bot_path_problems(branch, mine, hook_cfg, cwd=repo)
+    b = parse_branch(branch, hook_cfg["branch_prefix"])
+    hand, why = handover_commit(repo, branch, b["key"], env, tgt.base, cfg["runs_dir"])
+    if not hand:
+        probs.append("%s: this pipeline was started by the bot (%s), but %s: without the hand-over commit push-rules "
+                     "cannot tell the owner's commits from the bot's. A run branch gets bot commits only after a "
+                     "hand-over the bridge signed; check the job's vouchers (brain-intake) and the bridge's hand-over "
+                     "comment on the MR" % (branch, user, why))
+        return probs
+    ae, _, ce = git_out(repo, "log", "-1", "--format=%ae%x00%ce", hand).partition("\0")
+    owner = {ae.strip().lower(), ce.strip().lower()} - bots - {""}
+    after = set(pre_receive.new_commits(hand, head, default, cwd=repo))
+    alien = []
+    for c in commits:
+        ae, ce = who[c]
+        if ae in bots:
+            if ce not in bots | owner:
+                alien.append("%s committed by %s" % (c[:12], ce or "-"))
+        elif c in after and ce in bots:
+            alien.append("%s authored by %s but committed by the bot" % (c[:12], ae or "-"))
+        elif c in after and ce not in owner:
+            alien.append("%s committed by %s" % (c[:12], ce or "-"))
+    if alien:
+        probs.append("%s: after the hand-over (%s) only the bot (%s) and the run's owner (%s) commit on this branch, "
+                     "and bot commits are authored as the bot: %s" % (
+                         branch, hand[:12], ", ".join(sorted(bots)) or "-", ", ".join(sorted(owner)) or "-",
+                         "; ".join(alien[:3])))
+    return probs
 
 
 def cmd_push_rules(a):

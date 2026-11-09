@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS mr_desc_notes (
   project TEXT NOT NULL, iid INTEGER NOT NULL, run_id TEXT, note_id INTEGER, md_hash TEXT, sha TEXT,
   state TEXT NOT NULL, created TEXT NOT NULL, updated TEXT NOT NULL,
   PRIMARY KEY (project, iid));
+CREATE TABLE IF NOT EXISTS outbox (
+  send_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, slot TEXT, what TEXT NOT NULL, message TEXT NOT NULL,
+  state TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL, updated TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS notices (
+  key TEXT PRIMARY KEY, run_id TEXT, project TEXT, iid INTEGER, state TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0, created TEXT NOT NULL, updated TEXT NOT NULL);
 """
 # pending_vouchers: the voucher last sent to a signer that did not answer in time, by what it is for (a hand-over
 # check, a decision). The next round asks for that same voucher, so a late signature is used, not left over.
@@ -45,7 +51,16 @@ CREATE TABLE IF NOT EXISTS mr_desc_notes (
 # the run wrote none); sha: the MR head it was last checked at. state: wanted (to be posted), posting (one bridge
 # process posts it now; taken over once stale), posted. A ledger from before this table gets it when it is opened
 # (CREATE TABLE IF NOT EXISTS); columns added later go in MR_DESC_ADDED_COLUMNS.
+# outbox: every message the bridge sends into a run's KiroCrew slot (the hand-over, an answer, a notice), written
+# before it is sent, so a bridge that stops mid-send knows what it was sending. send_id: meta.sendId (the voucher id,
+# or N-<hash> for a notice); what: handover:<run> | answer:<D-n> | notice:<key>. state: sending (being sent now, by
+# this or another bridge process), interrupted (the bridge was stopped while it sent: it may or may not have
+# landed), sent, unknown (KiroCrew answered with an error: it may or may not have landed). A row is settled again by
+# reading the slot (a user message with that sendId landed); tries: how often it was sent.
+# notices: things the bridge tells once (an MR note, a counter of attempts), by key. state: telling (one bridge
+# process posts it now; taken over once stale), told, counting (only `count` matters).
 MR_DESC_ADDED_COLUMNS = ()
+OUTBOX_STATES = ("sending", "interrupted", "sent", "unknown")
 
 
 class _Rows:
@@ -314,6 +329,81 @@ class Ledger:
         return self.db.execute("UPDATE mr_desc_notes SET state='wanted', note_id=NULL, updated=? WHERE project=? AND "
                                "iid=? AND state='posted' AND note_id IS ?",
                                (iso(utcnow()), project, int(iid), note_id)).rowcount == 1
+
+    # the outbox (see above): compare-and-set on state
+    def outbox(self, send_id):
+        return self.db.execute("SELECT * FROM outbox WHERE send_id=?", (send_id,)).fetchone()
+
+    def outbox_put(self, send_id, run_id, slot, what, message):
+        """Record a message about to be sent (state 'sending'). An earlier row with this send id is kept as it is
+        (the caller looks at its state). -> (the row, whether it is new)."""
+        now = iso(utcnow())
+        new = self.db.execute("INSERT OR IGNORE INTO outbox(send_id,run_id,slot,what,message,state,tries,created,"
+                              "updated) VALUES (?,?,?,?,?,?,?,?,?)",
+                              (send_id, run_id, slot, what, message, "sending", 0, now, now)).rowcount == 1
+        return self.outbox(send_id), new
+
+    def outbox_set(self, send_id, frm, to, tried=False, updated=None) -> bool:
+        """frm: a state or a tuple of states. `updated`: only when the row was last changed then (a stale row is
+        taken over by one bridge process only)."""
+        frm = (frm,) if isinstance(frm, str) else tuple(frm)
+        q = ("UPDATE outbox SET state=?, updated=?%s WHERE send_id=? AND state IN (%s)%s"
+             % (", tries=tries+1" if tried else "", ",".join("?" * len(frm)), " AND updated=?" if updated else ""))
+        args = (to, iso(utcnow()), send_id) + frm + ((updated,) if updated else ())
+        return self.db.execute(q, args).rowcount == 1
+
+    def outbox_rows(self, *states, older_than=None):
+        """Rows in these states; with `older_than` (seconds), only those not updated since then."""
+        q = "SELECT * FROM outbox WHERE state IN (%s)" % ",".join("?" * len(states))
+        args = tuple(states)
+        if older_than is not None:
+            q += " AND updated<?"
+            args += (iso(utcnow() - timedelta(seconds=older_than)),)
+        return self.db.execute(q + " ORDER BY created", args).fetchall()
+
+    # notices: told once (see above)
+    def notice(self, key):
+        return self.db.execute("SELECT * FROM notices WHERE key=?", (key,)).fetchone()
+
+    def claim_notice(self, key, run_id=None, project=None, iid=None, stale_after=300) -> bool:
+        """Claim telling `key` (-> 'telling'): True once, until it is told or given back. A claim older than
+        `stale_after` seconds was left by a bridge that stopped while telling: taken over."""
+        now = utcnow()
+        with self.lock:
+            if self.db.execute("INSERT OR IGNORE INTO notices(key,run_id,project,iid,state,count,created,updated) "
+                               "VALUES (?,?,?,?,?,?,?,?)", (key, run_id, project, iid, "telling", 0, iso(now),
+                                                            iso(now))).rowcount == 1:
+                return True
+            return self.db.execute("UPDATE notices SET state='telling', updated=? WHERE key=? AND (state='counting' "
+                                   "OR (state='telling' AND updated<?))",
+                                   (iso(now), key, iso(now - timedelta(seconds=stale_after)))).rowcount == 1
+
+    def notice_told(self, key):
+        self.db.execute("UPDATE notices SET state='told', updated=? WHERE key=?", (iso(utcnow()), key))
+
+    def release_notice(self, key):
+        """Telling failed: told again next time (a counter row keeps its count)."""
+        with self.lock:
+            self.db.execute("DELETE FROM notices WHERE key=? AND state='telling' AND count=0", (key,))
+            self.db.execute("UPDATE notices SET state='counting', updated=? WHERE key=? AND state='telling'",
+                            (iso(utcnow()), key))
+
+    def bump(self, key, run_id=None) -> int:
+        """Add one to the counter `key` (a row in state 'counting'); -> the new count."""
+        now = iso(utcnow())
+        with self.lock:
+            self.db.execute("INSERT OR IGNORE INTO notices(key,run_id,state,count,created,updated) "
+                            "VALUES (?,?,?,?,?,?)", (key, run_id, "counting", 0, now, now))
+            self.db.execute("UPDATE notices SET count=count+1, updated=? WHERE key=?", (now, key))
+            return int(self.notice(key)["count"])
+
+    def drop_count(self, key):
+        """A counter starts again (a row in state 'counting' only)."""
+        self.db.execute("DELETE FROM notices WHERE key=? AND state='counting'", (key,))
+
+    def count_of(self, key) -> int:
+        row = self.notice(key)
+        return int(row["count"]) if row is not None else 0
 
     def set_run(self, run_id, frm, to, **fields) -> bool:
         sets = ", ".join(["state=?", "updated=?"] + ["%s=?" % k for k in fields])

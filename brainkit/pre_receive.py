@@ -160,6 +160,21 @@ def claim_rules(old, new, branch, user, is_bot, cwd) -> list:
     return []
 
 
+def bot_path_problems(branch, commits, cfg, cwd=None) -> list:
+    """The bot's path rules for these commits (what they change, not who made them): no bot_forbidden_paths, no
+    <runs_dir>/<KEY>/run.json. brain-ci push-rules applies them to the bot's commits of an MR too."""
+    reasons = []
+    paths = changed_paths(commits, cfg["default_branch"], cwd)
+    bad = sorted(p for p in paths if _forbidden(p, cfg["bot_forbidden_paths"]))
+    if bad:
+        reasons.append("%s: bot accounts may not change %s" % (branch, ", ".join(bad[:5])))
+    recs = sorted(p for p in own_changes(commits, cwd) if run_record_path(p, cfg.get("runs_dir", "runs")))
+    if recs:
+        reasons.append("%s: bot accounts may not change %s (run.json is written by `brain start` and "
+                       "`brain handoff` only)" % (branch, ", ".join(recs[:5])))
+    return reasons
+
+
 def decide(updates, user, cfg, cwd=None) -> list:
     """Return a list of denial reasons (empty = accept). updates: [(old, new, ref)]."""
     prefix = cfg["branch_prefix"]
@@ -192,14 +207,7 @@ def decide(updates, user, cfg, cwd=None) -> list:
                 reasons.append("%s: bot accounts may not force-push" % branch)
                 continue
             commits = new_commits(old, new, cfg["default_branch"], cwd)
-            paths = changed_paths(commits, cfg["default_branch"], cwd)
-            bad = sorted(p for p in paths if _forbidden(p, cfg["bot_forbidden_paths"]))
-            if bad:
-                reasons.append("%s: bot accounts may not change %s" % (branch, ", ".join(bad[:5])))
-            recs = sorted(p for p in own_changes(commits, cwd) if run_record_path(p, cfg.get("runs_dir", "runs")))
-            if recs:
-                reasons.append("%s: bot accounts may not change %s (run.json is written by `brain start` and "
-                               "`brain handoff` only)" % (branch, ", ".join(recs[:5])))
+            reasons += bot_path_problems(branch, commits, cfg, cwd)
             emails = {e.lower() for e in cfg.get("bot_emails", [])}
             alien = sorted(committer_emails(commits, cwd) - emails)
             if alien:

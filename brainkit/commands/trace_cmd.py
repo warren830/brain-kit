@@ -4,6 +4,8 @@
                   [--as-of TIME]
 Read-only. --vouchers defaults to <intake store>/vouchers when it exists ($BRAIN_INTAKE_DIR, git config
 brain.intake, ~/.brain/intake). --credits is the JSON the KiroCrew app passes in (credits are not readable here).
+Without --ref, a run whose run.json is not in the working tree (not merged yet) is read from its run branch here
+(the same branch `brain eval` reads: evaluate.run_branches).
 """
 from __future__ import annotations
 
@@ -46,10 +48,19 @@ def common_args(s, suppress=False):
     s.add_argument("--as-of", help="judge the 14-day window at this time (default now)", **d)
 
 
+def ref_for(repo, cfg, key, ref):
+    """--ref as given; without it, the working tree, or the run branch when run.json is only there."""
+    if ref or T.Tree(repo, None).read("%s/%s/run.json" % (cfg["runs_dir"], key)) is not None:
+        return ref
+    from .. import evaluate as EV
+    return EV.run_branches(repo, cfg).get(key)
+
+
 def cmd_trace(a):
     repo = repo_root()
     cfg = config.load(repo)
-    t = T.build(repo, cfg, a.key, ref=a.ref, ledger_path=a.ledger, vouchers_dir=a.vouchers or default_vouchers(repo),
+    ref = ref_for(repo, cfg, a.key, a.ref)
+    t = T.build(repo, cfg, a.key, ref=ref, ledger_path=a.ledger, vouchers_dir=a.vouchers or default_vouchers(repo),
                 credits=load_credits(a.credits), as_of=a.as_of, allowed_signers=a.allowed_signers)
     print(json.dumps(t, ensure_ascii=False, indent=2, sort_keys=True) if a.json else T.render(t))
     return 0

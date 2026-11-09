@@ -72,11 +72,11 @@ class Rest:
         self.headers = dict(headers or {})
         self.transport = transport or urllib_transport
 
-    def call(self, method, path, query=None, body=None, ok=(200, 201, 204), raw=False):
+    def call(self, method, path, query=None, body=None, ok=(200, 201, 204), raw=False, headers=None):
         url = self.base + path
         if query:
             url += "?" + urllib.parse.urlencode(query, doseq=True)
-        headers = dict(self.headers)
+        headers = dict(self.headers, **(headers or {}))
         data = None
         if body is not None:
             data = json.dumps(body).encode("utf-8")
@@ -250,6 +250,21 @@ class GitLab(Rest):
 
     def commit_exists(self, project, sha):
         return self.commit(project, sha) is not None
+
+    def pipeline_jobs(self, project, pipeline_id, scope="failed", per_page=100):
+        """The jobs of a pipeline in `scope` (GET /projects/:id/pipelines/:pipeline_id/jobs, one page: a pipeline
+        with more than `per_page` failed jobs is shown by its first ones)."""
+        return self.call("GET", "/projects/%s/pipelines/%d/jobs" % (q(project), int(pipeline_id)),
+                         {"scope[]": scope, "per_page": per_page}) or []
+
+    def job_trace(self, project, job_id):
+        """A job's log (bytes), or None when GitLab does not show it (no log yet, or no access to it)."""
+        try:
+            return self.call("GET", "/projects/%s/jobs/%d/trace" % (q(project), int(job_id)), raw=True)
+        except HttpError as e:
+            if e.status in (403, 404):
+                return None
+            raise
 
     # ---------- GraphQL (what REST does not show) ----------
 

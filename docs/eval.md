@@ -17,8 +17,9 @@ brain trace PAY-1                                  # 看一个需求（中文摘
 brain trace PAY-1 --json --ref origin/main         # 合并以后，从 main 读
 brain trace PAY-1 --ledger /srv/bridge/ledger.sqlite --vouchers ~/brain-intake/vouchers --credits credits.json
 
-brain eval                                         # 全部需求的指标
+brain eval                                         # 全部需求的指标（开头一张表：这一批每个需求一行）
 brain eval --since 2026-11-01 --ref origin/main    # 只看这一期
+brain eval --ledger /srv/bridge/ledger.sqlite --stuck-hours 48   # 没合并的 run 48 小时没动静算停住（默认 24）
 brain eval --json
 brain eval gaps                                    # 值得记的缺口
 brain eval gaps --file                             # 记成需求（来源 eval-gap）
@@ -56,7 +57,7 @@ brain golden summarize results.json --tasks tasks
 
 **人的身份**：只出现 GitLab 用户名和化名。git 和 Lean 记的邮箱、名字、主机名，换成 `G-` 加 6 位（邮箱的哈希）。Lean 的审计文件名里有主机名（`<主机>-<6 位>.jsonl`），trace 里写成 `aidlc-docs/audit/L-<6 位>.jsonl`（文件路径的哈希，每台机器上一样）。被拦下的命令、阶段说明、失败的检查命令里出现的邮箱换成 `G-` 化名，`/Users/<名字>`、`/home/<名字>` 换成 `~`。桥的答复人用凭证里的化名 `P-xxxx`。decisions.md 的 Who 栏不是规定的写法时，不写出来（可能是人名）。人的消息原文不抄，decisions.md 里本来就有的除外。
 
-下面是 trace 读 git 的全部规则。每条都有测试（`tests/test_qa_r2_trace.py`，测试类名或测试名里带规则号）。说法里：main = 默认分支（有 `origin/main` 用它，没有用本地的）；分支 = run.json 里的 `branch`；KEY = 需求号；运行机 = kit.json 的 `bot_emails`；**S** = main 的第一父链上第一个带进 `runs/<KEY>/run.json` 的提交。
+下面是 trace 读 git 的全部规则。每条都有测试（`tests/test_qa_r2_trace.py`、`tests/test_qa_r3_trace.py`，测试类名或测试名里带规则号）。说法里：main = 默认分支（有 `origin/main` 用它，没有用本地的）；分支 = run.json 里的 `branch`；KEY = 需求号；运行机 = kit.json 的 `bot_emails`；**S** = main 的第一父链上第一个带进 `runs/<KEY>/run.json` 的提交。
 
 **读哪一份分支**：分支可能有几份：本地的 `refs/heads/<分支>`、origin 的 `refs/remotes/origin/<分支>`，或者 `--ref <分支>` 给的。没合并时取新的那份（包含另一份的那份）；两份分叉了，用 origin 的。合并了以后读"合并进去的那份"（下面的 M1–M6）。用不上的那几份写进 `src.git.tip_note`：旧了、合并后又有提交、分叉了。所以负责人自己机器上那份停在交接时的旧分支，不会把交接后的事丢掉，结果和没有这个分支的机器一样。
 
@@ -64,6 +65,7 @@ brain golden summarize results.json --tasks tasks
 
 - **M1 合并提交**：main 的第一父链上有标题正好是 `Merge branch '<分支>' into '<main>'` 的合并提交（GitLab 的写法）；没有的话，S 本身是合并提交、它的第二个父提交里有 run.json，也算。合并进去的那份 = 第二个父提交。只是提到分支名的合并不算：`git pull` 写的 `Merge branch '<分支>' of … into <分支>`、GitLab 解决冲突写的 `Merge branch 'main' into '<分支>'`，都是在分支上做的。
 - **M1a squash + 合并提交**（GitLab 勾了 "Squash commits"，又用合并提交）：M1 的第二个父提交只有一个父提交、坐在合并基点上，而这里还有一份分支、和它互不包含：它是 squash 出来的。run 的提交读分支上的，squash 提交本身也算 run 的。分支删了时，就只有 squash 那一个提交。
+- **M1b 别的分支上做的合并**：S 是合并提交、第二个父提交里有 run.json，但它的标题写着合并进了别的分支（`Merge branch 'main' into '<别的分支>'`：另一个 run 把 main 合进自己的分支，然后 fast-forward 进了 main）。它不是这个 run 的合并：run 是从它的第二个父提交（当时的 main）进来的，就在那个提交的第一父链上按 M1–M6 重新找（最多找 4 层）。`merged_at.via` 写明。不这样的话，先合并的 run 的合并时间会挪到后一个 run 合并 main 的时候，它真正的热修也落在那个合并的历史里，看不到了。
 - **M2 fast-forward**：S 不是合并提交，而且某一份分支包含 S（main 的第一父链上就是分支自己的提交）。从 S 起顺着 main 的第一父链按 R1–R5 找 run 的提交，至少到分支最后一个已经在 main 上的提交；最后一个就是合并点。本地分支旧了、或者合并后分支上又提交了，合并点都一样。
 - **M6**：分支最后一个提交已经在 main 上，但 M1、M2 都没对上（别的标题的合并提交）：main 第一父链上第一个包含它的提交就是合并点。
 - **M3 rebase**（分支还在，它的提交不在 main 上）：从 S 起的 run 提交（R1–R5）里，有和分支上某个提交 patch-id 一样的。trace 读 main 上的这些副本，合并点是最后一个。
@@ -81,27 +83,48 @@ brain golden summarize results.json --tasks tasks
 
 - **R1**：S、分支最后一个已经在 main 上的提交和它以前的、和分支上某个提交 patch-id 一样的（rebase 的副本），都是 run 的。
 - **R2**：合并提交，在 run 分支上做的（标题是 `Merge … into <分支>`：把 main 或 origin 合进分支）或运行机做的，是 run 的；别的合并提交（别的 MR 合进 main）到此为止。
-- **R3**：到此为止，而且不是 run 的：人（不是运行机）做的回滚（消息里有 `This reverts commit`，或标题以 `Revert "` 开头）；人的提交，消息里点名 KEY、又带修复词（hotfix、fix、bug、defect、regression、revert、修复、热修、回滚、缺陷……）；改了别的 run 的 `runs/<KEY2>/` 的提交（谁做的都算）。运行机只在自己的 run 上干活，它的回滚、修复都是 run 的（R4）。
+- **R3**：到此为止，而且不是 run 的：交接之后，人（不是运行机）做的回滚（消息里有 `This reverts commit`，或标题以 `Revert "` 开头）、人的提交里点名 KEY 又带修复词（hotfix、fix、bug、defect、regression、revert、修复、热修、回滚、缺陷……）的；改了别的 run 的 `runs/<KEY2>/` 的提交（谁做的、在哪都算）。"交接之后" = 在最后一个 `brain handoff` 提交（run.json 的 handoff 变了的提交）之后：从 S 到它，负责人本地半程的回滚、"PAY-1: fix failing test" 这类提交都是 run 自己的（按 R5 算），不会让 run 在开工那个提交就结束。运行机只在自己的 run 上干活，它的回滚、修复都是 run 的（R4）。
 - **R4**：改了 `runs/<KEY>/` 或 `aidlc-docs/<intent>/` 的，和运行机的提交，是 run 的。
 - **R5**：别的（人推的、什么都没点名的）：后面还有 run 的提交，才算 run 的。
 - run 到最后一个 run 的提交为止。
+
+**交接是哪一次**（`outcome.handed_over`：`value`、`commit`、`rule`、`how`、`requests`、`requested`、`bridge_accepted`）。一次"交接请求" = run 的一个提交，它的 run.json 里 `handoff` 不为空、又和上一版不一样（每跑一次 `brain handoff` 写一次）。第一次没过（exit 1 没打上标签，或者桥拒了、拒的评论让负责人再跑一次）时，会有好几次请求。按顺序看：
+
+- **H1 桥接受了**：有交接凭证（签名不是 bad）、ledger 的 handoffs 里有 accepted、或 ledger 里有这个需求的 run（正在签的 `signing` 不算）：取最早的那个。交接 = 它的提交本身或之前的最后一次请求；那个提交不在这里（rebase 了）时，取 run.json 里 handoff 一样的那次请求；还对不上，取桥接受之前的最后一次请求。之后负责人再跑的 `brain handoff`（比如 run 失败了重交）算交接后人的提交。
+- **H2 桥拒了**：没有接受的记录，ledger 里有桥拒掉这个 run 的请求（handoffs 的 rejected；按请求的提交找，拒掉的交接没有 run 那一行）：没有交接（"只在本地做"）。运行机没拿到过它，负责人接着做的都是本地半程。
+- **H3 桥没见过**：给了 ledger，但它没有任何一次请求的记录，没有交接凭证，请求之后也没有运行机的提交：没有交接（`brain handoff` 停在打标签之前，或者桥还没来得及检查）。
+- **H4 没有桥的记录**（没给 ledger、也没有交接凭证）：取运行机第一个提交之前的最后一次请求（之前那几次没过）；运行机一个提交都没有时，取最后一次。分支不在了、run 的提交列不出来时，按 run.json 的 `handoff`。
+- `actions.handovers` 里每次请求一行，`taken` 标出用的是哪一次。
 
 **用哪个时间**：
 
 - 提交的 `at` 是作者时间：提交是什么时候做的，rebase、cherry-pick 都不改它；`committed_at` 是提交时间（进 main、或被 rebase 的时间）。以前用的是提交时间，rebase 合并后每个副本都成了合并那天。park 问题的时间也是带它的提交的作者时间。
 - 合并时间：M1、M6 是合并提交的提交时间；M3、M4 是 main 上 run 最后一个提交的提交时间（squash 提交、rebase 后最后一个副本）；M2、M5 是最后一个 run 提交的提交时间（git 不记 fast-forward 是什么时候做的）。
-- "交接后"的提交：不在交接提交（第一个 `handoff` 不为空的 run.json）历史里的提交，看提交之间的关系，不看时间。Lean、桥、KiroCrew 上人做的事，用它们自己的时间和 `handoff.requested_at` 比。
-- "合并后"的提交：在 main 上、又不在合并点历史里的提交（不用 `git log --since`，一个时间早的提交会把后面的都挡住），再按它的提交时间（进 main 的时间）看是否在 14 天内。这个 run 自己的提交（C1–C3、R1–R5 认出的，和 M1a 的 squash 提交）不算热修。
+- "交接后"的提交：不在交接提交（H1–H4 认出的那次请求）历史里的提交，看提交之间的关系，不看时间。Lean、桥、KiroCrew 上人做的事，用它们自己的时间和那次请求的 `handoff.requested_at` 比。没有交接（H2、H3）时，什么都不算交接后。
 - 文件名用 `git log -z --no-renames` 读：带空格、引号、换行的文件名不会被转义成别的样子；改名时新旧两个名字都算"改过"。
+
+**合并后 14 天**（`outcome.reverted_or_hotfixed_within_14d`）：
+
+- **A1**："合并后"的提交 = 在 main 上、又不在合并点历史里的提交（不用 `git log --since`，一个时间早的提交会把后面的都挡住）。时间只用来框 14 天：按它的提交时间（进 main 的时间），从合并那一秒（含）到 14 天后（含）；和合并同一秒进来的热修也算。这个 run 自己的提交（C1–C3、R1–R5 认出的，和 M1a 的 squash 提交）不算热修。
+- 回滚（`This reverts commit <run 的提交>`），或者点名 KEY、又带修复词的提交，算回滚 / 热修；新的报告问题的 `claim/<KEY2>`，标题点名 KEY 又带修复词的，算缺陷（第 3 节）。
+- **A2**：回滚和热修，都要改了 `brain/`、`runs/`、`aidlc-docs/` 以外的东西才算。只改 Brain 和记录的不算：`brain reflect --apply` 的提交和它的 MR 合并，消息里都点名这个需求，缺口的标题又常带"回滚、故障、缺陷"这类词。这些列在 `ignored` 里（写明为什么），不算数。合并提交看它带进 main 的改动（和第一个父提交比）。
 
 **同一件事只算一次**：桥送回 Lean 的审批口令，在 Lean 日志里也有一条。两条按凭证号合成一条，来源都列上。decisions.md 里记下桥上回答的那一行，也按凭证号连到桥上那条决策。
 
 ## 3. 指标
 
+**E1 哪些需求**：`brain eval` 读三处，一个需求只算一次：
+
+1. 读的那棵树（工作区或 `--ref`）里的 `runs/<KEY>/run.json`：在 main 上读，就是已经合并的；
+2. 这里的 run 分支（本地的和 origin 的 `ai/<人>/<KEY>-<名字>`）里，上面没有的需求：没合并的 run，从它的分支读（几份里取新的那份，和第 2 节"读哪一份分支"一样；一个需求有几个分支时，取 tip 有 run.json、而且最后提交的那个）。报告开头写"没合并的 n 个从分支读"，JSON 的 `open_branches`。`brain trace KEY` 不给 `--ref`、工作区里又没有它的 run.json 时，读的也是这个分支；
+3. 给了 `--ledger` 时，ledger 里有 run、这里却读不到 run.json 的需求（分支没 fetch、MR 关了分支也删了）：列在 `skipped`（带它在 ledger 里的状态，`ledger_only`），也进下面那张表。
+
+**E2 状态**（JSON 的 `states`）：`merged` 已合并；`merged_not_here` ledger 说合并了，这里的 main 没有；`closed` MR 关了、没合并；`failed` 运行机没能开始（ledger 是 failed：brain-runnerd 失败）；`unknown` ledger 的状态以 `_unknown` 结尾（`send_unknown`：桥不知道派单成没成）；`waiting` 在等回答（run 分支上的 park.json 现在是 waiting，或者桥上的问题还开着）；`accepted` 验收过了、还没合并；`open` 进行中。没合并、没关、没失败的 run，最后一次有动静（提交、Lean 记录、park 问题、ledger 里这个 run 的行、凭证；`outcome.last_activity`）离 `--as-of` 超过 `--stuck-hours`（默认 24 小时）的，算停住了（`stuck`）。
+
 | 指标 | 怎么算 | 现在量不到的 |
 |---|---|---|
 | 自主度 | 交接以后，除了必经的审批（REQUIREMENTS、DESIGN、INCEPTION、PLAN、RELEASE、验收），人没做过别的事、而且交付正确的 run ÷ 已完成、交接过、对错已知的 run | 本地半程是人自己带着 AI 做，不算介入（本地的提交分不清是人还是 AI 写的）。没交接过的 run 单列，不算。验收被驳回过、还没合并的 run，和合并了的一样，等合并满 14 天再算（不先算成“不对”，合并后又退出分母） |
-| 交付正确率 | 一次通过验收、合并后 14 天内没有回滚和热修的交付 ÷ 14 天已满、有验收记录的交付 | 没接 Jira 时，缺陷单只能看新的 `claim/<KEY>`：报告问题的（来源是 product、alert，或没有来源的老认领），标题点名这个需求、又带"修复 / bug / 缺陷"这类词的才算；gap、eval-gap、debt、schedule 这些"缺了什么"的需求不算缺陷。热修只认点名需求号的提交。14 天没满的列为"还不知道"；已经知道出了问题、14 天还没满的，也等满了再算（单列 `wrong_open`），这样一期里的好坏按同样的时间算 |
+| 交付正确率 | 一次通过验收、合并后 14 天内没有回滚和热修的交付 ÷ 14 天已满、有验收记录的交付 | 没接 Jira 时，缺陷单只能看新的 `claim/<KEY>`：报告问题的（来源是 product、alert，或没有来源的老认领），标题点名这个需求、又带"修复 / bug / 缺陷"这类词的才算；gap、eval-gap、debt、schedule 这些"缺了什么"的需求不算缺陷。热修只认点名需求号、又改了 `brain/`、`runs/`、`aidlc-docs/` 以外东西的提交（A2）。14 天没满的列为"还不知道"；已经知道出了问题、14 天还没满的，也等满了再算（单列 `wrong_open`），这样一期里的好坏按同样的时间算 |
 | 介入落在判断点的比例 | 落在判断点上的人工介入 ÷ 全部人工介入。判断点 = Lean 的审批口令（批准、驳回、没被接受的口令）和桥上的 park 问题。别的都算判断点之外：交接后人往 ai/* 的提交、"允许改测试"、KiroCrew 上手动停止或重启 | 方案里"复盘也认定确实需要人判断"这一半要人看。git 不记推送，用"交接后人的提交"代替。手动停止和重启要 KiroCrew app 传进来才有 |
 | 重复纠正率 | correction 条目的 repeats 合计 ÷（correction 条目数 + repeats 合计），目标趋近 0 | 和 `brain usage` 一样 |
 | 知识有用率 | 被引用过的条目 ÷ 现有条目；另给每个 run 引用数之和 ÷ 装载数之和 | 只认 Lean 记录里写出的条目号 |
@@ -119,7 +142,7 @@ brain golden summarize results.json --tasks tasks
 
 Who 的写法是运行机提示词（`remote/prompts/brain-run.md` 第 5 节）和本地的 steering（`kit/.kiro/steering`）定的：`agent`、`brain <条目号>`、`check`、`<化名> <凭证号>`，本地半程负责人在对话里答的写 `owner`；后面可以加一个括号写备注（`agent (A-2)`）。条目号、化名写成代码（`` brain `T-PAY-1-1` ``）也认。`brain eval` 报“没归类”时，提示的也是这几种写法。
 
-还没回答的问题（按提问的时间算在哪一期）、考题的自动回答（eval_oracle，按回答的时间）都不进漏斗，单独报个数。
+还没回答的问题（按提问的时间算在哪一期）、考题的自动回答（eval_oracle，按回答的时间）都不进漏斗，单独报个数。**E4**：桥上不再等回答的问题（`stale` MR 更新了、问题重发；`void` 作废；`invalid` 无效；`closed` MR 关了）不算"还没回答"，按状态另报（`funnel.dropped_questions`）。
 
 **要人复看的 run**（每条写明原因）：
 
@@ -129,7 +152,10 @@ Who 的写法是运行机提示词（`remote/prompts/brain-run.md` 第 5 节）�
 - 同样的纠正又来了：提案里有 `rel: repeats`，或者一个 run 被驳回 2 次以上；
 - 引用了已归档的条目；
 - 判断点之外有人介入；
-- credits 超过中位数的 2 倍（至少 3 个 run 有 credits 时才判断）。
+- credits 超过中位数的 2 倍（至少 3 个 run 有 credits 时才判断）；
+- **E3** 没合并的 run（不管 `--since`，没合并就还在这一批里）：停住了（`stuck`，写明最后一次动静和在等谁回答什么）；MR 关了没合并（`closed_unmerged`）；运行机失败（`runner_failed`）；派单结果不明（`state_unknown`）；桥上的问题作废、无效、送达不明、签名服务拒签（`question_problem`：void、invalid、delivery_unknown、refused）；ledger 说合并了、这里没有（`merge_not_here`）；ledger 里有、这里读不到 run.json（`not_readable`，MR 关了的除外）。
+
+**E5 这一批**（报告开头那张表，JSON 的 `batch`）：每个需求一行：需求、状态（停住了的写"n 小时没动静"）、自主（交接后除了必经的审批没人插手：是 / 否（做了什么）/ 本地 = 没交接 / ? = 有人做了事、但没有时间）、人工介入落在判断点内 / 外的次数、问过几个问题（park.json 里不同的问题，或桥上的问题，取多的）、credits、交付（对 / 不对 / 14 天未满 / 有问题（14 天未满）/ 没有验收记录 / 还没合并 / 没合并）。表上面一句话：交接给运行机的有几个、交接后没人插手的几个、其中已经确认交付对的几个。"能不能无人值守地跑一批"先看这张表，再看下面的复看队列。
 
 **缺口**（`brain eval gaps`）：
 
@@ -222,6 +248,8 @@ Who 的写法是运行机提示词（`remote/prompts/brain-run.md` 第 5 节）�
 - **复盘认定**：介入是不是"确实需要人判断"，要人看。
 - **缺陷单**：不接 Jira 时只能看 claim 标题；接 Jira 以后要另外读。
 - **squash 合并**：分支删了、又是 squash 合并时，合并时间取 main 上带进 run.json 的那个提交；这个需求自己的提交就列不出来了。分支还在、但停在交接时（旧了）、又是 squash 合并时，交接后运行机的提交也列不出来（它们只在已经删掉的分支上）。
-- **fast-forward 合并**：合并时间是最后一个 run 提交的时间，不是真正合并的时刻。run 里夹着、又排在最后的别人的提交（R5），会被当成合并之后的；合并后紧接着有人往 main 推了改 `runs/<KEY>/` 或 `aidlc-docs/<intent>/`、又没点名修复的提交（R4），会被当成 run 的；交接后人往分支推的、点名 KEY 又带修复词的提交（R3），在 main 上会被当成合并后的热修。分支还在时，分支上有的都按分支算（R1），不会这样。
+- **fast-forward 合并**：合并时间是最后一个 run 提交的时间，不是真正合并的时刻。run 里夹着、又排在最后的别人的提交（R5），会被当成合并之后的；合并后紧接着有人往 main 推了改 `runs/<KEY>/` 或 `aidlc-docs/<intent>/`、又没点名修复的提交（R4），会被当成 run 的；交接后人往分支推的、点名 KEY 又带修复词的提交（R3），在 main 上会被当成合并后的热修。没交接过的 run（只在本地做），负责人自己的回滚、修复提交还是会让 run 在那里结束（没有交接点可依）。分支还在时，分支上有的都按分支算（R1），不会这样。
+- **交接**：给了 ledger、桥还没来得及检查（ledger 里还没有这一行）、运行机也还没提交时，按 H3 算没交接；桥检查过以后就对了。没给 ledger、也没有凭证时（H4），桥拒掉、负责人自己做完的 run 看不出来，还是算交接了。
+- **没合并的 run**：只看得到这里有分支的（`git fetch` 过的）和 ledger 里有的。ledger 只记交接被接受之后的 run；没给 ledger、分支也没 fetch 的，`brain eval` 看不到。
 - **读不了的 run**：某个 `runs/<KEY>/run.json` 坏了（不是 JSON、字段类型不对），`brain eval` 跳过它，在 `skipped` 和报告里写明原因，别的照算。
 - **真实数据**：只在自造的仓库上测过。真 run、真 ledger、真凭证都还没跑过一遍。
