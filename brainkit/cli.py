@@ -851,6 +851,13 @@ def _current(repo, cfg):
     return br, b, rp, rec
 
 
+def _is_clone_root(path) -> bool:
+    """True when `path` is the top of a git work tree (a clone, or a worktree of one), not a folder somewhere
+    inside another repository."""
+    p = git(path, "rev-parse", "--show-toplevel", check=False)
+    return p.returncode == 0 and os.path.realpath(p.stdout.strip()) == os.path.realpath(path)
+
+
 def publish_materials(store, rec) -> list:
     """Make sure each package is in the shared intake repo. Returns warnings (empty when all published)."""
     warn = []
@@ -860,7 +867,9 @@ def publish_materials(store, rec) -> list:
             raise BrainError("package %s in %s does not match run.json" % (m["package"], store))
     if not rec.get("materials"):
         return warn
-    if git(store, "rev-parse", "--is-inside-work-tree", check=False).returncode != 0:
+    if not _is_clone_root(store):
+        # only the store's own clone: inside an enclosing repo (a dotfiles repo in $HOME holding ~/.brain/intake)
+        # a commit and push would publish the masked materials to that repo's remote
         return ["intake store %s is not a git clone of brain-intake: the team runner cannot get the materials" % store]
     for m in rec["materials"]:
         git(store, "add", "--", os.path.join("packages", m["package"]))
