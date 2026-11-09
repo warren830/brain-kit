@@ -11,6 +11,9 @@ from brainkit.intake import convert, package  # noqa: E402
 from tests.helpers import tmpdir  # noqa: E402
 
 KIT = {"allow_confidential": False, "bulk_pii_limit": 30, "segment_chars": 6000, "max_file_mb": 50, "max_total_mb": 200}
+W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
+P = ('xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+     'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"')
 S = 'xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
 R = 'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
 
@@ -26,7 +29,7 @@ def xlsx(path, sheets, files=()):
     """sheets: [(name, state or None, [[cell text, ...], ...] or the sheetData XML, worksheet XML after sheetData)]."""
     wb = '<?xml version="1.0"?><workbook %s %s><sheets>' % (S, R)
     rels = '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-    parts = list(files)
+    parts = []
     for i, (name, state, rows, tail) in enumerate(sheets, 1):
         wb += '<sheet name="%s" sheetId="%d"%s r:id="rId%d"/>' % (name, i, ' state="%s"' % state if state else "", i)
         rels += '<Relationship Id="rId%d" Target="worksheets/sheet%d.xml"/>' % (i, i)
@@ -35,13 +38,36 @@ def xlsx(path, sheets, files=()):
             for r, row in enumerate(rows, 1))
         parts.append(("xl/worksheets/sheet%d.xml" % i, '<?xml version="1.0"?><worksheet %s><sheetData>%s</sheetData>%s'
                       '</worksheet>' % (S, data, tail)))
+    given = dict(files)                              # parts given by the caller replace the generated ones
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with zipfile.ZipFile(path, "w") as z:
-        z.writestr("xl/workbook.xml", wb + "</sheets></workbook>")
-        z.writestr("xl/_rels/workbook.xml.rels", rels + "</Relationships>")
-        for n, data in parts:
+        for n, data in [("xl/workbook.xml", wb + "</sheets></workbook>"),
+                        ("xl/_rels/workbook.xml.rels", rels + "</Relationships>")] + parts:
+            z.writestr(n, given.pop(n, data))
+        for n, data in given.items():
             z.writestr(n, data)
     return path
+
+
+def docx(path, body, files=()):
+    with zipfile.ZipFile(path, "w") as z:
+        z.writestr("word/document.xml", '<?xml version="1.0"?><w:document %s><w:body>%s</w:body></w:document>' % (W, body))
+        for n, data in files:
+            z.writestr(n, data)
+    return path
+
+
+def wp(text, rpr=""):
+    return '<w:p><w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>' % ("<w:rPr>%s</w:rPr>" % rpr if rpr else "", text)
+
+
+def sp(text, hidden=""):
+    return ('<p:sp><p:nvSpPr><p:cNvPr id="2" name="t"%s/></p:nvSpPr><p:txBody><a:p><a:r><a:t>%s</a:t></a:r>'
+            '</a:p></p:txBody></p:sp>' % (hidden, text))
+
+
+def slide(inner, attrs=""):
+    return '<?xml version="1.0"?><p:sld %s%s><p:cSld><p:spTree>%s</p:spTree></p:cSld></p:sld>' % (P, attrs, inner)
 
 
 def build(src, **kw):
@@ -185,19 +211,9 @@ class R1_53InvisibleContent(unittest.TestCase):
             self.assertIn(shown, doc.text)
 
     def test_pptx_hidden_group_and_slide(self):
-        P = ('xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
-             'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"')
-
-        def sp(text, hidden=""):
-            return ('<p:sp><p:nvSpPr><p:cNvPr id="2" name="t"%s/></p:nvSpPr><p:txBody><a:p><a:r><a:t>%s</a:t></a:r>'
-                    '</a:p></p:txBody></p:sp>' % (hidden, text))
-
         def grp(inner, hidden=""):
             return ('<p:grpSp><p:nvGrpSpPr><p:cNvPr id="5" name="g"%s/></p:nvGrpSpPr><p:grpSpPr/>%s</p:grpSp>'
                     % (hidden, inner))
-
-        def slide(inner, attrs=""):
-            return '<?xml version="1.0"?><p:sld %s%s><p:cSld><p:spTree>%s</p:spTree></p:cSld></p:sld>' % (P, attrs, inner)
 
         path = os.path.join(tmpdir(self), "a.pptx")
         with zipfile.ZipFile(path, "w") as z:
@@ -212,6 +228,89 @@ class R1_53InvisibleContent(unittest.TestCase):
         for h in ("HIDDEN-GROUP", "HIDDEN-NESTED", "HIDDEN-SLIDE-FALSE", "HIDDEN-SLIDE-0"):
             self.assertNotIn(h, doc.text)
             self.assertIn(h, hidden)
+
+
+class R1_54NothingDroppedSilently(unittest.TestCase):
+    """Content in docx content controls (w:sdt), pptx tables, and xlsx rows and cells without r= reaches the package;
+    a 机密 in a cover-page content control reaches gate 2; comments and speaker notes go to the hidden area."""
+
+    def test_docx_content_controls(self):
+        def sdt(inner):
+            return '<w:sdt><w:sdtPr><w:alias w:val="块"/></w:sdtPr><w:sdtContent>%s</w:sdtContent></w:sdt>' % inner
+
+        def tc(text):
+            return "<w:tc>%s</w:tc>" % wp(text)
+
+        table = ("<w:tbl><w:tr>%s%s</w:tr>%s</w:tbl>" % (tc("事项"), sdt(tc("负责人")),
+                                                         sdt("<w:tr>%s%s</w:tr>" % (tc("退款接口"), tc("张伟")))))
+        body = (wp("退款需求") + sdt(wp("AC-1 十四天内可退") + sdt(wp("AC-2 嵌套控件"))) + sdt(table) +
+                '<w:customXml w:element="x">%s</w:customXml>' % wp("AC-3 自定义 XML") + wp("（完）"))
+        d = tmpdir(self)
+        doc = convert.convert(docx(os.path.join(d, "a.docx"), body))
+        for shown in ("退款需求", "AC-1 十四天内可退", "AC-2 嵌套控件", "AC-3 自定义 XML", "（完）"):
+            self.assertIn(shown, doc.text)
+        self.assertIn("| 事项 | 负责人 |\n|---|---|\n| 退款接口 | 张伟 |", doc.text)
+        src = os.path.join(d, "cover")
+        os.makedirs(src)
+        docx(os.path.join(src, "需求.docx"), sdt(wp("CONFIDENTIAL 机密")) + wp("正文"))
+        with self.assertRaises(BrainError) as cm:
+            build(src)
+        self.assertIn("需求.docx=confidential", str(cm.exception))
+
+    def test_pptx_tables_charts_and_notes(self):
+        def frame(graphic, hidden=""):
+            return ('<p:graphicFrame><p:nvGraphicFramePr><p:cNvPr id="4" name="f"%s/><p:cNvGraphicFramePr/><p:nvPr/>'
+                    '</p:nvGraphicFramePr><a:graphic><a:graphicData uri="x">%s</a:graphicData></a:graphic>'
+                    '</p:graphicFrame>' % (hidden, graphic))
+
+        def table(*rows):
+            return "<a:tbl>%s</a:tbl>" % "".join("<a:tr>%s</a:tr>" % "".join(
+                '<a:tc><a:txBody><a:p><a:r><a:t>%s</a:t></a:r></a:p></a:txBody></a:tc>' % c for c in r) for r in rows)
+
+        notes = slide(sp("备注：HIDDEN-NOTES") + '<p:sp><p:nvSpPr><p:cNvPr id="3" name="n"/><p:cNvSpPr/><p:nvPr>'
+                      '<p:ph type="sldNum"/></p:nvPr></p:nvSpPr><p:txBody><a:p><a:r><a:t>7</a:t></a:r></a:p></p:txBody>'
+                      '</p:sp>').replace("p:sld ", "p:notes ").replace("</p:sld>", "</p:notes>")
+        rels = ('<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+                'notesSlide" Target="../notesSlides/notesSlide1.xml"/></Relationships>')
+        path = os.path.join(tmpdir(self), "a.pptx")
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr("ppt/slides/slide1.xml", slide(sp("验收标准") + frame(table(["编号", "内容"], ["AC-3", "显示退款状态"])) +
+                                                      frame(table(["HIDDEN-TABLE"]), ' hidden="1"') + frame("<chart/>")))
+            z.writestr("ppt/slides/_rels/slide1.xml.rels", rels)
+            z.writestr("ppt/notesSlides/notesSlide1.xml", notes)
+        doc = convert.convert(path)
+        self.assertIn("| 编号 | 内容 |\n|---|---|\n| AC-3 | 显示退款状态 |", doc.text)
+        hidden = "\n".join(t for _, t in doc.hidden)
+        for h in ("HIDDEN-TABLE", "备注：HIDDEN-NOTES"):
+            self.assertNotIn(h, doc.text)
+            self.assertIn(h, hidden)
+        self.assertNotIn("7", hidden)                        # the slide number placeholder is not a note
+        self.assertTrue(any("图表、SmartArt 或嵌入对象 1 个（幻灯片 1）" in n for n in doc.notes))
+
+    def test_xlsx_rows_and_cells_without_r_comments_and_missing_sheets(self):
+        rows = ('<row><c t="inlineStr"><is><t>编号</t></is></c><c t="inlineStr"><is><t>负责人</t></is></c></row>'
+                '<row><c t="inlineStr"><is><t>AC-4</t></is></c><c t="inlineStr"><is><t>张伟</t></is></c></row>'
+                '<row r="5"><c r="B5" t="inlineStr"><is><t>B5 有 r</t></is></c><c t="inlineStr"><is><t>C5 接着</t></is>'
+                '</c></row><row><c t="inlineStr"><is><t>A6</t></is></c></row>')
+        rels = ('<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="r1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'
+                'comments" Target="../comments1.xml"/></Relationships>')
+        comments = ('<?xml version="1.0"?><comments %s><authors><author>someone</author></authors><commentList>'
+                    '<comment ref="B2" authorId="0"><text><r><t>HIDDEN-COMMENT</t></r></text></comment>'
+                    '</commentList></comments>' % S)
+        d = tmpdir(self)
+        p = xlsx(os.path.join(d, "a.xlsx"), [("规则", None, rows, "")],
+                 [("xl/worksheets/_rels/sheet1.xml.rels", rels), ("xl/comments1.xml", comments)])
+        doc = convert.convert(p)
+        self.assertIn("| 行 | 编号 | 负责人 |  |\n|---|---|---|---|\n| 2 | AC-4 | 张伟 |  |\n| 5 |  | B5 有 r | C5 接着 |"
+                      "\n| 6 | A6 |  |  |", doc.text)
+        self.assertIn(("Excel 批注 规则!B2", "HIDDEN-COMMENT"), doc.hidden)
+        self.assertNotIn("someone", str(doc.hidden))
+        p2 = xlsx(os.path.join(d, "b.xlsx"), [("规则", None, rows, "")], [("xl/workbook.xml", (
+            '<workbook %s %s><sheets><sheet name="规则" r:id="rId1"/><sheet name="缺页" r:id="rId9"/></sheets>'
+            '</workbook>' % (S, R)))])
+        self.assertTrue(any("缺页" in n for n in convert.convert(p2).notes))   # a sheet whose part is missing
 
 
 if __name__ == "__main__":

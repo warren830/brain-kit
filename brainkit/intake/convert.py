@@ -10,6 +10,7 @@ import colorsys
 import csv
 import io
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -274,7 +275,8 @@ def _csv_rows(text, ext):
     first = next((x for x in text.split("\n") if x.strip()), "")
     delims = ("\t",) if ext == ".tsv" else (",", ";", "\t")
     delim = max(delims, key=lambda c: len(next(csv.reader([first], delimiter=c), [])))
-    rows = [(n, r) for n, r in enumerate(csv.reader(io.StringIO(text), delimiter=delim), 1) if any(x.strip() for x in r)]
+    rows = [(n, r) for n, r in enumerate(csv.reader(io.StringIO(text), delimiter=delim), 1)
+            if any(x.strip() for x in r)]
     width = max((len(r) for _, r in rows), default=0)
     return [(n, r + [""] * (width - len(r))) for n, r in rows]
 
@@ -497,6 +499,27 @@ def _q(prefix, tag):
     return "{%s}%s" % (NS[prefix], tag)
 
 
+def _part_rels(z, part):
+    """[(the relationship type's last word, target part)] of a package part, from its _rels/<name>.rels."""
+    base, fname = posixpath.split(part)
+    root = _xml(z, posixpath.join(base, "_rels", fname + ".rels"))
+    out = []
+    for rel in (root.findall(_q("pr", "Relationship")) if root is not None else []):
+        t = rel.get("Target", "")
+        if rel.get("TargetMode") != "External" and t:
+            out.append((rel.get("Type", "").rsplit("/", 1)[-1],
+                        t.lstrip("/") if t.startswith("/") else posixpath.normpath(posixpath.join(base, t))))
+    return out
+
+
+def _md_rows(rows) -> str:
+    """A Markdown table of rows of cell texts, the first row its header (Word and PowerPoint tables)."""
+    width = max(len(r) for r in rows)
+    rows = [[c.replace("|", "\\|").replace("\n", " ") for c in r] + [""] * (width - len(r)) for r in rows]
+    lines = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * width]
+    return "\n".join(lines + ["| " + " | ".join(r) + " |" for r in rows[1:]])
+
+
 def _custom_labels(z, doc):
     root = _xml(z, "docProps/custom.xml")
     if root is None:
@@ -507,6 +530,14 @@ def _custom_labels(z, doc):
             val = "".join(prop.itertext()).strip()
             if val:
                 doc.labels.append(val)
+
+
+def _col_letters(n):
+    s = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
 
 
 def _col_index(ref):
@@ -648,6 +679,7 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
         target = rels.get(sh.get(_q("r", "id")), "")
         root = _xml(z, target) if target else None
         if root is None:
+            d.notes.append("工作表「%s」的内容读不到（文件里没有这一页），没收" % sname)
             continue
         hf = root.find(_q("s", "headerFooter"))
         for part in (list(hf) if hf is not None else []):   # odd / even / first page header and footer
@@ -662,14 +694,17 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
         grid = {}
         maxc = 0
         data = root.find(_q("s", "sheetData"))
+        rnum = 0
         for row in (data.findall(_q("s", "row")) if data is not None else []):
-            rnum = int(row.get("r", "0") or 0)
+            rnum = _int(row.get("r")) or rnum + 1     # r= is optional on rows and cells: then the next one
             row_hidden = row.get("hidden") in ("1", "true")
+            ci = 0
             for c in row.findall(_q("s", "c")):
                 cells += 1
                 if cells > max_cells:
                     break
-                ref = c.get("r", "")
+                ci = _col_index(c.get("r")) or ci + 1
+                ref = "%s%d" % (_col_letters(ci), rnum)
                 t = c.get("t", "n")
                 v = c.find(_q("s", "v"))
                 if t == "s" and v is not None and (v.text or "").isdigit() and int(v.text) < len(shared):
@@ -682,7 +717,6 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
                     val = v.text if v is not None and v.text else ""
                 if not val:
                     continue
-                ci = _col_index(ref)
                 where = "%s!%s" % (sname, ref)
                 if state != "visible":
                     d.hide("隐藏工作表 %s" % where, val)
@@ -695,6 +729,11 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
                 else:
                     grid[(rnum, ci)] = val
                     maxc = max(maxc, ci)
+        for kind, part in _part_rels(z, target):
+            cm = _xml(z, part) if kind == "comments" else None
+            for c in (cm.iter(_q("s", "comment")) if cm is not None else []):
+                d.hide("Excel 批注 %s!%s" % (sname, c.get("ref", "")),
+                       "".join(t.text or "" for t in c.iter(_q("s", "t"))))
         if state != "visible":
             d.notes.append("工作表「%s」是隐藏的（%s），内容已移到隐藏区" % (sname, state))
             continue
@@ -769,6 +808,18 @@ def _w_paragraph(p, d, where, hidden_styles=frozenset()):
     return text
 
 
+def _w_items(parent, tags):
+    """The children of a body, table, row or cell with one of these tags, in order, also inside content controls
+    (w:sdt: a cover page, a form field, a template block) and custom XML: Word shows what is in them."""
+    for el in (list(parent) if parent is not None else []):
+        if el.tag in tags:
+            yield el
+        elif el.tag == _q("w", "sdt"):
+            yield from _w_items(el.find(_q("w", "sdtContent")), tags)
+        elif el.tag == _q("w", "customXml"):
+            yield from _w_items(el, tags)
+
+
 def convert_docx(path, name) -> Doc:
     d = Doc(name, "docx")
     z = _open_zip(path)
@@ -779,25 +830,24 @@ def convert_docx(path, name) -> Doc:
     body = root.find(_q("w", "body"))
     hs = _w_hidden_styles(z)
     out = []
-    for i, el in enumerate(list(body) if body is not None else []):
+    for i, el in enumerate(_w_items(body, (_q("w", "p"), _q("w", "tbl")))):
         if el.tag == _q("w", "p"):
             t = _w_paragraph(el, d, "Word 隐藏文字（第 %d 段）" % (i + 1), hs)
             if t:
                 out.append(t)
-        elif el.tag == _q("w", "tbl"):
+        else:
             rows = []
-            for tr in el.iter(_q("w", "tr")):
+            for tr in _w_items(el, (_q("w", "tr"),)):
                 cells = []
-                for tc in tr.findall(_q("w", "tc")):
+                for tc in _w_items(tr, (_q("w", "tc"),)):
                     ps = [_w_paragraph(p, d, "Word 表格隐藏文字", hs) for p in tc.iter(_q("w", "p"))]
-                    cells.append(" ".join(x for x in ps if x).replace("|", "\\|").replace("\n", " "))
+                    cells.append(" ".join(x for x in ps if x))
                 rows.append(cells)
             if rows:
-                width = max(len(r) for r in rows)
-                rows = [r + [""] * (width - len(r)) for r in rows]
-                lines = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * width]
-                lines += ["| " + " | ".join(r) + " |" for r in rows[1:]]
-                out.append("\n".join(lines))
+                out.append(_md_rows(rows))
+    chunks = len(list(body.iter(_q("w", "altChunk")))) if body is not None else 0
+    if chunks:
+        d.notes.append("有 %d 处嵌入的文档块（altChunk）：里面的内容没收，请另存为普通 docx 再交" % chunks)
     for n in sorted(z.namelist()):
         if re.match(r"word/(header|footer)\d*\.xml$", n):
             hf = _xml(z, n)
@@ -826,8 +876,20 @@ def _p_shapes(tree, hidden=False):
         h = hidden or (cnv is not None and cnv.get("hidden") in ("1", "true"))
         if el.tag == _q("p", "grpSp"):
             yield from _p_shapes(el, h)
-        elif el.tag == _q("p", "sp"):
+        elif el.tag in (_q("p", "sp"), _q("p", "graphicFrame")):
             yield h, el
+
+
+NOTES_SKIP = ("sldNum", "sldImg", "dt", "hdr", "ftr")   # a notes page's slide picture, number, date, header, footer
+
+
+def _a_text(p) -> str:
+    return "".join(x.text or "" for x in p.iter(_q("a", "t")))
+
+
+def _p_placeholder(sp, kinds) -> bool:
+    ph = sp.find("%s/%s/%s" % (_q("p", "nvSpPr"), _q("p", "nvPr"), _q("p", "ph")))
+    return ph is not None and ph.get("type") in kinds
 
 
 def convert_pptx(path, name) -> Doc:
@@ -837,22 +899,41 @@ def convert_pptx(path, name) -> Doc:
     slides = sorted((n for n in z.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n)),
                     key=lambda n: int(re.search(r"(\d+)", n.rsplit("/", 1)[1]).group(1)))
     out = []
+    unread = []                                      # slides with a chart, SmartArt or embedded object
     for n in slides:
         root = _xml(z, n)
         num = re.search(r"(\d+)", n.rsplit("/", 1)[1]).group(1)
         d.images += len(list(root.iter(_q("p", "pic"))))
         visible = []
         for hidden, sp in _p_shapes(root.find("%s/%s" % (_q("p", "cSld"), _q("p", "spTree")))):
-            t = "\n".join(x.text for x in sp.iter(_q("a", "t")) if x.text and x.text.strip())
+            if sp.tag == _q("p", "graphicFrame"):
+                tbl = sp.find(".//" + _q("a", "tbl"))
+                if tbl is None:
+                    unread.append(num)
+                    continue
+                rows = [[" ".join(_a_text(p) for p in tc.iter(_q("a", "p"))).strip()
+                         for tc in tr.findall(_q("a", "tc"))] for tr in tbl.findall(_q("a", "tr"))]
+                t = "\n%s\n" % _md_rows(rows) if any(any(r) for r in rows) else ""
+            else:
+                t = "\n".join(x.text for x in sp.iter(_q("a", "t")) if x.text and x.text.strip())
             if hidden:
                 d.hide("隐藏形状（幻灯片 %s）" % num, t)
             elif t:
                 visible.append(t)
-        text = "\n".join(visible)
+        text = "\n".join(visible).strip("\n")
+        for kind, part in _part_rels(z, n):
+            notes = _xml(z, part) if kind == "notesSlide" else None
+            if notes is not None:                    # speaker notes: not on the slide
+                d.hide("演讲者备注（幻灯片 %s）" % num, "\n".join(
+                    _a_text(p) for sp in notes.iter(_q("p", "sp")) if not _p_placeholder(sp, NOTES_SKIP)
+                    for p in sp.iter(_q("a", "p"))))
         if root.get("show") in ("0", "false"):
             d.hide("隐藏幻灯片 %s" % num, text)
             continue
         out.append("## 幻灯片 %s\n\n%s" % (num, text or "（无文字）"))
+    if unread:
+        d.notes.append("图表、SmartArt 或嵌入对象 %d 个（幻灯片 %s）：里面的文字没收，涉及的需求要人确认"
+                       % (len(unread), "、".join(sorted(set(unread), key=int))))
     d.notes.append("PPT 只收文字；页面外或透明的形状没做检查")
     d.text = ZW_RE.sub("", "\n\n".join(out)) + "\n"
     return d
