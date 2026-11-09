@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 
 from . import config, lean, riskpaths, runrec, sign
 from .common import BrainError, git, git_out, load_json, parse_branch, parse_iso, utcnow
@@ -252,6 +253,31 @@ def changed_paths(repo, *revs, paths=()) -> list:
     return [x for x in p.stdout.decode("utf-8", "surrogateescape").split("\0") if x]
 
 
+def _fold(path) -> str:
+    """A path as a case-insensitive disk (macOS, Windows) compares it: there Agents.md is AGENTS.md."""
+    return unicodedata.normalize("NFC", path).casefold()
+
+
+def in_brain(path, brain_dir) -> bool:
+    """Is `path` the Brain's (brain_dir and below, AGENTS.md) in any letter case? A clone on a case-insensitive disk
+    checks Agents.md or Brain/TECH.md out over the real file, so those count as changing it too."""
+    p, d = _fold(path), _fold(str(brain_dir).strip("/"))
+    return p == _fold("AGENTS.md") or p == d or p.startswith(d + "/")
+
+
+def _index_entries(repo) -> list:
+    """[(mode, path)] of the checkout's index, NUL-separated (odd names are not quoted)."""
+    p = subprocess.run(["git", "-C", repo, "ls-files", "-s", "-z"], capture_output=True)
+    if p.returncode != 0:
+        raise BrainError("git ls-files failed: %s" % p.stderr.decode("utf-8", "replace").strip())
+    out = []
+    for rec in p.stdout.decode("utf-8", "surrogateescape").split("\0"):
+        meta, tab, path = rec.partition("\t")
+        if tab:
+            out.append((meta.split(" ", 1)[0], path))
+    return out
+
+
 def lean_hashes(data) -> set:
     """sha256 hex of a file as Lean may have hashed it. Lean hashes the checked-out file; git stores the blob, which
     may differ only in line ends (`eol=crlf` attributes, core.autocrlf): the blob, its LF form and its CRLF form."""
@@ -390,11 +416,10 @@ def check_run(repo, branch, env) -> list:
     base = tgt.base or rec["brain_commit"]
     if git_out(repo, "ls-files", "--", ".brain-materials"):
         probs.append("material packages are committed (.brain-materials/ must stay out of git)")
-    links = [l.split("\t", 1)[1] for l in git_out(repo, "ls-files", "-s", "--", cfg["brain_dir"], "AGENTS.md").split("\n")
-             if l.startswith("120000 ")]
+    links = [p for mode, p in _index_entries(repo) if mode == "120000" and in_brain(p, cfg["brain_dir"])]
     if links:
         probs.append("symlinks in the Brain (%s): the Brain must be real files" % ", ".join(links[:5]))
-    touched = changed_paths(repo, "%s..HEAD" % base, paths=(cfg["brain_dir"], "AGENTS.md"))
+    touched = [p for p in changed_paths(repo, "%s..HEAD" % base) if in_brain(p, cfg["brain_dir"])]
     if touched:
         probs.append("a run branch changed the Brain (%s): write brain-proposal blocks in decisions.md instead; "
                      "`brain reflect` turns them into a Brain MR for the file owners" % ", ".join(touched[:5]))
