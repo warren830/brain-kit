@@ -125,5 +125,20 @@ class KiroUpgradedAgentSpec(unittest.TestCase):
         self.assertIn(wrong["hooks"][0], fixed["hooks"])
 
 
+class ReflectWorktreeNamedAfterTheRepo(unittest.TestCase):
+    """Live regression 2026-11-09: reflect run inside a requirement's worktree named its worktree folder after the
+    requirement (~/.brain/worktrees/subtract) instead of the repository."""
+
+    def test_worktree_root_uses_the_main_repo(self):
+        from brainkit import reflect
+        d = tmpdir(self)
+        repo = git_repo(os.path.join(d, "demo"))
+        commit_file(repo, "a.txt", "a\n")
+        wt = os.path.join(d, "subtract")
+        sh("git", "-C", repo, "worktree", "add", "-q", "--detach", wt)
+        self.assertEqual(os.path.basename(reflect.worktree_root(wt)), "demo")
+        self.assertEqual(os.path.basename(reflect.worktree_root(repo)), "demo")
+
+
 if __name__ == "__main__":
     unittest.main()

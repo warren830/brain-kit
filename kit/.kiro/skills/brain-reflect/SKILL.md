@@ -55,7 +55,8 @@ One to five lines the next run can act on. State the rule, not the story.
 Some things do not belong in the Brain yet: knowledge nobody could give you, a test that should exist, a check a
 person did by hand. Write one `brain-gap` block each (next to your proposals). `brain reflect --apply` files every
 new gap as a requirement (an intent with source `gap`, `brain intent list` shows it); the same title and text are
-filed once.
+filed once. Run `brain intent list` first: if an open requirement already covers the gap (even in other words), cite
+its key in `refs:` of a proposal or in decisions.md instead of writing a second gap.
 
 ````
 ```brain-gap

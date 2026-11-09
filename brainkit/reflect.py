@@ -496,7 +496,11 @@ def _intent(raw, where) -> str:
 
 
 def worktree_root(repo) -> str:
-    return os.path.join(os.path.expanduser("~"), ".brain", "worktrees", os.path.basename(os.path.realpath(repo)))
+    """~/.brain/worktrees/<repo name>: the main repository's name, also when reflect runs inside a run's worktree
+    (a worktree's own folder is named after the requirement, not the repo)."""
+    common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False).stdout.strip()
+    main = os.path.dirname(common) if common.endswith(os.sep + ".git") else (common or repo)
+    return os.path.join(os.path.expanduser("~"), ".brain", "worktrees", os.path.basename(os.path.realpath(main)))
 
 
 def main_cfg(repo, base):
