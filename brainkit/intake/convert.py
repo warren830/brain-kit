@@ -580,6 +580,12 @@ def _col_index(ref):
     return n
 
 
+def head_and_tail(text, head=4000, tail=2000) -> str:
+    """The part of a text gate 2 looks at for a classification marking (package.detect_class reads a document's
+    first 4000 and last 2000 characters)."""
+    return text if len(text) <= head + tail else text[:head] + "\n" + text[-tail:]
+
+
 # the default indexed colours that matter here (a workbook's own <indexedColors> replaces them): black and white
 XL_PALETTE = {0: "000000", 1: "FFFFFF", 8: "000000", 9: "FFFFFF", 64: "000000", 65: "FFFFFF"}
 
@@ -725,6 +731,7 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
                 hidden_cols.update(range(int(c.get("min", "0")), int(c.get("max", "0")) + 1))
         grid = {}
         maxc = 0
+        values = []                                  # every cell of the sheet, hidden ones too, in order
         data = root.find(_q("s", "sheetData"))
         rnum = 0
         for row in (data.findall(_q("s", "row")) if data is not None else []):
@@ -749,6 +756,7 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
                     val = v.text if v is not None and v.text else ""
                 if not val:
                     continue
+                values.append(val)
                 where = "%s!%s" % (sname, ref)
                 if state != "visible":
                     d.hide("隐藏工作表 %s" % where, val)
@@ -761,6 +769,9 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
                 else:
                     grid[(rnum, ci)] = val
                     maxc = max(maxc, ci)
+        # each sheet is a document of its own for gate 2 (a hidden sheet marked 绝密, a 机密 sheet in the middle of a
+        # long workbook): its head and tail, as gate 2 reads a document's
+        d.labels.append(head_and_tail("%s\n%s" % (sname, "\n".join(values))))
         for kind, part in _part_rels(z, target):
             cm = _xml(z, part) if kind == "comments" else None
             for c in (cm.iter(_q("s", "comment")) if cm is not None else []):

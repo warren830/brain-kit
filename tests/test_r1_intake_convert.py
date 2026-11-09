@@ -162,7 +162,7 @@ class R1_51SheetHeaderFooter(unittest.TestCase):
         foot = ('<headerFooter><oddHeader>&amp;L&amp;"Arial,Bold"&amp;12R&amp;&amp;D</oddHeader>'
                 '<oddFooter>&amp;CConfidential&amp;R第 &amp;P 页</oddFooter></headerFooter>')
         p = xlsx(os.path.join(src, "规则.xlsx"), [("规则", None, [["规则", "说明"], ["R1", "14 天内可退"]], foot)])
-        self.assertEqual(convert.convert(p).labels, ["R&D", "Confidential 第 页"])
+        self.assertEqual(convert.convert(p).labels[:2], ["R&D", "Confidential 第 页"])
         with self.assertRaises(BrainError) as cm:
             build(src)
         self.assertIn("规则.xlsx=confidential", str(cm.exception))
@@ -378,6 +378,36 @@ class R1_58Big5(unittest.TestCase):
         for raw in ("陳大文", "張偉", "张伟", "9123 4567"):
             self.assertNotIn(raw, blob)
         self.assertIn("phone×1", [f for f in rep["findings"] if "big5.txt" in f][0])
+
+
+class R1_61MarkingsOnEverySheet(unittest.TestCase):
+    """Gate 2 reads each sheet's head and tail (a hidden sheet marked 绝密, a 机密 sheet in the middle of a long
+    workbook) and the hidden area, which goes into the package too."""
+    LONG = [["编号", "需求"]] + [["R%d" % i, "退款规则说明第 %d 条：按原路退回，状态写入退款单。" % i] for i in range(150)]
+
+    def gate2(self, src):
+        return build(src, dry_run=True)[0]
+
+    def test_hidden_and_middle_sheets_and_hidden_text(self):
+        d = tmpdir(self)
+        a = os.path.join(d, "a")
+        xlsx(os.path.join(a, "x.xlsx"), [("需求", None, [["编号", "需求"], ["R1", "14 天内可退"]], ""),
+                                         ("内部定价", "hidden", [["绝密 · Top Secret"], ["渠道", "底价费率"]], "")])
+        rep = self.gate2(a)
+        self.assertEqual(rep["classification"], "secret")
+        self.assertTrue(any("绝密" in b for b in rep["blocking"]))
+        b = os.path.join(d, "b")
+        xlsx(os.path.join(b, "x.xlsx"), [("需求", None, self.LONG, ""), ("费率", None, [["机密 · Confidential"],
+                                                                                    ["银联", "0.18%"]], ""),
+                                         ("附录", None, self.LONG, "")])
+        self.assertEqual(self.gate2(b)["classification"], "confidential")
+        c = os.path.join(d, "c")
+        os.makedirs(c)
+        docx(os.path.join(c, "x.docx"), wp("退款需求") + wp("绝密：底价", "<w:vanish/>"))
+        self.assertEqual(self.gate2(c)["classification"], "secret")
+        e = os.path.join(d, "e")
+        xlsx(os.path.join(e, "x.xlsx"), [("需求", None, self.LONG, ""), ("附录", None, self.LONG, "")])
+        self.assertEqual(self.gate2(e)["classification"], "internal")
 
 
 if __name__ == "__main__":

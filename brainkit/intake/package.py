@@ -24,7 +24,7 @@ import re
 from .. import __version__
 from ..common import BrainError, canonical, iso, utcnow, write_json, load_json
 from . import checks
-from .convert import Refused, convert
+from .convert import Refused, convert, head_and_tail
 
 CLASSES = ("public", "internal", "confidential", "secret")
 CLASS_MARKERS = [
@@ -196,7 +196,8 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
             refused.append(dict(info, reason="个人信息 %d 处，超过上限 %d（成批的个人信息不收）"
                                 % (pii, kit_intake.get("bulk_pii_limit", 30))))
             continue
-        cls = detect_class(doc.text, doc.labels)
+        # the hidden area goes into the package too (extras/hidden.md): gate 2 reads it as well
+        cls = detect_class(doc.text, doc.labels + [head_and_tail(t) for _, t in doc.hidden])
         if cls:
             detected.append((name, cls))
         converted.append((sid, name, info, doc, hits, hidden_hits))
