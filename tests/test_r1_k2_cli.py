@@ -371,5 +371,38 @@ class R1_26_PushedNotLabelledExits1(Project):
         self.assertEqual(self.pushed(), "PAY-1: hand off to team runner")
 
 
+class R1_27_NoPushSaysMaterialsAreNotPublished(Project):
+    def test_r1_27_no_push_with_a_package_says_it_is_not_published(self):
+        self.add_origin()
+        remote = os.path.join(self.d, "intake.git")
+        sh("git", "init", "-q", "--bare", "-b", "main", remote)
+        store = os.path.join(self.d, "intake")
+        sh("git", "clone", "-q", remote, store)
+        for k, v in (("user.name", "t"), ("user.email", "t@example.com")):
+            sh("git", "-C", store, "config", k, v)
+        rc, out = brain(self.repo, "start", "refund", "--key", "PAY-1", "--doc", self.docs(), "--classification",
+                        "internal", "--consent", "--store", store)
+        self.assertEqual(rc, 0, out)
+        edit_status(self.repo, load_json(os.path.join(self.repo, "runs", "PAY-1", "run.json"))["intent"])
+        rc, out = brain(self.repo, "handoff", "--no-push", "--store", store)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("material package PKG-PAY-1-1 not published to brain-intake", out)
+        self.assertIn("run `brain handoff` again without --no-push", out)
+        self.assertNotIn("Push ai/alice/PAY-1-refund and add label", out)
+        self.assertEqual(sh("git", "-C", remote, "rev-list", "--all").stdout, "")     # nothing published
+        rc, out = brain(self.repo, "handoff", "--no-label", "--store", store)            # as the message says
+        self.assertEqual(rc, 1, out)
+        self.assertIn("packages/PKG-PAY-1-1/manifest.json",
+                      sh("git", "-C", remote, "ls-tree", "-r", "--name-only", "main").stdout)
+
+    def test_r1_27_no_push_without_a_package_says_push_and_label(self):
+        rc, out = brain(self.repo, "start", "refund", "--key", "PAY-1")
+        self.assertEqual(rc, 0, out)
+        edit_status(self.repo, load_json(os.path.join(self.repo, "runs", "PAY-1", "run.json"))["intent"])
+        rc, out = brain(self.repo, "handoff", "--no-push")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Push ai/alice/PAY-1-refund and add label 'ai-handoff' to its MR", out)
+
+
 if __name__ == "__main__":
     unittest.main()

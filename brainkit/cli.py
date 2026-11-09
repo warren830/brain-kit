@@ -1248,6 +1248,14 @@ def cmd_handoff(a):
     git(repo, "add", "--", rel)
     git(repo, "commit", "-q", "-m", "%s: hand off to team runner" % rec["key"])
     desc = handoff_description(repo, cfg, rec["key"])
+    unpublished = [m["package"] for m in rec.get("materials") or []] if a.no_push else []
+    if unpublished:
+        # pushing and labelling by hand would hand over a run whose package the bridge cannot find in brain-intake
+        print("Committed the hand-over; not pushed, and material package %s not published to brain-intake either "
+              "(--no-push skips both; the bridge refuses a hand-over whose package is not there). When it is ready, "
+              "run `brain handoff` again without --no-push: it publishes the package, pushes %s and labels its MR%s."
+              % (", ".join(unpublished), br, " (its description is %s)" % md if desc is not None else ""))
+        return 0
     if a.no_push or not _has_origin(repo):
         print("Committed the hand-over; not pushed. Push %s and add label '%s' to its MR%s." % (
             br, cfg["handoff_label"], " (its description is %s)" % md if desc is not None else ""))
