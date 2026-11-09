@@ -26,7 +26,7 @@ import re
 import subprocess
 import sys
 
-from . import config, lean, runrec, sign
+from . import config, lean, riskpaths, runrec, sign
 from .common import BrainError, git, git_out, load_json, parse_branch, parse_iso, utcnow
 
 
@@ -215,29 +215,9 @@ class Target:
 
 
 def glob_match(path, pattern) -> bool:
-    """gitignore-like: '**' spans directories, '*' and '?' stay inside one; a trailing '/' means the whole dir."""
-    pat = pattern.strip()
-    if pat.endswith("/"):
-        pat += "**"
-    rx = ""
-    i = 0
-    while i < len(pat):
-        if pat.startswith("**/", i):
-            rx += "(?:.*/)?"
-            i += 3
-        elif pat.startswith("**", i):
-            rx += ".*"
-            i += 2
-        elif pat[i] == "*":
-            rx += "[^/]*"
-            i += 1
-        elif pat[i] == "?":
-            rx += "[^/]"
-            i += 1
-        else:
-            rx += re.escape(pat[i])
-            i += 1
-    return re.fullmatch(rx, path) is not None
+    """Is the file `path` under the gates/risk-paths `pattern`? The .gitignore rules (riskpaths): src/pay, /src/pay/,
+    *.sql, src/**/x. BrainError for a pattern those rules do not support."""
+    return riskpaths.matches(path, pattern)
 
 
 def lean_events(repo, intent):
@@ -350,10 +330,13 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
         return []
     pats = [l.split("#", 1)[0].strip() for l in text.splitlines()]
     pats = [x for x in pats if x]
+    bad = ["%s: %s: brain-ci fails every run MR until it is fixed" % (cfg["risk_paths_file"], why)
+           for why in (riskpaths.problem(x) for x in pats) if why]
+    pats = [x for x in pats if not riskpaths.problem(x)]
     changed = changed_paths(repo, base, "HEAD")
     risky = sorted({f for f in changed if any(glob_match(f, x) for x in pats)})
     if not risky:
-        return []
+        return bad
     shown = ", ".join(risky[:5])
     ev = lean_events(repo, rec["intent"])
     skipped = any(e.get("event") == "STAGE_SKIPPED" and (e.get("data") or {}).get("stage") == "application-design"
@@ -361,17 +344,17 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
     design_path = "%s/%s/inception/application-design/application-design.md" % (lean.DOCS, rec["intent"])
     designed = os.path.exists(os.path.join(repo, design_path))
     if skipped or not designed:
-        return ["risk paths changed (%s) but application design was %s: this change needs the design stage"
-                % (shown, "skipped" if skipped else "not written")]
+        return bad + ["risk paths changed (%s) but application design was %s: this change needs the design stage"
+                      % (shown, "skipped" if skipped else "not written")]
     approvals = [v for v in latest_design_answers(repo, vouchers) if v.get("choice") == "approve"]
     if not approvals:
-        return ["risk paths changed (%s): no design approval signed by the bridge for %s (ask through the MR: "
-                "park.json with lean_request DESIGN ...)" % (shown, rec["key"])]
+        return bad + ["risk paths changed (%s): no design approval signed by the bridge for %s (ask through the MR: "
+                      "park.json with lean_request DESIGN ...)" % (shown, rec["key"])]
     why = [design_approval_covers(repo, v, design_path, risky) for v in approvals]
     if all(why):
-        return ["risk paths changed (%s): no design approval covers them any more (%s): ask for a fresh DESIGN "
-                "approval through the MR" % (shown, "; ".join(why[:3]))]
-    return []
+        return bad + ["risk paths changed (%s): no design approval covers them any more (%s): ask for a fresh DESIGN "
+                      "approval through the MR" % (shown, "; ".join(why[:3]))]
+    return bad
 
 
 def _claimed_child(repo, rec) -> bool:
