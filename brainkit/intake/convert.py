@@ -5,6 +5,8 @@ hidden sheets/rows/columns, ';;;' cells, hidden slides) goes to Doc.hidden, neve
 """
 from __future__ import annotations
 
+import csv
+import io
 import os
 import re
 import shutil
@@ -107,11 +109,40 @@ def sniff(path) -> str:
 
 # ---------- text / markdown ----------
 
+def table_markdown(rows) -> str:
+    """rows: [(row number, [cell, ...])], all the same width -> a Markdown table. Its header is the first row with
+    two or more cells (the first row, for one column): a sheet or a csv export has its column names there, and gate 4
+    finds the name columns (负责人, Owner ...) by the table header, as in a Markdown table. Rows above it (a title, a
+    marking) are lines before the table. The first column (行) keeps the row numbers; a line break in a cell is <br>
+    (张伟 / 李娜 on two lines are two people)."""
+    def cell(v):
+        return "<br>".join(" ".join(x.split()) for x in v.split("\n") if x.strip()).replace("|", "\\|")
+
+    width = len(rows[0][1])
+    need = min(2, width)
+    h = next((k for k, (_, vals) in enumerate(rows) if sum(1 for v in vals if v.strip()) >= need), 0)
+    before = ["第 %d 行：%s" % (r, " · ".join(cell(v) for v in vals if v.strip())) for r, vals in rows[:h]]
+    lines = ["| 行 | " + " | ".join(cell(v) for v in rows[h][1]) + " |", "|" + "---|" * (width + 1)]
+    lines += ["| %d | %s |" % (r, " | ".join(cell(v) for v in vals)) for r, vals in rows[h + 1:]]
+    return "\n\n".join(before + ["\n".join(lines)])
+
+
+def _csv_rows(text, ext):
+    """[(record number, [cell, ...])] of a csv / tsv (the delimiter of a .csv: the one of , ; tab that splits the
+    first line most), empty records left out, all padded to one width."""
+    first = next((x for x in text.split("\n") if x.strip()), "")
+    delims = ("\t",) if ext == ".tsv" else (",", ";", "\t")
+    delim = max(delims, key=lambda c: len(next(csv.reader([first], delimiter=c), [])))
+    rows = [(n, r) for n, r in enumerate(csv.reader(io.StringIO(text), delimiter=delim), 1) if any(x.strip() for x in r)]
+    width = max((len(r) for _, r in rows), default=0)
+    return [(n, r + [""] * (width - len(r))) for n, r in rows]
+
+
 def convert_text(path, name) -> Doc:
     ext = os.path.splitext(name)[1].lower()
     with open(path, "rb") as f:
         text = decode_text(f.read()).replace("\r\n", "\n").replace("\r", "\n")
-    d = Doc(name, "markdown" if ext in (".md", ".markdown") else "text")
+    d = Doc(name, "markdown" if ext in (".md", ".markdown") else "csv" if ext in (".csv", ".tsv") else "text")
     for m in HTML_COMMENT_RE.finditer(text):
         d.hide("HTML 注释", m.group(1))
     text = HTML_COMMENT_RE.sub("", text)
@@ -122,6 +153,17 @@ def convert_text(path, name) -> Doc:
         d.notes.append("去掉了零宽或方向控制字符 %d 个" % len(ZW_RE.findall(text)))
         text = ZW_RE.sub("", text)
     d.images = len(MD_IMAGE_RE.findall(text))
+    if d.kind == "csv":
+        # a table, as the same rows in an xlsx or a Markdown file: gate 4 reads the name columns by the header
+        try:
+            rows = _csv_rows(text, ext)
+        except csv.Error as e:
+            rows = None
+            d.notes.append("读不成表格（%s），按纯文本收：表里人名列的人名没有按列打码" % e)
+        if rows:
+            d.text = table_markdown(rows) + "\n"
+            return d
+        d.kind = "text"
     if d.kind == "text":
         fence = "````" if "```" in text else "```"
         text = "%stext\n%s\n%s" % (fence, text.strip("\n"), fence)
@@ -329,14 +371,6 @@ def _col_index(ref):
     return n
 
 
-def _col_name(n):
-    s = ""
-    while n:
-        n, r = divmod(n - 1, 26)
-        s = chr(65 + r) + s
-    return s
-
-
 def convert_xlsx(path, name, max_cells=20000) -> Doc:
     d = Doc(name, "xlsx")
     z = _open_zip(path)
@@ -419,13 +453,8 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
         if not grid:
             parts.append("## 工作表：%s\n\n（空）\n" % sname)
             continue
-        rows = sorted({r for r, _ in grid})
-        header = "| 行 | " + " | ".join(_col_name(i) for i in range(1, maxc + 1)) + " |"
-        lines = [header, "|" + "---|" * (maxc + 1)]
-        for r in rows:
-            vals = [" ".join(grid.get((r, i), "").split()).replace("|", "\\|") for i in range(1, maxc + 1)]
-            lines.append("| %d | %s |" % (r, " | ".join(vals)))
-        parts.append("## 工作表：%s\n\n%s\n" % (sname, "\n".join(lines)))
+        rows = [(r, [grid.get((r, i), "") for i in range(1, maxc + 1)]) for r in sorted({r for r, _ in grid})]
+        parts.append("## 工作表：%s\n\n%s\n" % (sname, table_markdown(rows)))
     if cells > max_cells:
         d.notes.append("单元格超过 %d 个，后面的没收" % max_cells)
     d.images = sum(1 for n in z.namelist() if n.startswith("xl/media/"))
