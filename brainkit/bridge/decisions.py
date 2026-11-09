@@ -45,7 +45,7 @@ from datetime import timedelta
 from .. import sign
 from ..common import CTRL_RE, SHA_RE, BrainError, iso, load_json, plain, utcnow, write_json
 from ..intake import checks
-from ..rest import HttpError, gl_time, head_pushed_at
+from ..rest import HttpError, gl_time, head_pushed_at, q
 from .delivery import Delivery, one_line
 
 KINDS = ("clarify", "design", "plan", "acceptance", "action", "other")
@@ -102,7 +102,7 @@ REPLY_STATES = ("original", "edited", "changed", "unknown")
 ASKING_STALE_S = 300
 # a run is told about at most this many failed pipelines (brain-run fixes CI for at most 3 rounds, then parks)
 MAX_CI_NOTICES = 6
-# an acceptance question is asked once the MR head's own pipeline is one of these (or the head has none)
+# an acceptance question is asked once the MR head's own pipeline is one of these (or the MR has no pipeline at all)
 CI_GREEN = ("success", "skipped")
 # ... and while it is one of these, a person has to act first (re-run it, run its manual job): the MR is told
 CI_NEEDS_PERSON = ("canceled", "manual")
@@ -846,17 +846,23 @@ class DecisionLoop(Delivery):
             "`问题没发出，等人处理：签名服务没签 %s 的回答` 结束这一轮。") % (d["id"], row["req"], d["id"], d["id"]), sha=sha)
 
     def _acceptance_waits_for_ci(self, row, mr, head) -> bool:
-        """An acceptance question is asked on a commit whose own pipeline passed (or that has none: no CI for it).
-        Once the product approves, Lean closes the intent and the run changes no code; so the product accepts what CI
-        accepted, and a CI fix never comes after the acceptance. While the head's pipeline runs, failed or needs a
-        person, the question waits (True; looked at again each round): a failed one goes to the run as a CI notice
-        (it fixes, releases again and parks again); one that is canceled or waits for a manual job, one that runs
-        longer than acceptance_ci_wait_minutes, and a failure the run can no longer be told about, are told on the
-        MR once."""
+        """An acceptance question is asked on a commit whose own pipeline passed (or, on an MR with no pipeline at all,
+        that has none: no CI for it). Once the product approves, Lean closes the intent and the run changes no code;
+        so the product accepts what CI accepted, and a CI fix never comes after the acceptance. While the head's
+        pipeline is not on the MR yet (_waits_for_heads_pipeline), runs, failed or needs a person, the question waits
+        (True; looked at again each round): a failed one goes to the run as a CI notice (it fixes, releases again and
+        parks again); one that is canceled or waits for a manual job, one that runs longer than
+        acceptance_ci_wait_minutes or does not come in that time, and a failure the run can no longer be told about,
+        are told on the MR once."""
         from .delivery import notice_send_id
         pl = mr.get("head_pipeline")
-        if not isinstance(pl, dict) or str(pl.get("sha") or "") != head:
-            return False
+        if not isinstance(pl, dict):
+            pl = self._newest_pipeline(row)
+            if pl is None:
+                return False                    # an MR without any pipeline: no CI for it
+            mr = dict(mr, head_pipeline=pl)
+        if str(pl.get("sha") or "") != head:
+            return self._waits_for_heads_pipeline(row, head, pl)
         status = str(pl.get("status") or "")
         held = self._held_key(row, head)
         if status in CI_GREEN:
@@ -887,6 +893,42 @@ class DecisionLoop(Delivery):
                     "%s 的验收问题（提交 %s）在等 MR 的流水线 #%d 跑完（现在是 %s，等了 %d 分钟以上）。通过以后桥自动发出验收问题；"
                     "流水线一直不动的话请看一下。") % (run_id, head[:12], pid, status or "?", wait), run_id=run_id)
         self.out("%s: the acceptance question at %s waits for pipeline #%d (%s)" % (run_id, head[:12], pid, status))
+        return True
+
+    def _newest_pipeline(self, row):
+        """The MR's newest pipeline (GET /projects/:id/merge_requests/:iid/pipelines, newest first), when the MR shows
+        no head pipeline: None when it has none, or GitLab serves no pipelines for it (403, 404: CI/CD off). Any
+        other error is raised: the question is looked at again next round."""
+        try:
+            rows = self.gl.call("GET", "/projects/%s/merge_requests/%d/pipelines"
+                                % (q(row["project"]), int(row["iid"])), {"per_page": 1})
+        except HttpError as e:
+            if e.status in (403, 404):
+                return None
+            raise
+        return next((p for p in rows if isinstance(p, dict)), None) if isinstance(rows, list) else None
+
+    def _waits_for_heads_pipeline(self, row, head, pl) -> bool:
+        """The MR runs CI (`pl`, its head pipeline or newest one, is an earlier commit's) but has no pipeline for its
+        head yet: GitLab creates a push's pipeline a moment after the push (until then head_pipeline is null, or,
+        on older GitLab, still the previous commit's). That is not a commit without CI: the acceptance question waits
+        for the head's own (True). When none comes within acceptance_ci_wait_minutes (CI rules may skip a commit),
+        the MR is told once: a person runs a pipeline for the head."""
+        run_id, held = row["run_id"], self._held_key(row, head)
+        self.ledger.bump(held, run_id)
+        since = str(self.ledger.notice(held)["created"])
+        try:
+            pid = int(pl.get("id") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        wait = sign.seconds(self.cfg.get("acceptance_ci_wait_minutes"), 60.0)
+        if since <= iso(utcnow() - timedelta(minutes=wait)):
+            self.tell_mr_once("ciheld-none:%s:%s" % (run_id, head[:12]), row["project"], row["iid"], (
+                "%s 的验收问题（提交 %s）在等这个提交自己的流水线，可 %d 分钟以上 MR 上还没有它的流水线（最近的是提交 %s 的 #%d）。"
+                "CI 规则跳过了这个提交的话，请为它运行一次流水线；通过以后桥自动发出验收问题，不用别的操作。")
+                % (run_id, head[:12], wait, str(pl.get("sha") or "?")[:12], pid), run_id=run_id)
+        self.out("%s: the acceptance question at %s waits for the head's pipeline (the MR's newest is #%d, of %s)"
+                 % (run_id, head[:12], pid, str(pl.get("sha") or "?")[:12]))
         return True
 
     @staticmethod

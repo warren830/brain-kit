@@ -5,6 +5,8 @@ adapter's park.json allowance and the bridge's park.json questions. Each class n
   R1-02  deploy/brain-runnerd.service (ProtectSystem=strict) left runnerd's brain-intake clone, examples/runnerd.json
          intake_dir, read-only: its `git pull` failed, and a run with a newly published material package never got a
          workspace.
+  R1-04  the acceptance question went out while the head's own pipeline was not on the MR yet (head_pipeline null, or
+         still the previous commit's); the pipeline then failed, and the product's approve reached the run as RELEASE.
 """
 import importlib.util
 import json
@@ -134,6 +136,93 @@ class R102RunnerdUnit(unittest.TestCase):
         toc = os.path.join(ready["path"], ".brain-materials", mat["package"], "toc.md")
         self.assertTrue(os.path.isfile(toc))
         self.assertFalse(os.access(toc, os.W_OK))       # copied read-only
+
+
+# ---------- R1-04: the acceptance question waits for the head's own pipeline ----------
+
+@unittest.skipUnless(sign.available(), "ssh-keygen not found")
+class R104AcceptanceWaitsForTheHeadsPipeline(unittest.TestCase):
+    """GitLab creates a push's pipeline a moment after the push: until then the MR's head_pipeline is null, or (older
+    GitLab) still the previous commit's. That is not a commit without CI: the question waits for the head's own."""
+
+    def setUp(self):
+        t = self.t = r4.fixture(self)
+        t.dispatched()
+        r4.ci_routes(t)
+        self.mr_pipelines, self.pipelines_down = [], False        # GET .../merge_requests/:iid/pipelines
+        t.fake.on("GET", tb.GL + r"/merge_requests/(\d+)/pipelines", self.list_pipelines)
+
+    def list_pipelines(self, m, qy, b):
+        return (502, b"Bad Gateway") if self.pipelines_down else (200, list(self.mr_pipelines))
+
+    def acceptance(self, h="8cf2cbce"):
+        return self.t.park(kind="acceptance", options=[], lean_request="RELEASE " + h, question="请验收 AC-1..AC-3")
+
+    def approve_reaches_nobody(self):
+        t = self.t
+        t.reply(5, "carol", "answer D-1 approve")
+        self.assertEqual(t.bridge.collect(), 0)
+        self.assertEqual([m for m in r4.to_run(t) if m.startswith("决策 ")], [])
+
+    def test_head_pipeline_still_the_previous_commits(self):
+        t = self.t
+        old = t.mrs[5]["sha"]
+        r4.pipeline(t, 41, "failed", sha=old)            # the run's last push failed; it fixed and parked again
+        new = self.acceptance()
+        self.assertEqual(t.bridge.watch(), 0)
+        self.assertEqual((r4.asked(t), r4.ci_notices(t)), ([], []))   # nor is the old failure sent again
+        r4.pipeline(t, 42, "failed", sha=new)            # a moment later: the head's own, failed
+        self.assertEqual(t.bridge.watch(), 0)
+        self.assertEqual(r4.asked(t), [])
+        self.assertEqual(len(r4.ci_notices(t, 42)), 1, r4.to_run(t))   # not held back by a question
+        self.approve_reaches_nobody()
+
+    def test_head_pipeline_null_on_an_mr_that_runs_ci(self):
+        t = self.t
+        self.mr_pipelines = [{"id": 76, "sha": t.mrs[5]["sha"], "status": "success"}]
+        new = self.acceptance()
+        t.mrs[5]["head_pipeline"] = None
+        for _ in range(2):
+            self.assertEqual(t.bridge.watch(), 0)
+        r4.pipeline(t, 77, "failed", sha=new)
+        self.assertEqual(t.bridge.watch(), 0)
+        self.assertEqual(len(r4.ci_notices(t, 77)), 1, r4.to_run(t))
+        self.approve_reaches_nobody()
+        self.acceptance("9d3e0a17")                      # fixed, released and parked again
+        t.mrs[5]["head_pipeline"] = None
+        self.assertEqual(t.bridge.watch(), 0)
+        r4.pipeline(t, 78, "success")
+        self.assertEqual(t.bridge.watch(), 1)
+        self.assertIn("RELEASE 9d3e0a17", r4.notes(t, start="**D-1")[0])
+
+    def test_an_mr_with_no_pipeline_at_all_is_asked_at_once(self):
+        self.acceptance()                                # no CI: brain-run §6 "or that has none"
+        self.assertEqual(self.t.bridge.watch(), 1)
+
+    def test_pipelines_that_cannot_be_read_hold_the_question(self):
+        t = self.t
+        self.pipelines_down = True
+        self.acceptance()
+        with self.assertRaises(BrainError):
+            t.bridge.watch()
+        self.assertEqual(r4.asked(t), [])
+        self.pipelines_down = False
+        self.assertEqual(t.bridge.watch(), 1)            # GitLab back, no pipeline on the MR: asked
+
+    def test_a_head_that_gets_no_pipeline_is_told_on_the_mr_once(self):
+        t = self.t
+        r4.pipeline(t, 41, "success", sha=t.mrs[5]["sha"])
+        head = self.acceptance()
+        for _ in range(2):
+            self.assertEqual(t.bridge.watch(), 0)
+        told = lambda: [n for n in r4.notes(t) if "没有它的流水线" in n]  # noqa: E731
+        self.assertEqual(told(), [])
+        with r4.later(decisions, minutes=61):
+            for _ in range(2):
+                self.assertEqual(t.bridge.watch(), 0)
+        self.assertEqual(len(told()), 1)
+        self.assertIn(head[:12], told()[0])
+        self.assertEqual((r4.asked(t), r4.ci_notices(t)), ([], []))
 
 
 if __name__ == "__main__":
