@@ -13,3 +13,7 @@ current after each stage or plan step; it is the hand-over note if this run move
 
 Never push, merge, approve MRs, deploy, or touch production. Never edit `brain/`, `gates/`, `.brain/`,
 `project-agent.yaml` or CI files; propose changes instead.
+
+A big requirement split with `brain split` follows the split rules in `.kiro/steering/brain.md` (skill
+`brain-split`): on a child run (run.json has `parent` and `unit`) build only that unit, in this worktree; on the
+parent run build no unit and release only after every child has merged.

@@ -37,6 +37,12 @@
    - 问题的第一行写着提交号和 park 指纹；回答只认：问题评论没被改过、问题是在那次推送之后贴的、一个 D-n 只对应一个问题。否则这个问题作废，重问。
 6. **验收**：运行机执行 `lean release` 和 `lean request RELEASE`，再以"验收"类问题停下；产品在 MR 上回 approve。合并仍然要过 GitLab 审批和 CI。
 
+**大需求拆成小需求，大家一起做**：大需求照常走 Lean 的 Inception，在 `unit-of-work.md` 里拆成几个单元，人批 DESIGN 就是批了拆法。
+- `brain split PAY-1` 把每个单元登记成一个待认领的小需求（带着单元的 Paths、依赖、契约、验收标准）。
+- 大家 `brain claim PAY-2` 认领，`brain start --key PAY-2` 开工：从大需求的分支开自己的分支，放在单独的 worktree 里（一个 Lean clone，Lean 团队就是单元）。依赖没合并前不让开工。
+- `brain sync` 把大需求的分支合进来，自动解决 Lean 进度页的冲突；`brain handoff` 把 MR 开到大需求的分支，由大需求的负责人审、合并（小需求不交给运行机）。
+- 小需求都合并了，大需求再评审、发布。`brain intent list` 看进度（已合并 n/m）。详见 [docs/安装和使用.md](docs/安装和使用.md) 4.7；Lean 缺的几样和怎么绕见 [docs/lean-requests.md](docs/lean-requests.md)。
+
 ## Brain：团队共用的知识
 
 Brain 是仓库里的 `brain/PRODUCT.md`、`TECH.md`、`IMPROVEMENT.md`、`PROJECT.md` 四个文件，加上仓库根目录的 `AGENTS.md`。本地 run 和运行机上的 run 开工前都先读它们。
@@ -96,12 +102,12 @@ Brain 是仓库里的 `brain/PRODUCT.md`、`TECH.md`、`IMPROVEMENT.md`、`PROJE
 
 | 命令 | 谁跑、在哪 | 做什么 |
 |---|---|---|
-| `brain` | 每个人的电脑 | `install`、`doctor`、`claim`、`intake`、`start`、`handoff`、`status`；Brain：`lint`、`entry`、`reflect`（含 `--draft`）、`usage`；入口：`intent add/list/show/close`（见 [docs/intents.md](docs/intents.md)）；评估：`trace`、`eval`、`eval gaps`、`golden`（见 [docs/eval.md](docs/eval.md)） |
+| `brain` | 每个人的电脑 | `install`、`doctor`、`claim`、`intake`、`start`、`handoff`、`status`；大需求拆成小需求：`split`、`claim KEY`（认领待认领的）、`sync`（见 [docs/安装和使用.md](docs/安装和使用.md) 4.7）；Brain：`lint`、`entry`、`reflect`（含 `--draft`）、`usage`；入口：`intent add/list/show/close`（见 [docs/intents.md](docs/intents.md)）；评估：`trace`、`eval`、`eval gaps`、`golden`（见 [docs/eval.md](docs/eval.md)） |
 | `brain-bridge` | 团队运行机，`brainbridge` 用户 | `poll`（接手核对）、`dispatch`（送进 KiroCrew）、`watch`（贴问题）、`collect`（收回答并送回）、`reconcile`（MR 合并后收尾）、`report`（统计）、`loop`（循环跑以上全部） |
 | `brain-runnerd` | 团队运行机，`brainbot` 用户 | 验合同签名，按合同里的 commit 建 worktree，拷材料包 |
 | `brain-ci check-run` | GitLab MR 流水线（只在 MR 流水线里跑） | 检查五件事：run.json 和分支一致；材料包没被提交进仓库；run 分支没改 `brain/` 和 `AGENTS.md`；改了 risk-paths 必须有桥签名的设计批准；机器人提交的 commit 要有接手凭证。kit 配置、risk-paths 和 diff 基线都从**目标分支**读，MR 分支上改了也不算数 |
 | `brain-ci brain-lint` | GitLab MR 流水线（每个 MR） | Brain 的关系规则，对照 MR 的 diff 基线；配置从目标分支读 |
-| `brain-pre-receive` | GitLab 服务器钩子 | 人只能推 `ai/<自己>/*`；`claim/<KEY>` 只有 claim.json 里写的那个人能建、能改、能删；机器人只能推 `ai/*`，不能删分支、不能强推、不能推 tag，也不能改 gates、CI、`.brain/` |
+| `brain-pre-receive` | GitLab 服务器钩子 | 人只能推 `ai/<自己>/*`；`claim/<KEY>` 只有 claim.json 里写的那个人能建、能改、能删（待认领的另有规则，见 [docs/intents.md](docs/intents.md) 2.2）；机器人只能推 `ai/*`，不能删分支、不能强推、不能推 tag，也不能改 gates、CI、`.brain/` |
 | `remote/agents/brain-run.json` + `remote/prompts/brain-run.md` | 团队运行机上的 KiroCrew | 接手模式的 agent |
 
 ## 文档的五道关（`brain intake` / `brain start --doc`）

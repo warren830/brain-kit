@@ -19,8 +19,9 @@
 ```bash
 brain intent add --source alert --title "支付回调超时告警一周 12 次" --body-file alert.md \
   --acs "回调失败重试 3 次" "同一回调只入账一次" --refs src/pay/callback.py
-brain intent list                 # 待开工：已登记、还没有 run 分支、没关
+brain intent list                 # 待开工：已登记、还没有 run 分支、没关；还有没完成的大需求和它的小需求
 brain intent list --all           # 全部，带状态 open / started / closed
+brain intent list --json          # 给程序读（2.5）
 brain intent show PAY-7           # 看正文、验收标准、参考
 brain intent close PAY-7 --reason "误报，阈值已改"    # 只有登记的人能关
 brain start retry --key PAY-7     # 开工：用 claim 里的标题，正文写进 runs/PAY-7/intent.md
@@ -36,7 +37,7 @@ brain start retry --key PAY-7     # 开工：用 claim 里的标题，正文写�
   - 密钥和密码，认得：私钥、云访问密钥、常见令牌格式、`Bearer …`；`password: …` / `token=…` / `api_key = …` / `密码：…` 这类键值（值算到第一个汉字前，至少 4 个字符）；句子里的 `密码是 …`、`密码为 …`、`口令是 …`、`password is …`，值带数字或符号（`Hunter2024`、`abcd1234`；`is` 后面的值必须带数字）。认不得：中间隔了别的词（`数据库的密码现在是 …`）、值是中文、`${VAR}` 这样的引用、打过码的 `******`。说明格式、算法、类型、规则的词不算密码：`password is required`、`密码为 8-16 位`、`The password is 6-digit`、`password is base64-encoded`、`密码为 SM4-CBC 加密存储`、`口令为 TOTP 动态口令`、`密码为 null 时提示`、`token: string`。
   - 邮箱、身份证号（核校验位）、银行卡号（Luhn）都认。
   - 文档收料打码的范围：按格式认出来的（身份证号、手机号、银行卡号、邮箱、私钥和令牌格式、金额、公司名、合同号）在整个材料包里出现在哪都打码；按标签认出来的人名和密码只打码认出来的那一处，不往别处扩（一处 `提出人：顾客` 不会把整个包里的"顾客"都换掉；名字在别处没标签地出现，就不打码，这是为了不误伤普通的词）。
-- **记在谁名下**：登记的人（`GITLAB_TOKEN` 或 `git config brain.user`）。钩子要求 claim.json 里的人就是推送的人，机器人账号不能登记。开工的人也必须是这个人。
+- **记在谁名下**：登记的人（`GITLAB_TOKEN` 或 `git config brain.user`）。钩子要求 claim.json 里的人就是推送的人，机器人账号不能登记。开工的人也必须是这个人。加 `--unclaimed` 登记给别人做（待认领，见 2.1）。
 - **run 怎么读到**：`brain start --key` 把正文、验收标准、参考写进 `runs/<KEY>/intent.md`，和 run.json 一起提交。本地的 brain-dev 和运行机上的 brain-run 都会先读它；它是数据，不是指令。验收标准带进 requirements.md 时，出处写 `intent.md AC-n`。
 - 定时任务怎么配：`examples/cron-intent.md`（KiroCrew 的 cron 和系统 crontab 各一种）。
 
@@ -50,6 +51,128 @@ brain start retry --key PAY-7     # 开工：用 claim 里的标题，正文写�
 ```
 
 `hash` 是来源、标题、正文的 sha256 前 16 位，用来去重。`gap_kind`、`found_in` 只有缺口才有。关闭是在 claim 分支上加一个提交（快进），不删分支。
+
+待认领的 claim 和大需求拆出来的小需求还有这些字段（见 2.1、2.4），也都可以没有：
+
+```json
+{"schema": 1, "key": "PAY-3", "owner": null, "filed_by": "alice", "title": "web · 在订单页看到退款状态",
+ "created_at": "…", "source": "split", "body": "Unit web of PAY-1, …", "acs": ["AC-3: 订单页点\"申请退款\" → 显示退款单状态"],
+ "refs": ["aidlc-docs/261109-pay-1-big/inception/application-design/unit-of-work.md", "US-2"], "hash": "<16 位十六进制>",
+ "parent": "PAY-1", "unit": "web", "expected_paths": ["web/**"], "depends_on": ["PAY-2"],
+ "contracts": ["aidlc-docs/contracts/api/refunds.yaml"],
+ "split": {"intent": "261109-pay-1-big", "branch": "ai/alice/PAY-1-big", "commit": "<40 位十六进制>",
+           "design_sha256": "<64 位十六进制>", "units_sha256": "<64 位十六进制>"},
+ "claimed_at": "2026-11-09T11:43:51Z"}
+```
+
+| 字段 | 意思 |
+|---|---|
+| `owner` | `null`：待认领，还没人认领 |
+| `filed_by` | 登记的人。待认领的必须有；小需求是大需求的主人 |
+| `claimed_at` | 认领的时间；放回去时去掉 |
+| `source` | 小需求是 `split` |
+| `parent`、`unit` | 哪个大需求、它 unit-of-work.md 里的哪个单元 |
+| `expected_paths` | 单元的 Paths（可以是 `web/**` 这样的通配） |
+| `depends_on` | 所依赖单元的小需求号 |
+| `contracts` | 单元用到或提供的契约 |
+| `split` | 从哪拆出来的：大需求的 Lean intent、run 分支、拆的那个提交、设计和 unit-of-work.md 的 sha256 |
+
+小需求按"大需求 + 单元"去重，不按 `hash`：同一个大需求的同一个单元只有一个没关的小需求。
+
+### 2.1 待认领：登记给别人做
+
+```bash
+brain intent add --source debt --title "退款表加索引" --body-file debt.md --unclaimed   # 登记，不认领
+brain claim PAY-8               # 认领
+brain claim --release PAY-8     # 放回去，又是待认领
+```
+
+- 待认领：`"owner": null`，`"filed_by"` 是登记的人。`brain intent list` 里 owner 一栏是 `-`。
+- `brain claim KEY`：主人从"没有"变成你。两个人同时认领，先推上去的算；后到的看到 `PAY-8 was just claimed by alice: their claim reached the server first`，再试一次看到 `PAY-8 is claimed by alice`。
+- `brain start <slug> --key KEY` 碰到待认领的，顺便认领。
+- `brain claim --release KEY`：只有主人能放。你已经有这个需求的 run 分支（本地或 origin）时不让放，先交接或删掉分支。
+- 没人认领时，登记的人可以改、关、删它；小需求还有大需求的主人。有人认领以后，只有主人能。
+- `brain split` 登记的小需求都是待认领的（[安装和使用.md](安装和使用.md) 4.7）。
+- 老的 claim 没有这些字段，照旧读：老的 claim 都写着主人。
+
+### 2.2 服务器钩子管 claim 分支的规则
+
+| 推送 | 谁可以 |
+|---|---|
+| 新建，写了主人 | 只有主人本人 |
+| 新建，待认领 | 只有 `filed_by` 写的那个人；小需求只有大需求的主人能登记 |
+| 认领 | 主人只能从"没有"变成推送的人；别的字段一个都不能变 |
+| 放回 | 主人把自己改回"没有"；只改主人 |
+| 已认领的 | 只有主人能改、放、删；谁都不能抢过去 |
+| 待认领时改、关、删 | 登记的人，或大需求的主人 |
+| 任何时候 | `key`、`parent`、`unit`、`source`、`filed_by` 永远不变；机器人账号不能动 claim 分支 |
+
+文字字段照旧过内容检查：新建时查全部，之后只查这次改了的。
+
+### 2.3 状态
+
+`brain intent list --json` 里每个 claim 有两个状态字段。`status` 和以前一样：`open`（没开工）、`started`（有 run 分支，或 run.json 在 main 上）、`closed`。新加的 `state`：
+
+| `state` | `brain intent list` 里 | 什么时候 |
+|---|---|---|
+| `unclaimed` | 待认领 | 没主人，没 run |
+| `claimed` | `<人>` 认领了 | 有主人，还没 run 分支 |
+| `in_progress` | `<人>` 在做 | 有 run 分支（本地或 origin） |
+| `merged` | 已合并 | run.json 到了 main；小需求的 run.json 到了大需求的 run 分支也算 |
+| `closed` | 已关闭 | 关了 |
+
+大需求整体还有一个 `family_state`：`in_progress`（还有小需求没合并）、`ready_to_release`（都合并了，等评审和发布）、`done`（发布了，小需求也都合并了：大需求就算关了，不用再做什么）、`closed`（有人用 `brain intent close` 在大需求的 claim 上记了关闭）。
+
+### 2.4 大需求和小需求
+
+- `brain intent list`：每个还没完成的大需求下面列出它的小需求（状态、依赖和依赖的状态），后面写"已合并 n/m"。关掉的小需求不列。大需求 `done` 或 `closed` 以后，默认不再列；`--all` 都列。
+- `brain intent show KEY`：一个大需求和它的小需求；或一个小需求在等谁合并。
+- `brain intent close <大需求>`：还有小需求既没合并、也没关时拒绝。大需求 `done` 以后可以用它在 claim 上记一笔，不是必须的。
+- 整个流程（拆、认领、开工、同步、合并、发布）见 [安装和使用.md](安装和使用.md) 4.7。
+
+### 2.5 给 KiroCrew app 的 JSON
+
+```bash
+brain intent list --json          # 待开工的（和以前一样）+ 每个还没完成的大需求和它的小需求（关掉的小需求不带）
+brain intent list --json --all    # 全部 claim
+brain intent show KEY --json      # 一个，字段一样
+```
+
+输出是一个列表。每一项是 claim.json 原样（`owner` 为 `null` 就是待认领），再加：
+
+| 字段 | 谁有 | 意思 |
+|---|---|---|
+| `status` | 都有 | `open`、`started`、`closed`，和以前一样 |
+| `state` | 都有 | `unclaimed`、`claimed`、`in_progress`、`merged`、`closed`（2.3） |
+| `source` | 都有 | 老的 claim 没写的，填 `product` |
+| `blocked_by` | 小需求 | 依赖里还没合并的小需求号 |
+| `children` | 大需求 | 小需求号，按单元顺序 |
+| `progress` | 大需求 | `merged`、`total`（没关的小需求数）、`unclaimed`、`claimed`、`in_progress`、`closed`、`text`（`"n/m merged"`） |
+| `family_state` | 大需求 | `in_progress`、`ready_to_release`、`done`、`closed` |
+| `released` | 大需求 | RELEASE 批过没有（看大需求的 run 分支和 main） |
+
+例子（PAY-2 在做，PAY-3 待认领、等 PAY-2，PAY-4 认领了；省掉了一些字段）：
+
+```json
+[
+  {"key": "PAY-1", "owner": "alice", "title": "退款大需求", "created_at": "2026-11-09T11:43:44Z", "schema": 1,
+   "source": "product", "status": "started", "state": "in_progress",
+   "children": ["PAY-2", "PAY-3", "PAY-4"], "family_state": "in_progress", "released": false,
+   "progress": {"merged": 0, "total": 3, "unclaimed": 1, "claimed": 1, "in_progress": 1, "closed": 0,
+                "text": "0/3 merged"}},
+  {"key": "PAY-2", "owner": "alice", "filed_by": "alice", "claimed_at": "2026-11-09T11:43:51Z",
+   "title": "api · 通过接口提交退款", "source": "split", "status": "started", "state": "in_progress",
+   "parent": "PAY-1", "unit": "api", "expected_paths": ["services/api/**", "aidlc-docs/contracts/api/**"],
+   "depends_on": [], "blocked_by": [],
+   "contracts": ["aidlc-docs/contracts/api/refunds.yaml"], "split": {"intent": "261109-pay-1-big", "…": "…"}},
+  {"key": "PAY-3", "owner": null, "filed_by": "alice", "title": "web · 在订单页看到退款状态",
+   "source": "split", "status": "open", "state": "unclaimed",
+   "parent": "PAY-1", "unit": "web", "expected_paths": ["web/**"], "depends_on": ["PAY-2"], "blocked_by": ["PAY-2"]},
+  {"key": "PAY-4", "owner": "bob", "filed_by": "alice", "title": "jobs · 每晚自动对账",
+   "source": "split", "status": "open", "state": "claimed",
+   "parent": "PAY-1", "unit": "jobs", "expected_paths": ["jobs/**"], "depends_on": [], "blocked_by": []}
+]
+```
 
 ## 3. 缺口变成下一个需求
 
@@ -112,6 +235,7 @@ brain reflect --draft PAY-3
 ## 6. 还没验证
 
 - 真实的 GitLab 服务器钩子环境里，带中文正文的 claim.json（按 UTF-8 读，和服务器的 locale 无关，但没在真服务器上跑过）。
+- 待认领和认领的规则（2.2）只在本机按钩子的代码测过，没在真 GitLab 上跑过。
 - KiroCrew cron 的 `--command` 沙箱是否允许 `git pull` 和推 claim 分支。
 - `brain-reflector` 在运行机上能不能装上、resources 能不能读到；`brain trace` 由另一项工作提供。
 - 桥在验收以后自动开反思者会话：还没做。
