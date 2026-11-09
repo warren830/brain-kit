@@ -239,6 +239,9 @@ def _brain_base(repo, cfg):
 
 
 def _readonly_copy(src, dst):
+    s, d = os.path.realpath(src), os.path.realpath(dst)
+    if s == d or d.startswith(s + os.sep) or s.startswith(d + os.sep):
+        raise BrainError("not copying %s onto itself (%s): nothing was deleted" % (src, dst))
     if os.path.exists(dst):
         _make_writable(dst)
         shutil.rmtree(dst)
@@ -258,8 +261,23 @@ def _make_writable(path):
             os.chmod(os.path.join(root, f), stat.S_IRUSR | stat.S_IWUSR)
 
 
+def package_id_problem(pkg) -> str:
+    """Why `pkg` is not a material package id PKG-<KEY>-<n> (what `brain intake` prints), or ''. A path to the
+    package (tab completion gives one) is refused too: joined onto the store and the workspace it names the store's
+    own copy, which the attach would delete before copying."""
+    if runrec.PKG_RE.match(str(pkg or "")):
+        return ""
+    base = os.path.basename(os.path.normpath(str(pkg or "")))
+    if base != pkg and runrec.PKG_RE.match(base):
+        return "--package takes the package id, not its path: --package %s" % base
+    return "--package %r is not a package id PKG-<KEY>-<n> (`brain intake` prints it)" % (pkg,)
+
+
 def attach_package(repo, store, pkg) -> dict:
     """Copy a checked package read-only into the run's workspace; return its run.json entry."""
+    why = package_id_problem(pkg)
+    if why:
+        raise BrainError(why)
     src = os.path.join(store, "packages", pkg)
     if not os.path.isdir(src):
         raise BrainError("package %s not found in %s" % (pkg, store))
@@ -739,6 +757,8 @@ def cmd_start(a):
         raise BrainError("working tree has uncommitted changes; commit or stash first")
     if a.doc and a.package:
         raise BrainError("use --doc (take documents in now) or --package (an existing package), not both")
+    if a.package and package_id_problem(a.package):
+        raise BrainError(package_id_problem(a.package))
     if a.doc and (not a.consent or not a.classification):
         raise BrainError("--doc needs --consent and --classification (see `brain intake --help`)")
     from . import intents
