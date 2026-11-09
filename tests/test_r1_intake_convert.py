@@ -126,6 +126,29 @@ class R1_47NameColumnsInSheets(unittest.TestCase):
         self.assertTrue(all("个人信息 40 处" in r["reason"] for r in rep["refused"]))
         self.assertNotIn("王伟", "\n".join(package_text(store, rep).values()))
 
+    def test_hidden_columns_and_sheets_are_masked_too(self):
+        """A hidden 负责人 column, a hidden sheet: the hidden area keeps the sheet's header row, so the names in it are
+        masked and count toward the file's limit; a date row above the header does not take its place."""
+        d = tmpdir(self)
+        src = os.path.join(d, "src")
+        names = [s + g for s in "王李张刘陈杨黄赵吴周" for g in ("伟", "芳", "娜", "敏")]
+        rows = "".join('<row r="%d"><c r="A%d" t="inlineStr"><is><t>R%d</t></is></c><c r="B%d" t="inlineStr"><is><t>%s</t>'
+                       '</is></c></row>' % (k + 2, k + 2, k, k + 2, n) for k, n in enumerate(names))
+        head = '<row r="1"><c r="A1" t="inlineStr"><is><t>编号</t></is></c><c r="B1" t="inlineStr"><is><t>负责人</t></is></c></row>'
+        xlsx(os.path.join(src, "隐藏列.xlsx"), [("表", None, head + rows, "")],
+             [("xl/worksheets/sheet1.xml", '<?xml version="1.0"?><worksheet %s><cols><col min="2" max="2" hidden="1"/>'
+               '</cols><sheetData>%s</sheetData></worksheet>' % (S, head + rows))])
+        xlsx(os.path.join(src, "隐藏页.xlsx"), [("需求", None, [["编号", "需求"], ["R1", "14 天内可退"]], ""),
+                                              ("名单", "hidden", [["填表日期", "2026-11-01"], ["事项", "负责人"],
+                                                                  ["退款", "张伟"], ["对账", "李娜"]], "")])
+        rep, store = build(src)
+        self.assertEqual([r["name"] for r in rep["refused"]], ["src/隐藏列.xlsx"])
+        self.assertIn("个人信息 40 处", rep["refused"][0]["reason"])
+        hidden = package_text(store, rep)["extras/hidden.md"]
+        self.assertIn("| 行 | 事项 | 负责人 |", hidden)
+        for raw in ("张伟", "李娜"):
+            self.assertNotIn(raw, hidden)
+
     def test_unparsable_csv_is_kept_as_text_with_a_note(self):
         p = write(os.path.join(tmpdir(self), "a.csv"), "a,b\n1,\"" + "x" * 200000 + "\"\n")
         d = convert.convert(p)

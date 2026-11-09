@@ -22,6 +22,8 @@ from html.parser import HTMLParser
 from xml.etree import ElementTree as ET
 from xml.parsers import expat
 
+from . import checks
+
 ZW_RE = re.compile("[\u200b\u200c\u200d\u2060\ufeff\u202a-\u202e\u2066-\u2069]")
 HTML_COMMENT_RE = re.compile(r"<!--(.*?)-->", re.S)
 # a tag; a quoted attribute value may hold a ">" (if the quotes do not pair up, up to the first ">")
@@ -351,18 +353,27 @@ def sniff(path) -> str:
 
 # ---------- text / markdown ----------
 
+def header_row(rows) -> int:
+    """Which of the rows is a table's header: among the first rows with two or more cells (one, for one column), the
+    first that names a column gate 4 masks (负责人, Owner ...: a date or title row above it is no header), else the
+    first of them."""
+    need = min(2, len(rows[0][1]))
+    full = [k for k, (_, vals) in enumerate(rows) if sum(1 for v in vals if v.strip()) >= need]
+    named = [k for k in full[:10] if any(checks.NAME_COL_RE.search(v.strip()) for v in rows[k][1])]
+    return named[0] if named else (full[0] if full else 0)
+
+
 def table_markdown(rows) -> str:
     """rows: [(row number, [cell, ...])], all the same width -> a Markdown table. Its header is the first row with
-    two or more cells (the first row, for one column): a sheet or a csv export has its column names there, and gate 4
-    finds the name columns (负责人, Owner ...) by the table header, as in a Markdown table. Rows above it (a title, a
-    marking) are lines before the table. The first column (行) keeps the row numbers; a line break in a cell is <br>
+    two or more cells (see header_row): a sheet or a csv export has its column names there, and gate 4 finds the name
+    columns (负责人, Owner ...) by the table header, as in a Markdown table. Rows above it (a title, a marking) are
+    lines before the table. The first column (行) keeps the row numbers; a line break in a cell is <br>
     (张伟 / 李娜 on two lines are two people)."""
     def cell(v):
         return "<br>".join(" ".join(x.split()) for x in v.split("\n") if x.strip()).replace("|", "\\|")
 
     width = len(rows[0][1])
-    need = min(2, width)
-    h = next((k for k, (_, vals) in enumerate(rows) if sum(1 for v in vals if v.strip()) >= need), 0)
+    h = header_row(rows)
     before = ["第 %d 行：%s" % (r, " · ".join(cell(v) for v in vals if v.strip())) for r, vals in rows[:h]]
     lines = ["| 行 | " + " | ".join(cell(v) for v in rows[h][1]) + " |", "|" + "---|" * (width + 1)]
     lines += ["| %d | %s |" % (r, " | ".join(cell(v) for v in vals)) for r, vals in rows[h + 1:]]
@@ -803,7 +814,7 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
             if c.get("hidden") in ("1", "true"):
                 hidden_cols.update(range(int(c.get("min", "0")), int(c.get("max", "0")) + 1))
         grid = {}
-        maxc = 0
+        every, hidden = {}, {}                       # every cell of the sheet; the hidden ones (with why)
         values = []                                  # every cell of the sheet, hidden ones too, in order
         data = root.find(_q("s", "sheetData"))
         rnum = 0
@@ -830,21 +841,29 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
                 if not val:
                     continue
                 values.append(val)
-                where = "%s!%s" % (sname, ref)
+                every[(rnum, ci)] = val
                 if state != "visible":
-                    d.hide("隐藏工作表 %s" % where, val)
+                    hidden[(rnum, ci)] = "隐藏工作表"
                 elif row_hidden or ci in hidden_cols:
-                    d.hide("隐藏行/列 %s" % where, val)
+                    hidden[(rnum, ci)] = "隐藏行/列"
                 elif c.get("s", "0") in hidden_fmt:
-                    d.hide("';;;' 格式隐藏 %s" % where, val)
+                    hidden[(rnum, ci)] = "';;;' 格式隐藏"
                 elif c.get("s", "0") in faint:
-                    d.hide("白字或极小的字 %s" % where, val)
+                    hidden[(rnum, ci)] = "白字或极小的字"
                 else:
                     grid[(rnum, ci)] = val
-                    maxc = max(maxc, ci)
         # each sheet is a document of its own for gate 2 (a hidden sheet marked 绝密, a 机密 sheet in the middle of a
         # long workbook): its head and tail, as gate 2 reads a document's
         d.labels.append(head_and_tail("%s\n%s" % (sname, "\n".join(values))))
+        if hidden:
+            # the hidden cells as a table under the sheet's header row, so gate 4 masks the names of a hidden 负责人
+            # column (or sheet) as in a visible one, and they count toward the file's limit
+            width = max(c for _, c in every)
+            rows = [(r, [every.get((r, i), "") for i in range(1, width + 1)]) for r in sorted({r for r, _ in every})]
+            head = rows[header_row(rows)]
+            rows = [head] + [(r, [hidden.get((r, i)) and every[(r, i)] or "" for i in range(1, width + 1)])
+                             for r, _ in rows if r != head[0] and any((r, i) in hidden for i in range(1, width + 1))]
+            d.hide("%s（工作表 %s）" % ("、".join(sorted(set(hidden.values()))), sname), table_markdown(rows))
         for kind, part in _part_rels(z, target):
             cm = _xml(z, part) if kind == "comments" else None
             for c in (cm.iter(_q("s", "comment")) if cm is not None else []):
@@ -856,6 +875,7 @@ def convert_xlsx(path, name, max_cells=20000) -> Doc:
         if not grid:
             parts.append("## 工作表：%s\n\n（空）\n" % sname)
             continue
+        maxc = max(c for _, c in grid)
         rows = [(r, [grid.get((r, i), "") for i in range(1, maxc + 1)]) for r in sorted({r for r, _ in grid})]
         parts.append("## 工作表：%s\n\n%s\n" % (sname, table_markdown(rows)))
     if cells > max_cells:
