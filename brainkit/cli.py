@@ -239,10 +239,14 @@ def _brain_base(repo, cfg):
 
 
 def _readonly_copy(src, dst):
+    for root, dirs, files in os.walk(src):      # verify_package refuses links too; a copy must never follow one
+        for n in dirs + files:
+            if os.path.islink(os.path.join(root, n)):
+                raise BrainError("%s holds a symbolic link (%s): not copied" % (src, os.path.join(root, n)))
     if os.path.exists(dst):
         _make_writable(dst)
         shutil.rmtree(dst)
-    shutil.copytree(src, dst)
+    shutil.copytree(src, dst, symlinks=True)
     for root, dirs, files in os.walk(dst):
         for f in files:
             os.chmod(os.path.join(root, f), stat.S_IRUSR | stat.S_IRGRP)
