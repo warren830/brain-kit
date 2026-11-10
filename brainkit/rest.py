@@ -303,7 +303,7 @@ class GitLab(Rest):
 
     def note_edits(self, project, iid, max_pages=20) -> dict:
         """{note id: {"author", "last_edited_at", "last_edited_by"}} for the MR's notes, from GitLab GraphQL
-        (Note.lastEditedAt / lastEditedBy). Measured on gitlab.aws.dev 2026-11-09: lastEditedBy names the editor only
+        (Note.lastEditedAt / lastEditedBy). Measured on a self-managed GitLab 2026-11-09: lastEditedBy names the editor only
         when a note's text was edited (by its author, or by a Maintainer or admin editing someone else's note; ticking
         a task-list box is a text edit); an award emoji moves updated_at and lastEditedAt but leaves lastEditedBy
         empty, and an untouched note has lastEditedAt equal to its creation time. Use lastEditedBy, not lastEditedAt.
