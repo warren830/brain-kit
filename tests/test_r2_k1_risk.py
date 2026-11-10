@@ -3,6 +3,9 @@ on 2b8f45e.
 
   R1-17  (the submodule case) a folder rule (vendor/pay-sdk/, vendor/*/) did not cover a submodule at that folder:
          check-run let a run branch move the submodule with no design approval. git reads a submodule as a folder.
+  R2-15  a rule with no '/' (*.sql, pay) met every expected path, a plain file too: brain handoff warned and the
+         bridge sent every run to ask for DESIGN. An expected path that is plainly a file (an extension in its last
+         name) meets only the rules that cover it.
 """
 import json
 import os
@@ -12,7 +15,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from brainkit import ci, riskpaths  # noqa: E402
+from brainkit import ci, cli, config, riskpaths, sign  # noqa: E402
+from tests import test_bridge as tb  # noqa: E402
+from tests import test_qa_security as qs  # noqa: E402
 from tests.helpers import commit_file, git_repo, sh, tmpdir  # noqa: E402
 from tests.test_r1_k1_ci import BR, INTENT, OWNER_ENV, PATHS, PATTERNS, run_record  # noqa: E402
 
@@ -70,6 +75,56 @@ class SubmoduleIsAFolder(unittest.TestCase):
         self.assertEqual(len(probs), 1, probs)
         self.assertIn("risk paths changed (vendor/old-sdk, vendor/pay-sdk) but application design was not written",
                       probs[0])
+
+
+# ---------- R2-15: an expected path that is plainly a file meets only the rules that cover it ----------
+
+FILES = [p for p in PATHS if p.endswith((".py", ".sql", ".md", ".txt"))]
+
+
+class PlainFileExpectedPaths(unittest.TestCase):
+    def test_a_file_meets_only_what_covers_it(self):
+        for pat in PATTERNS:
+            for path in FILES:
+                self.assertEqual(riskpaths.meets(path, pat), riskpaths.matches(path, pat), "%r vs %r" % (pat, path))
+        for ep in ("README.md", "docs/guide.md", "./src/app/main.py", "web/.eslintrc.json"):
+            self.assertFalse(riskpaths.meets(ep, "*.sql"), ep)
+            self.assertFalse(riskpaths.meets(ep, "pay"), ep)
+
+    def test_what_may_be_a_folder_still_meets_a_rule_below_it(self):
+        for ep in ("db", "src/pay/", "Makefile", ".github", "conf.d/", "src/*.py", "services/**"):
+            self.assertTrue(riskpaths.meets(ep, "*.sql"), ep)
+
+    def test_brain_handoff_warns_only_for_what_a_rule_covers(self):
+        d = tmpdir(self)
+        r = git_repo(os.path.join(d, "proj"))
+        commit_file(r, "gates/risk-paths", "*.sql\n", "risk paths")
+        bc = commit_file(r, "brain/TECH.md", "# TECH\n", "brain")
+        sh("git", "-C", r, "switch", "-q", "-c", BR)
+        qs.env(self, BRAIN_INTAKE_DIR=os.path.join(d, "no-intake"))
+        cfg = config.merged(config.DEFAULTS, {"version": 1, "req_prefix": "PAY"})
+        rec = dict(run_record(bc), expected_paths=["docs/guide.md", "src/app/main.py"])
+        self.assertEqual(cli.handoff_risk_warnings(r, cfg, rec), [])
+        rec = dict(run_record(bc), expected_paths=["docs/guide.md", "db/migrations/002.sql", "db"])
+        w = cli.handoff_risk_warnings(r, cfg, rec)
+        self.assertTrue(w and w[0].startswith("this run plans to change (run.json expected_paths) risk paths "
+                                              "(db/migrations/002.sql, db; gates/risk-paths)"), w)
+
+
+@unittest.skipUnless(sign.available(), "ssh-keygen not found")
+class PlainFileBridgeHint(unittest.TestCase):
+    def test_the_bridge_reads_expected_paths_as_brain_handoff_does(self):
+        qs.env(self, HOME=tmpdir(self))
+        t = qs.fixture(self)
+        sh("git", "-C", t.work, "switch", "-q", "main")
+        commit_file(t.work, "gates/risk-paths", "*.sql\n", "risk paths")
+        sh("git", "-C", t.work, "push", "-q", t.origin, "main")
+
+        def hits(*paths):
+            return t.bridge.risk_paths_hit(tb.P, t.bridge.kit(tb.P), "PAY-1", list(paths))
+        self.assertEqual(hits("docs/guide.md", "src/app/main.py"), [])
+        self.assertEqual(hits("db/migrations/002.sql"), ["*.sql"])
+        self.assertEqual(hits("conf.d/"), ["*.sql"])
 
 
 if __name__ == "__main__":
