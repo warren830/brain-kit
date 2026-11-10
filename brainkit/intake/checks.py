@@ -289,8 +289,9 @@ def _kv_secrets(text) -> list:
     for m in KV_SECRET_RE.finditer(text):
         cut = _NOT_ASCII_RE.search(m.group(2))
         v = m.group(2)[:cut.start()] if cut else m.group(2)          # 密码：abc123（测试环境）
-        if len(v) < 4 or _blanked(v) or v.startswith(("$", "%(", "{{")) or describes_a_secret(v):
-            continue
+        if len(v) < 4 or _blanked(v) or v.startswith(("$", "%(", "{{")) or describes_a_secret(v) or \
+                SAID_SECRET_UNIT_RE.match(text, m.start(2) + len(v)):
+            continue                                 # 密码：8-16位 is a rule
         hits.append(Hit("secret", "kv_secret", m.start(2), m.start(2) + len(v), v))
     for m in SAID_SECRET_RE.finditer(text):
         v = m.group(2).rstrip(".")

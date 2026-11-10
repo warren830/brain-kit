@@ -1,4 +1,4 @@
-"""Review round 2 on document intake: regressions from round 1's fixes (R2-01, R2-11).
+"""Review round 2 on document intake: regressions from round 1's fixes (R2-01, R2-11, R2-12).
 
 Password-shaped values are built at runtime, so the source holds none (the commit hook scans for them).
 """
@@ -93,6 +93,19 @@ class R2_11PiiHoldingASecretIsMaskedWhole(Base):
         self.assertIn("客服经理手机 [电话-1]", text)
         self.assertIn("邮箱 [邮箱-1]", text)
         self.assertNotIn("1234", text)
+
+
+class R2_12PasswordRuleIsNoPassword(Base):
+    """「密码：8-16位」was read as the password 8-16 and spread to the user-name rule's 8-16."""
+
+    def test_length_rules(self):
+        for text in ("- AC-1：密码：8-16位，必须包含大小写字母和数字。", "password: 8-16 characters", "密码：6-20 个字符"):
+            self.assertEqual([h for h in checks.scan(text) if h.cat == "secret"], [], text)
+        self.file("注册需求.md", "# 注册需求\n\n- AC-1：密码：8-16位，必须包含大小写字母和数字。\n"
+                  "- AC-2：用户名长度 8-16 个字符。\n")
+        text = self.segments(self.build())
+        self.assertIn("用户名长度 8-16 个字符", text)
+        self.assertIn("密码：8-16位", text)
 
 
 
