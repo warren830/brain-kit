@@ -25,8 +25,9 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 
-from . import config, lean, runrec, sign
+from . import config, lean, riskpaths, runrec, sign
 from .common import BrainError, git, git_out, load_json, parse_branch, parse_iso, utcnow
 
 
@@ -215,29 +216,9 @@ class Target:
 
 
 def glob_match(path, pattern) -> bool:
-    """gitignore-like: '**' spans directories, '*' and '?' stay inside one; a trailing '/' means the whole dir."""
-    pat = pattern.strip()
-    if pat.endswith("/"):
-        pat += "**"
-    rx = ""
-    i = 0
-    while i < len(pat):
-        if pat.startswith("**/", i):
-            rx += "(?:.*/)?"
-            i += 3
-        elif pat.startswith("**", i):
-            rx += ".*"
-            i += 2
-        elif pat[i] == "*":
-            rx += "[^/]*"
-            i += 1
-        elif pat[i] == "?":
-            rx += "[^/]"
-            i += 1
-        else:
-            rx += re.escape(pat[i])
-            i += 1
-    return re.fullmatch(rx, path) is not None
+    """Is the file `path` under the gates/risk-paths `pattern`? The .gitignore rules (riskpaths): src/pay, /src/pay/,
+    *.sql, src/**/x. BrainError for a pattern those rules do not support."""
+    return riskpaths.matches(path, pattern)
 
 
 def lean_events(repo, intent):
@@ -270,6 +251,31 @@ def changed_paths(repo, *revs, paths=()) -> list:
     if p.returncode != 0:
         raise BrainError("git diff %s failed: %s" % (" ".join(revs), p.stderr.decode("utf-8", "replace").strip()))
     return [x for x in p.stdout.decode("utf-8", "surrogateescape").split("\0") if x]
+
+
+def _fold(path) -> str:
+    """A path as a case-insensitive disk (macOS, Windows) compares it: there Agents.md is AGENTS.md."""
+    return unicodedata.normalize("NFC", path).casefold()
+
+
+def in_brain(path, brain_dir) -> bool:
+    """Is `path` the Brain's (brain_dir and below, AGENTS.md) in any letter case? A clone on a case-insensitive disk
+    checks Agents.md or Brain/TECH.md out over the real file, so those count as changing it too."""
+    p, d = _fold(path), _fold(str(brain_dir).strip("/"))
+    return p == _fold("AGENTS.md") or p == d or p.startswith(d + "/")
+
+
+def _index_entries(repo) -> list:
+    """[(mode, path)] of the checkout's index, NUL-separated (odd names are not quoted)."""
+    p = subprocess.run(["git", "-C", repo, "ls-files", "-s", "-z"], capture_output=True)
+    if p.returncode != 0:
+        raise BrainError("git ls-files failed: %s" % p.stderr.decode("utf-8", "replace").strip())
+    out = []
+    for rec in p.stdout.decode("utf-8", "surrogateescape").split("\0"):
+        meta, tab, path = rec.partition("\t")
+        if tab:
+            out.append((meta.split(" ", 1)[0], path))
+    return out
 
 
 def lean_hashes(data) -> set:
@@ -350,10 +356,13 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
         return []
     pats = [l.split("#", 1)[0].strip() for l in text.splitlines()]
     pats = [x for x in pats if x]
+    bad = ["%s: %s: brain-ci fails every run MR until it is fixed" % (cfg["risk_paths_file"], why)
+           for why in (riskpaths.problem(x) for x in pats) if why]
+    pats = [x for x in pats if not riskpaths.problem(x)]
     changed = changed_paths(repo, base, "HEAD")
     risky = sorted({f for f in changed if any(glob_match(f, x) for x in pats)})
     if not risky:
-        return []
+        return bad
     shown = ", ".join(risky[:5])
     ev = lean_events(repo, rec["intent"])
     skipped = any(e.get("event") == "STAGE_SKIPPED" and (e.get("data") or {}).get("stage") == "application-design"
@@ -361,17 +370,17 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
     design_path = "%s/%s/inception/application-design/application-design.md" % (lean.DOCS, rec["intent"])
     designed = os.path.exists(os.path.join(repo, design_path))
     if skipped or not designed:
-        return ["risk paths changed (%s) but application design was %s: this change needs the design stage"
-                % (shown, "skipped" if skipped else "not written")]
+        return bad + ["risk paths changed (%s) but application design was %s: this change needs the design stage"
+                      % (shown, "skipped" if skipped else "not written")]
     approvals = [v for v in latest_design_answers(repo, vouchers) if v.get("choice") == "approve"]
     if not approvals:
-        return ["risk paths changed (%s): no design approval signed by the bridge for %s (ask through the MR: "
-                "park.json with lean_request DESIGN ...)" % (shown, rec["key"])]
+        return bad + ["risk paths changed (%s): no design approval signed by the bridge for %s (ask through the MR: "
+                      "park.json with lean_request DESIGN ...)" % (shown, rec["key"])]
     why = [design_approval_covers(repo, v, design_path, risky) for v in approvals]
     if all(why):
-        return ["risk paths changed (%s): no design approval covers them any more (%s): ask for a fresh DESIGN "
-                "approval through the MR" % (shown, "; ".join(why[:3]))]
-    return []
+        return bad + ["risk paths changed (%s): no design approval covers them any more (%s): ask for a fresh DESIGN "
+                      "approval through the MR" % (shown, "; ".join(why[:3]))]
+    return bad
 
 
 def _claimed_child(repo, rec) -> bool:
@@ -407,11 +416,10 @@ def check_run(repo, branch, env) -> list:
     base = tgt.base or rec["brain_commit"]
     if git_out(repo, "ls-files", "--", ".brain-materials"):
         probs.append("material packages are committed (.brain-materials/ must stay out of git)")
-    links = [l.split("\t", 1)[1] for l in git_out(repo, "ls-files", "-s", "--", cfg["brain_dir"], "AGENTS.md").split("\n")
-             if l.startswith("120000 ")]
+    links = [p for mode, p in _index_entries(repo) if mode == "120000" and in_brain(p, cfg["brain_dir"])]
     if links:
         probs.append("symlinks in the Brain (%s): the Brain must be real files" % ", ".join(links[:5]))
-    touched = changed_paths(repo, "%s..HEAD" % base, paths=(cfg["brain_dir"], "AGENTS.md"))
+    touched = [p for p in changed_paths(repo, "%s..HEAD" % base) if in_brain(p, cfg["brain_dir"])]
     if touched:
         probs.append("a run branch changed the Brain (%s): write brain-proposal blocks in decisions.md instead; "
                      "`brain reflect` turns them into a Brain MR for the file owners" % ", ".join(touched[:5]))
@@ -511,22 +519,39 @@ def run_owner(repo, signed, bots) -> set:
     return {ae.strip().lower(), ce.strip().lower()} - bots - {""}
 
 
+def _bots_commits(commits, who, bots) -> list:
+    """The commits the bot made: authored or committed as one of bot_emails. A bot commit with a person's author line
+    is still the bot's (the hook refuses it; CI judges it by the bot's rules too)."""
+    return [c for c in commits if who[c][0] in bots or who[c][1] in bots]
+
+
 def bot_commit_rules(repo, branch, env, tgt, cfg, hook_cfg, head) -> list:
     """The bot's per-commit rules in a pipeline a person started (their push, GitLab's Rebase, "Run pipeline" or
-    "Retry" on the bot's red head): whoever starts the pipeline, the commits the bot authored in the MR follow the bot's
-    path rules and are committed by the bot or the run's owner (as in bot_push_rules). Without them a person's next
-    push, or a re-run, would turn the bot's red pipeline green."""
+    "Retry" on the bot's red head): whoever starts the pipeline, the commits the bot made in the MR (authored or
+    committed as the bot: _bots_commits) follow the bot's path rules; the ones it committed are authored as the bot,
+    and the ones it authored are committed by the bot or the run's owner (as in bot_push_rules); they are on a run
+    branch (the hook lets the bot push nothing else: an MR from any other branch with bot commits is refused). Without
+    them a person's next push, or a re-run, would turn the bot's red pipeline green."""
     from . import pre_receive
     bots = {e.lower() for e in hook_cfg.get("bot_emails") or []}
     commits = pre_receive.new_commits(tgt.base, head, hook_cfg["default_branch"], cwd=repo)
     who = _who(repo, commits)
-    mine = [c for c in commits if who[c][0] in bots]
+    mine = _bots_commits(commits, who, bots)
     if not mine:
         return []
+    b = parse_branch(branch, hook_cfg["branch_prefix"])
     probs = pre_receive.bot_path_problems(branch, mine, hook_cfg, cwd=repo)
+    if not b:
+        probs.append("%s: the bot made commits in this MR (%s), but bot accounts push only %s/<owner>/<JIRA>-<slug> "
+                     "run branches: the bot's work comes through its run branch's MR" % (
+                         branch, ", ".join(c[:12] for c in mine[:3]), hook_cfg["branch_prefix"]))
+    forged = [c for c in mine if who[c][0] not in bots]
+    if forged:
+        probs.append("%s: bot commits are authored as the bot (%s): %s" % (
+            branch, ", ".join(sorted(bots)) or "-",
+            "; ".join("%s authored by %s but committed by the bot" % (c[:12], who[c][0] or "-") for c in forged[:3])))
     odd = [c for c in mine if who[c][1] not in bots]
     if odd:
-        b = parse_branch(branch, hook_cfg["branch_prefix"])
         hand, signed, why = handover_commit(repo, branch, b["key"], env, tgt.base, cfg["runs_dir"]) if b else (
             None, None, "%s is not a run branch" % branch)
         owner = run_owner(repo, signed, bots) if hand else set()
@@ -544,9 +569,10 @@ def bot_push_rules(repo, branch, user, env, tgt, cfg, hook_cfg, head) -> list:
     commit in the MR: the owner's own commits (`brain start`, local work, `brain handoff`) are not the bot's push.
     So, as the pre-receive hook judges each push by its pusher, commits are judged by who made them:
       - the branch: what the hook allows the bot (a well-formed <prefix>/<owner>/<KEY>-<slug> branch);
-      - the bot's commits (author in bot_emails), wherever they are in the MR: the bot's path rules (no gates/, CI,
-        .brain/, the kit's own files, ..., no runs/<KEY>/run.json), and committed by the bot or by the run's owner
-        (GitLab's Rebase); a pipeline a person starts applies these too (bot_commit_rules);
+      - the bot's commits (author or committer in bot_emails: _bots_commits), wherever they are in the MR: the bot's
+        path rules (no gates/, CI, .brain/, the kit's own files, ..., no runs/<KEY>/run.json); the ones the bot
+        authored are committed by the bot or by the run's owner (GitLab's Rebase); a pipeline a person starts applies
+        these too (bot_commit_rules);
       - the commits after the hand-over commit (the newest signed hand-over voucher for this branch) that are not the
         bot's: committed by the run's owner, people's rules (their own branch); anyone else is refused, and a bot
         committing another author's work is refused as the hook refuses it;
@@ -563,7 +589,7 @@ def bot_push_rules(repo, branch, user, env, tgt, cfg, hook_cfg, head) -> list:
     bots = {e.lower() for e in hook_cfg.get("bot_emails") or []}
     commits = pre_receive.new_commits(tgt.base, head, default, cwd=repo)
     who = _who(repo, commits)
-    mine = [c for c in commits if who[c][0] in bots]
+    mine = _bots_commits(commits, who, bots)
     if mine:
         probs += pre_receive.bot_path_problems(branch, mine, hook_cfg, cwd=repo)
     b = parse_branch(branch, hook_cfg["branch_prefix"])

@@ -29,13 +29,14 @@ refused up front as well; where Lean refuses such writes itself (its .kiro/hooks
 One write does not go to Lean: the run's own question, runs/<KEY>/park.json (park_target). It is how a run reaches a
 person, so it must be writable in every approval state (before REQUIREMENTS, before DESIGN, with PLAN pending, after
 a rejection), while Lean gates every file outside aidlc-docs/, .kiro/ and free_paths like product code. Only a
-file-write tool whose single target is exactly <runs_dir>/<KEY>/park.json of this branch's run is let through: KEY
+file-write tool whose single target is exactly <runs_dir>/<KEY>/park.json of this branch's run is let through
+(however the path spells it: ./runs/..., runs//..., or absolute through a symlinked folder above the workspace): KEY
 from the branch name <prefix>/<owner>/<KEY>-<slug>, confirmed by <runs_dir>/<KEY>/run.json naming this branch (or,
 when the branch name has no key, the one run.json that names it). Anything else, and anything this cannot tell
-(another key, run.json, any other runs/ file, '..', a symlink or hard link, a path outside the workspace, a shell
-command, an unknown tool or tool input), goes to Lean unchanged. run.json itself is guarded against the bot by the
-pre-receive hook and CI, not here. runs/<KEY>/MR.md needs no allowance: `brain mr-desc --write` writes it through the
-shell, and Lean's shell guard does not gate that command.
+(another key, run.json, any other runs/ file, '..', a symlink in the workspace or a hard link, a path outside the
+workspace, a shell command, an unknown tool or tool input), goes to Lean unchanged. run.json itself is guarded against
+the bot by the pre-receive hook and CI, not here. runs/<KEY>/MR.md needs no allowance: `brain mr-desc --write` writes
+it through the shell, and Lean's shell guard does not gate that command.
 
 Lean takes a prompt with `<original_user_request>` anywhere in it for a host message, not a person's turn (no
 approval or rejection read from it, the turn not counted). Text the bridge forwards (CI logs, MR notes) may contain
@@ -407,6 +408,25 @@ def run_key(root, runs):
     return found[0] if len(found) == 1 else None
 
 
+def _workspace_parts(root, given):
+    """The parts of a write tool's path below the workspace root, however it is spelled: relative to the root (as
+    Lean takes it) or absolute, through any folder that resolves to the root (/tmp/ws for /private/tmp/ws: the
+    shortest such start of the path, so a symlink inside the workspace stays in the parts); empty and '.' parts
+    dropped. None when it is not below the root, has a '..' part, or does not end in a file name."""
+    comps = given.split("/")
+    if ".." in comps or comps[-1] in ("", "."):
+        return None
+    if os.path.isabs(given):
+        real = os.path.realpath(root)
+        for i in range(2, len(comps)):
+            if os.path.realpath("/".join(comps[:i])) == real:
+                comps = comps[i:]
+                break
+        else:
+            return None
+    return [c for c in comps if c not in ("", ".")]
+
+
 def park_target(root, payload):
     """True when this PreToolUse is a file write whose only target is this run's <runs_dir>/<KEY>/park.json."""
     tool = payload.get("tool_name")
@@ -423,16 +443,8 @@ def park_target(root, payload):
     runs = _runs_dir(root)
     if not runs:
         return False
-    given = paths[0]
-    if os.path.isabs(given):
-        for r in {root, os.path.realpath(root)}:
-            if given.startswith(r.rstrip(os.sep) + os.sep):
-                given = given[len(r.rstrip(os.sep)) + 1:]
-                break
-        else:
-            return False
-    parts = given.split("/")
-    if len(parts) != len(runs) + 2 or parts[:len(runs)] != runs or parts[-1] != "park.json" \
+    parts = _workspace_parts(root, paths[0])
+    if parts is None or len(parts) != len(runs) + 2 or parts[:len(runs)] != runs or parts[-1] != "park.json" \
             or not KEY_RE.match(parts[-2]):
         return False
     want = os.path.join(os.path.realpath(root), *parts)

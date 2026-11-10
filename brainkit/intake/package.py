@@ -284,12 +284,21 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
         findings.append(line + ("；".join(parts) if parts else "无"))
     for r in refused:
         findings.append("- **%s %s**：没收——%s" % (r["id"], r["name"], r["reason"]))
+    texts = {   # every file of the package besides the segments and the manifest: their hashes go in the manifest
+        "README.md": README.format(pkg=pkg),
+        "toc.md": "# 目录 %s\n\n| 段 | 标题 | 来源 | 字数 | 哈希 | 备注 |\n|---|---|---|---|---|---|\n%s\n"
+                  % (pkg, "\n".join(toc)),
+        "findings.md": "# 检查结果 %s\n\n密级：%s（你选的是 %s）\n\n%s\n" % (pkg, effective, classification,
+                                                                  "\n".join(findings)),
+        "extras/hidden.md": "# 原文里看不见的内容（不能当需求引用）\n\n%s\n" % ("\n".join(hidden_out) or "（无）"),
+    }
     manifest = {
         "schema": 1, "package": pkg, "key": key, "created_at": iso(utcnow()), "submitter": submitter,
         "consent": True, "classification": {"given": classification, "effective": effective,
                                             "detected": [{"file": meta(n), "class": c} for n, c in detected]},
         "business": business if business_hits else "none-found", "sources": sources, "refused": refused,
         "segments": segs, "hidden_items": len(hidden_out), "tool": "brain-kit %s" % __version__,
+        "files": {rel: hashlib.sha256(t.encode("utf-8")).hexdigest() for rel, t in sorted(texts.items())},
     }
     manifest_sha = hashlib.sha256(canonical(manifest)).hexdigest()
     report = {"package": pkg, "manifest_sha256": manifest_sha, "segments": len(segs), "sources": len(sources),
@@ -298,20 +307,15 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
     if dry_run:
         return report
     base = os.path.join(store, "packages", pkg)
-    _write(os.path.join(base, "README.md"), README.format(pkg=pkg))
-    _write(os.path.join(base, "toc.md"), "# 目录 %s\n\n| 段 | 标题 | 来源 | 字数 | 哈希 | 备注 |\n|---|---|---|---|---|---|\n%s\n"
-           % (pkg, "\n".join(toc)))
-    _write(os.path.join(base, "findings.md"), "# 检查结果 %s\n\n密级：%s（你选的是 %s）\n\n%s\n"
-           % (pkg, effective, classification, "\n".join(findings)))
-    _write(os.path.join(base, "extras", "hidden.md"), "# 原文里看不见的内容（不能当需求引用）\n\n%s\n"
-           % ("\n".join(hidden_out) or "（无）"))
+    for rel, text in texts.items():
+        _write(os.path.join(base, *rel.split("/")), text)
     write_json(os.path.join(base, "manifest.json"), manifest)
     return report
 
 
 def _write(path, text):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="\n") as f:     # the bytes the manifest's hash was taken of
         f.write(text)
 
 
@@ -320,21 +324,43 @@ def manifest_digest(pkg_dir) -> str:
 
 
 def verify_package(pkg_dir) -> list:
-    """Problems: every segment listed in the manifest exists with the recorded hash, nothing extra."""
+    """Problems with a package: every file in it is the manifest, a segment or a file the manifest lists, with the
+    hash recorded there; no file is missing, nothing is extra, and nothing is a symbolic link (a copy would take in
+    whatever it points to). A package whose manifest records no file hashes (built before brain-kit recorded them)
+    cannot be checked and is refused too."""
+    if os.path.islink(pkg_dir):
+        return ["the package folder is a symbolic link"]
     m = load_json(os.path.join(pkg_dir, "manifest.json"))
     probs = []
-    listed = set()
+    expected = {}                               # path relative to the package, '/'-separated -> sha256
     for s in m.get("segments", []):
-        p = os.path.join(pkg_dir, s["file"])
-        listed.add(os.path.normpath(s["file"]))
-        if not os.path.exists(p):
-            probs.append("missing %s" % s["file"])
+        expected[os.path.normpath(s["file"]).replace(os.sep, "/")] = s["sha256"]
+    files = m.get("files")
+    if not isinstance(files, dict):
+        probs.append("manifest.json records no hashes for README.md, toc.md, findings.md and extras/ (built by an "
+                     "older brain-kit): run brain intake again")
+        files = {}
+    for rel, sha in files.items():
+        expected[os.path.normpath(rel).replace(os.sep, "/")] = sha
+    found = set()
+    for root, dirs, names in os.walk(pkg_dir):
+        for n in sorted(dirs + names):
+            p = os.path.join(root, n)
+            rel = os.path.relpath(p, pkg_dir).replace(os.sep, "/")
+            if os.path.islink(p):
+                probs.append("symbolic link %s" % rel)
+            elif n in names and not os.path.isfile(p):
+                probs.append("not a regular file: %s" % rel)
+            elif n in names:
+                found.add(rel)
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+    for rel, sha in sorted(expected.items()):
+        if rel not in found:
+            probs.append("missing %s" % rel)
             continue
-        with open(p, "rb") as f:
-            if hashlib.sha256(f.read()).hexdigest() != s["sha256"]:
-                probs.append("changed %s" % s["file"])
-    seg_dir = os.path.join(pkg_dir, "segments")
-    for f in (os.listdir(seg_dir) if os.path.isdir(seg_dir) else []):
-        if os.path.normpath("segments/" + f) not in listed:
-            probs.append("extra %s" % f)
+        with open(os.path.join(pkg_dir, *rel.split("/")), "rb") as f:
+            if hashlib.sha256(f.read()).hexdigest() != sha:
+                probs.append("changed %s" % rel)
+    for rel in sorted(found - set(expected) - {"manifest.json"}):
+        probs.append("extra %s" % rel)
     return probs

@@ -1,13 +1,15 @@
 # Include from the project's .gitlab-ci.yml (owned by the platform team; the bot cannot edit CI files).
-# Make `brain-run-check` a required check for MRs from ai/* branches, reported by a job the bot cannot fake
-# (see the main plan §6: only checks the bot cannot write count as gates).
+# Make all three jobs required checks, reported by jobs the bot cannot fake (see the main plan §6: only checks the
+# bot cannot write count as gates). They run in every MR pipeline, whatever the source branch is called: the bot can
+# open an MR from any branch, and kit.json's branch_prefix need not be ai. On a branch that is not a run branch
+# check-run has nothing to check; push-rules refuses the bot's pushes and commits there.
 brain-run-check:
   stage: test
   image: ${BRAIN_CI_IMAGE}          # internal image with python3 (3.8+), git and openssh-client
   variables:
     GIT_DEPTH: "0"                  # brain_commit must be in history
   rules:
-    - if: '$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^ai\//'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   script:
     - git clone -q --depth 1 --branch "${BRAIN_KIT_REF}" "${BRAIN_KIT_REPO}" /tmp/brain-kit
     # vouchers: read-only clone of brain-intake/vouchers (deploy token scoped to that repo, read_repository)
@@ -23,7 +25,7 @@ brain-push-rules:
   variables:
     GIT_DEPTH: "0"
   rules:
-    - if: '$CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^ai\//'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
   script:
     - git clone -q --depth 1 --branch "${BRAIN_KIT_REF}" "${BRAIN_KIT_REPO}" /tmp/brain-kit
     # in a pipeline the bot's push started, the hand-over voucher tells the owner's commits from the bot's

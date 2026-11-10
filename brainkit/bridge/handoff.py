@@ -104,13 +104,10 @@ WAITING_DECISION_STATES = ("open", "posting", "asking")
 
 
 def _paths_meet(path, pattern) -> bool:
-    """Does a run's expected path (a file or a folder) meet a risk-path pattern (ci.glob_match's rules)?"""
-    from ..ci import glob_match
-    pat = pattern.strip()
-    if glob_match(path, pat) or glob_match(path + "/x", pat):
-        return True
-    lit = re.split(r"[*?\[]", pat, 1)[0]
-    return bool(lit) and lit.startswith(path + "/")
+    """Does a run's expected path (a file, a folder or a glob such as services/api/**, naming everything below it)
+    meet a risk-path pattern: could a file it names be under it (riskpaths.meets: brain-ci check-run's rules)?"""
+    from ..riskpaths import meets
+    return meets(path, pattern)
 
 
 def _event_order(ev):
@@ -121,6 +118,13 @@ def _event_order(ev):
         n = 0
     t = gl_time(ev.get("created_at"))
     return n, t.timestamp() if t else float("-inf")
+
+
+def _users(authz) -> dict:
+    """brain-authz `users` by lowercased GitLab username: branch owners are lowercased, and GitLab usernames are
+    not case-sensitive (roles and bot_users are compared lowercased too)."""
+    users = authz.get("users") or {}
+    return {str(k).lower(): v for k, v in users.items()} if isinstance(users, dict) else {}
 
 
 class Bridge(DecisionLoop):
@@ -139,7 +143,7 @@ class Bridge(DecisionLoop):
             authz = load_json(cfg["identities"])
         except (OSError, ValueError) as e:
             raise BrainError("bridge config: identities %s cannot be read: %s" % (cfg["identities"], e))
-        self.ids = authz.get("users", {})
+        self.ids = _users(authz)
         self.roles = authz.get("roles", {})
         self._kit = {}
         self._kit_at = {}
@@ -202,7 +206,7 @@ class Bridge(DecisionLoop):
         except (OSError, ValueError) as e:
             self.out("identities %s not read again (the ones read before stay): %s" % (self.cfg["identities"], e))
             return
-        self.ids, self.roles, self._ids_mtime = authz.get("users", {}), authz.get("roles", {}), m
+        self.ids, self.roles, self._ids_mtime = _users(authz), authz.get("roles", {}), m
 
     # ---------- checks ----------
 
@@ -371,13 +375,7 @@ class Bridge(DecisionLoop):
         d = self.cfg.get("intake_dir")
         if not d:
             return ["the run uses material packages but the bridge has no intake_dir"]
-        pulled = ""
-        if os.path.isdir(os.path.join(d, ".git")):
-            try:
-                p = git_net(d, "pull", "-q", "--ff-only", timeout=self.git_timeout, check=False)
-                pulled = "" if p.returncode == 0 else (p.stderr or p.stdout).strip()[:300] or "git pull failed"
-            except NetworkError as e:
-                pulled = str(e)
+        pulled = self.sync_intake(d) if os.path.isdir(os.path.join(d, ".git")) else ""
         probs = []
         for m in materials:
             pdir = os.path.join(d, "packages", m["package"])
@@ -391,6 +389,44 @@ class Bridge(DecisionLoop):
             # the clone could not be brought up to date: not a reason to reject; checked again next round
             raise NetworkError("brain-intake (%s) could not be updated: %s" % (d, pulled))
         return probs
+
+    def sync_intake(self, d) -> str:
+        """Bring the bridge's brain-intake clone `d` up to date with origin: '' or why it could not. The bridge's own
+        commits there (vouchers whose push failed) are rebased onto origin, not left to block every later pull (each
+        voucher and each package is its own folder, so the rebase meets no conflict), and pushed again: a voucher
+        that could not be pushed goes out on a later round. A failed push is not a reason to refuse anything."""
+        try:
+            p = git_net(d, "pull", "-q", "--rebase", timeout=self.git_timeout, check=False)
+        except NetworkError as e:
+            return str(e)
+        if p.returncode != 0:
+            gdir = git(d, "rev-parse", "--absolute-git-dir", check=False).stdout.strip()
+            if gdir and any(os.path.isdir(os.path.join(gdir, x)) for x in ("rebase-merge", "rebase-apply")):
+                git(d, "rebase", "--abort", check=False)
+            return (p.stderr or p.stdout).strip()[:300] or "git pull failed"
+        ahead = git(d, "rev-list", "--count", "@{u}..HEAD", check=False)
+        if ahead.returncode == 0 and ahead.stdout.strip() not in ("", "0"):
+            try:
+                q = git_net(d, "push", "-q", timeout=self.git_timeout, check=False)
+                if q.returncode != 0:
+                    self.out("brain-intake (%s): %s local commit(s) not pushed yet: %s" % (
+                        d, ahead.stdout.strip(), one_line((q.stderr or q.stdout).strip(), 200)))
+            except NetworkError as e:
+                self.out("brain-intake (%s): local commits not pushed yet: %s" % (d, e))
+        return ""
+
+    def push_pending_vouchers(self):
+        """Voucher commits a failed push left in the bridge's clone go out on the next round, also when no hand-over
+        or answer publishes again. Nothing to do (no network) when the clone is not ahead of origin."""
+        vd = self.cfg.get("vouchers_dir")
+        if not self.cfg.get("publish_vouchers") or not vd or not os.path.isdir(vd):
+            return
+        top = git(vd, "rev-parse", "--show-toplevel", check=False)
+        ahead = git(vd, "rev-list", "--count", "@{u}..HEAD", check=False)
+        if top.returncode == 0 and ahead.returncode == 0 and ahead.stdout.strip() not in ("", "0"):
+            why = self.sync_intake(top.stdout.strip())
+            if why:
+                self.out("brain-intake: voucher commits not pushed yet: %s" % one_line(why, 200))
 
     @property
     def git_timeout(self) -> float:
@@ -413,14 +449,29 @@ class Bridge(DecisionLoop):
     # ---------- poll ----------
 
     def poll(self):
+        """Check the labelled MRs of every project. A project whose kit.json or MR list cannot be read does not hold
+        up the others (as in dispatch, watch and collect): its error is raised at the end, after the rest. First,
+        the comments earlier rounds could not post (tell_mr_due)."""
+        errors = self.notes_due_round()
+        try:
+            self.push_pending_vouchers()
+        except Exception as e:  # noqa: BLE001
+            errors.append("brain-intake: %s" % e)
         for proj in self.cfg["projects"]:
             project = proj["project"] if isinstance(proj, dict) else proj
-            kit = self.kit(project)
-            for mr in self.gl.mrs_with_label(project, kit["handoff_label"]):
+            try:
+                kit = self.kit(project)
+                mrs = self.gl.mrs_with_label(project, kit["handoff_label"])
+            except Exception as e:  # noqa: BLE001 - logged by the caller; this project is looked at again next round
+                errors.append("%s: %s" % (project, e))
+                continue
+            for mr in mrs:
                 try:
                     self.process(project, kit, mr)
                 except BrainError as e:  # one bad MR must not stop the others; it is retried next round
                     self.out("error on %s!%s: %s" % (project, mr.get("iid"), e))
+        if errors:
+            raise BrainError("poll: not done this round: " + "; ".join(errors))
 
     def process(self, project, kit, mr):
         """-> "accepted", "rejected", "seen" (this head and label event were checked before), "unlabelled" (the
@@ -435,6 +486,12 @@ class Bridge(DecisionLoop):
         # A check left 'checking' by a bridge that stopped mid-way is taken over once it is stale.
         key = "%s#%s" % (sha, event)
         if not self.ledger.claim_handoff(project, iid, key, stale_after=self.reservation_ttl):
+            for row in self.ledger.notes_due():   # checked before, but its comment may still be owed
+                if row["project"] == project and int(row["iid"]) == iid:
+                    try:
+                        self._post_due(row)
+                    except Exception as e:  # noqa: BLE001 - kept for the next round
+                        self.out("%s!%s: comment not posted yet: %s" % (project, iid, one_line(e, 200)))
             return "seen"
         try:
             return self._process(project, kit, mr, iid, sha, key, adder, label_event=ev)
@@ -458,10 +515,49 @@ class Bridge(DecisionLoop):
         self.out("rejected %s!%d @%s: %s" % (project, iid, sha[:12], "; ".join(probs)))
         if not self._label_event_is_current(project, iid, kit, key):
             return "rejected"
-        self.gl.comment(project, iid, "AI 接手被拒（%s）：\n" % sha[:12] + "\n".join("- " + x for x in probs) +
-                        "\n\n" + self.retry_advice(kit))
-        self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
+        self.tell_mr_due("rejected:%s!%d:%s" % (project, iid, key), project, iid,
+                         "AI 接手被拒（%s）：\n" % sha[:12] + "\n".join("- " + x for x in probs) + "\n\n" +
+                         self.retry_advice(kit), add=["rejected_label"], remove=["handoff_label"], check_key=key)
         return "rejected"
+
+    # ---------- MR comments owed after a verdict ----------
+
+    def tell_mr_due(self, key, project, iid, body, add=(), remove=(), run_id=None, check_key=None) -> bool:
+        """Post `body` on the MR once for `key` and change its labels (kit label keys: rejected_label, ...), after
+        the verdict was recorded. It is written down first (mr_notes_due): when GitLab fails (a 502, a timeout) it
+        is posted on a later round (notes_due_round), not lost behind the recorded verdict. check_key: the sha#event
+        of the hand-over check it is about. -> True when done now."""
+        row = self.ledger.note_due(key, project, iid, body, {"add": list(add), "remove": list(remove)},
+                                   run_id=run_id, check_key=check_key)
+        try:
+            self._post_due(row)
+            return True
+        except Exception as e:  # noqa: BLE001 - kept; posted next round
+            self.out("%s!%s: comment not posted yet (next round): %s" % (project, iid, one_line(e, 200)))
+            return False
+
+    def notes_due_round(self):
+        """Post what an earlier round could not (tell_mr_due). Errors stay for the next round."""
+        errors = []
+        for row in self.ledger.notes_due():
+            try:
+                self._post_due(row)
+            except Exception as e:  # noqa: BLE001
+                errors.append("%s!%s: %s" % (row["project"], row["iid"], one_line(e, 200)))
+        return errors
+
+    def _post_due(self, row):
+        project, iid, key = row["project"], int(row["iid"]), row["key"]
+        kit = self.kit(project)
+        if row["check_key"] and not self._label_event_is_current(project, iid, kit, row["check_key"]):
+            self.ledger.note_done(key)      # a newer label event is checked on its own: this verdict is moot
+            return
+        self.tell_mr_once(key, project, iid, row["body"], run_id=row["run_id"])   # once, also when labels failed
+        labels = json.loads(row["labels"] or "{}")
+        add, remove = [kit[k] for k in labels.get("add", [])], [kit[k] for k in labels.get("remove", [])]
+        if add or remove:
+            self.gl.edit_labels(project, iid, add=add, remove=remove)
+        self.ledger.note_done(key)
 
     @staticmethod
     def retry_advice(kit) -> str:
@@ -511,10 +607,10 @@ class Bridge(DecisionLoop):
             self.ledger.set_handoff(project, iid, key, "checking", "rejected", reason=("signer: " + why)[:2000])
             self.out("signer refused %s!%d @%s: %s" % (project, iid, sha[:12], why))
             if self._label_event_is_current(project, iid, kit, key):
-                self.gl.comment(project, iid, "AI 接手被拒（%s）：交接的检查都过了，但签名服务没有签这份合同：\n%s\n\n"
-                                "请负责人看一下签名服务的记录。%s"
-                                % (sha[:12], "\n".join("- " + x for x in e.reasons), self.retry_advice(kit)))
-                self.gl.edit_labels(project, iid, add=[kit["rejected_label"]], remove=[kit["handoff_label"]])
+                self.tell_mr_due("rejected:%s!%d:%s" % (project, iid, key), project, iid,
+                                 "AI 接手被拒（%s）：交接的检查都过了，但签名服务没有签这份合同：\n%s\n\n请负责人看一下签名服务的"
+                                 "记录。%s" % (sha[:12], "\n".join("- " + x for x in e.reasons), self.retry_advice(kit)),
+                                 add=["rejected_label"], remove=["handoff_label"], check_key=key)
             return "rejected"
         except BaseException:
             self.ledger.release_run(run_id)
@@ -617,7 +713,7 @@ class Bridge(DecisionLoop):
         """Send ready runs into KiroCrew (admission limits apply). First, what a stop, a crash or a KiroCrew error
         left half-sent is settled (recover_runs). A run runnerd could not prepare is asked for again or told on the
         MR (spool/failed). One run that fails does not hold up the others: the errors are raised at the end."""
-        errors, sent = [], 0
+        errors, sent = self.notes_due_round(), 0
         try:
             self.recover_runs()
         except Exception as e:  # noqa: BLE001
@@ -878,13 +974,9 @@ class Bridge(DecisionLoop):
         rid = row["run_id"]
         if not self.ledger.set_run(rid, frm, "failed"):
             return
-        self.tell_mr_once("failed:" + rid, row["project"], row["iid"], "%s 没能开始：%s。处理好以后在分支上重新运行 "
-                          "`brain handoff`（它提交交接、推送并打标签），桥会重新接手。" % (rid, why), run_id=rid)
-        try:
-            kit = self.kit(row["project"])
-            self.gl.edit_labels(row["project"], row["iid"], add=[kit["rejected_label"]], remove=[kit["running_label"]])
-        except BrainError as e:
-            self.out("%s: labels not changed: %s" % (rid, e))
+        self.tell_mr_due("failed:" + rid, row["project"], row["iid"], "%s 没能开始：%s。处理好以后在分支上重新运行 "
+                         "`brain handoff`（它提交交接、推送并打标签），桥会重新接手。" % (rid, why),
+                         add=["rejected_label"], remove=["running_label"], run_id=rid)
 
     # ---------- reconcile ----------
 

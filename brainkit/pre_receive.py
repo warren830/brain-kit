@@ -20,6 +20,8 @@ Rules for run branches (<prefix>/<owner>/<JIRA>-<slug>):
 Install: link `bin/brain-pre-receive` as a server hook (custom_hooks/pre-receive or the global
 server_hooks dir). Config: JSON at $BRAIN_HOOK_CONFIG (default /etc/brain-kit/pre-receive.json):
   {"default": {...}, "projects": {"group/repo": {...}}}   keys as in .brain/kit.json
+bot_emails: when the config does not set them, those of .brain/kit.json on the project's default branch (what
+brain-ci reads; the bot changes neither: main is protected, .brain/ is a forbidden path), else the kit's default.
 """
 from __future__ import annotations
 
@@ -321,14 +323,35 @@ def decide(updates, user, cfg, cwd=None) -> list:
     return reasons
 
 
-def load_cfg(project_path) -> dict:
+def kit_bot_emails(default_branch, cwd=None) -> list:
+    """bot_emails of .brain/kit.json on the default branch as the server has it before this push ([] when it has no
+    such list): the addresses brain-ci recognises the bot by."""
+    p = subprocess.run(["git", "show", "refs/heads/%s:.brain/kit.json" % default_branch], cwd=cwd,
+                       capture_output=True)
+    if p.returncode != 0:
+        return []
+    try:
+        doc = json.loads(p.stdout.decode("utf-8"))
+    except ValueError:            # also UnicodeDecodeError
+        return []
+    emails = doc.get("bot_emails") if isinstance(doc, dict) else None
+    return [e for e in emails if isinstance(e, str) and e.strip()] if isinstance(emails, list) else []
+
+
+def load_cfg(project_path, cwd=None) -> dict:
+    """The hook's config for this project. bot_emails the config does not set come from the project's kit.json on the
+    default branch (kit_bot_emails), so the hook and brain-ci recognise the same bot commits."""
     path = os.environ.get("BRAIN_HOOK_CONFIG", "/etc/brain-kit/pre-receive.json")
     cfg = dict(DEFAULT_CFG)
+    own = {}
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-        cfg.update(data.get("default", {}))
-        cfg.update(data.get("projects", {}).get(project_path or "", {}))
+        own.update(data.get("default", {}))
+        own.update(data.get("projects", {}).get(project_path or "", {}))
+    cfg.update(own)
+    if "bot_emails" not in own:
+        cfg["bot_emails"] = kit_bot_emails(cfg["default_branch"], cwd) or cfg["bot_emails"]
     return cfg
 
 
