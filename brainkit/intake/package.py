@@ -126,7 +126,8 @@ _PARTS_RE = re.compile(r"[ \t]*(?:[|·•–—★☆]|[ \t]-[ \t]|\t|[ \t]{2,})
 
 def _mark_rules(word):
     w = r"(?:%s)?(?:%s)%s" % (_QUAL, word, _SUFFIX)
-    return {"part": re.compile(r"(?i)^%s(?:[ \t]*[,，:：;；.。!！]?[ \t]*(?:%s))?[ \t.。!！]*$" % (w, _DISTRIB)),
+    return {"part": re.compile(r"(?i)^%s(?:[ \t]+%s)*(?:[ \t]*[,，:：;；.。!！]?[ \t]*(?:%s))?[ \t.。!！]*$"
+                               % (w, w, _DISTRIB)),     # the word in two languages is one mark: CONFIDENTIAL 机密
             "field": re.compile(r"(?i)(?:%s)[ \t]*(?:[:：=|]|为|為|是)?[ \t*_【\[(（「]*%s" % (_FIELD, w)),
             "doc": re.compile(r"(?i)%s%s|%s%s(?![ \t]+(?:to|clients?)\b)" % (_DOC, w, _DOC_EN, w)),
             "label": re.compile(r"(?i)(?<![A-Za-z])(?:%s)(?![A-Za-z]|性)" % word)}
