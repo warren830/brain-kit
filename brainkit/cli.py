@@ -1332,6 +1332,21 @@ def _child_mr(repo, cfg, a, br, b, rec, me):
     dirty = _dirty(repo, ignore=(md, rel))
     if dirty:
         raise BrainError("commit your work first:\n  " + "\n  ".join(dirty))
+    gl = None if a.no_push or not _has_origin(repo) else _gitlab(cfg)
+    proj = cfg["gitlab"]["project"] if gl else ""
+    existing = None
+    if proj:
+        # an MR of this branch opened by hand (GitLab's "create merge request" link targets the default branch)
+        # goes elsewhere: merged, the child would land there, not in its parent's branch. Before anything is written.
+        mrs = gl.mrs_for_branch(proj, br)
+        wrong = [m for m in mrs if m.get("target_branch") != target]
+        if wrong:
+            raise BrainError("%s: a child of a split merges into its parent's branch %s only. Change the target branch "
+                             "of %s on GitLab to %s, or close it, then run `brain handoff` again (nothing was committed "
+                             "or pushed)" % (", ".join("MR !%s goes into %s" % (m.get("iid"), m.get("target_branch"))
+                                                       for m in wrong), target,
+                                             "it" if len(wrong) == 1 else "them", target))
+        existing = mrs[0] if mrs else None
     rec["mr"] = {"requested_at": iso(utcnow()), "by": me, "local_head": git_out(repo, "rev-parse", "HEAD")}
     write_json(rp, rec)
     git(repo, "add", "--", rel)
@@ -1359,13 +1374,11 @@ def _child_mr(repo, cfg, a, br, b, rec, me):
               "handing it to the team runner comes with phase 2." % (who, br, target))
         return 0
     git(repo, "push", "-q", "-u", "origin", br)
-    gl = _gitlab(cfg)
-    if not gl or not cfg["gitlab"]["project"]:
+    if not proj:
         print("Pushed %s. GitLab not configured here: open its MR into %s by hand, for %s to review and merge." % (
             br, target, who))
         return 0
-    proj = cfg["gitlab"]["project"]
-    mr = gl.mr_for_branch(proj, br)
+    mr = existing
     if not mr:
         mr = _create_mr(gl, proj, br, target, "%s %s (unit %s of %s)" % (rec["key"], b["slug"].replace("-", " "),
                                                                         rec.get("unit"), rec["parent"]), desc)

@@ -4,11 +4,13 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from brainkit import claims, cli, lean  # noqa: E402
+from brainkit import claims, cli, config, lean  # noqa: E402
 from brainkit.common import load_json, write_json  # noqa: E402
+from tests import test_split as ts  # noqa: E402
 from tests.helpers import LEAN_SRC, commit_file, git_repo, sh, tmpdir  # noqa: E402
 from tests.test_cli import brain, fake_tools  # noqa: E402
 
@@ -510,6 +512,71 @@ class R1_44_ReleaseSaysDeleteTheBranch(Project):
         rc, out = self.release()
         self.assertEqual(rc, 0, out)
         self.assertIsNone(claims.read(self.repo, "PAY-1")["owner"])
+
+
+@unittest.skipUnless(HAVE_LEAN, "AI-DLC Lean checkout not found")
+class SplitChild(unittest.TestCase):
+    """tests/test_split.py's family: alice split PAY-1 (ai/alice/PAY-1-big); bob claimed and built PAY-4 (unit jobs)
+    in his worktree and wrote its note. No GitLab and no token: each person is their login name."""
+    run_as, ok, inception, build_unit, wt = (ts.Family.run_as, ts.Family.ok, ts.Family.inception,
+                                             ts.Family.build_unit, ts.Family.wt)
+
+    def setUp(self):
+        self.home = ts.isolate(self)
+        self.p = ts.Project(self)
+        self.alice, self.bob = self.p.clone("alice"), self.p.clone("bob")
+        self.inception()
+        self.ok("alice", self.alice, "split", "PAY-1")
+        self.ok("bob", self.bob, "claim", "PAY-4")
+        self.ok("bob", self.bob, "start", "--key", "PAY-4")
+        self.jobs = self.wt("bob", "PAY-4")
+        self.build_unit(self.jobs, "jobs", "AC-4", {"jobs/reconcile.py": "x = 1\n"})
+        with open(os.path.join(self.jobs, "aidlc-docs", self.intent, "aidlc-state.md"), "a", encoding="utf-8") as f:
+            f.write("### Next (team jobs)\nStatus: Construction jobs: done\n1. review and merge\n")
+        ts.commit_all(self.jobs, "jobs: notes")
+
+    def tip(self, where, ref):
+        return sh("git", "-C", where, "rev-parse", ref).stdout.strip()
+
+
+class R1_35_ChildMrIntoItsParentsBranch(SplitChild):
+    def handoff(self, mrs):
+        """bob's `brain handoff` with GitLab (acme/shop) and a token, its open MRs from ai/bob/PAY-4-jobs `mrs`."""
+        from tests.helpers import Fake
+        from brainkit.rest import GitLab
+        fake = Fake()
+        fake.on("GET", "/api/v4/user", lambda m, q, b: (200, {"username": "bob"}))
+        fake.on("GET", "/api/v4/projects/acme/shop/merge_requests", lambda m, q, b: (200, [dict(x) for x in mrs]))
+        fake.on("POST", "/api/v4/projects/acme/shop/merge_requests", lambda m, q, b: (201, {"iid": 9}))
+        fake.on("PUT", r"/api/v4/projects/acme/shop/merge_requests/(\d+)", lambda m, q, b: (200, {"iid": 1}))
+        load = config.load
+
+        def with_gitlab(repo):
+            cfg = load(repo)
+            cfg["gitlab"] = dict(cfg["gitlab"], base="https://gl.example", project="acme/shop")
+            return cfg
+        with mock.patch.object(config, "load", side_effect=with_gitlab), \
+                mock.patch.object(cli, "_gitlab", side_effect=lambda cfg: GitLab(cfg["gitlab"]["base"], "t", fake)):
+            rc, out = self.run_as("bob", self.jobs, "handoff")
+        return rc, out, [c[:2] for c in fake.calls if c[0] in ("POST", "PUT")]
+
+    def test_r1_35_an_open_mr_into_another_branch_is_refused_before_anything_is_done(self):
+        before = (self.tip(self.jobs, "HEAD"), self.tip(self.p.origin, "ai/bob/PAY-4-jobs"))
+        mr = {"iid": 1, "source_branch": "ai/bob/PAY-4-jobs", "target_branch": "main"}   # opened by hand
+        rc, out, writes = self.handoff([mr])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("MR !1 goes into main: a child of a split merges into its parent's branch ai/alice/PAY-1-big "
+                      "only. Change the target branch of it on GitLab to ai/alice/PAY-1-big, or close it", out)
+        self.assertNotIn("goes into ai/alice/PAY-1-big for", out)
+        self.assertEqual((self.tip(self.jobs, "HEAD"), self.tip(self.p.origin, "ai/bob/PAY-4-jobs")), before)
+        self.assertEqual(writes, [])
+        self.assertNotIn("mr", load_json(os.path.join(self.jobs, "runs", "PAY-4", "run.json")))
+        mr["target_branch"] = "ai/alice/PAY-1-big"                # retargeted: that MR is the child's
+        rc, out, writes = self.handoff([mr])
+        self.assertEqual(rc, 0, out)
+        self.assertIn("MR !1 goes into ai/alice/PAY-1-big for PAY-1's owner to review and merge", out)
+        self.assertEqual(writes, [("PUT", "/api/v4/projects/acme/shop/merge_requests/1")])
+        self.assertEqual(self.tip(self.p.origin, "ai/bob/PAY-4-jobs"), self.tip(self.jobs, "HEAD"))
 
 
 if __name__ == "__main__":
