@@ -518,11 +518,21 @@ def _dedupe(hits):
         if clash is None:
             last = len(kept)
             kept.append(h)
-        elif rank[h.cat] < rank[clash.cat]:
+        elif _replaces(h, clash, rank):
             kept[last] = None                        # dropped; h goes to the end, as before
             last = len(kept)
             kept.append(h)
     return sorted((k for k in kept if k is not None), key=lambda h: h.start)
+
+
+def _replaces(h, k, rank) -> bool:
+    """h takes the place of k, which it overlaps: the stronger hit wins, but personal data that holds a secret stays
+    whole (a phone 139 8888 1234 holding the PIN 8888), so no part of it shows around the secret's placeholder."""
+    if {h.cat, k.cat} == {"pii", "secret"}:
+        pii, secret = (h, k) if h.cat == "pii" else (k, h)
+        if pii.start <= secret.start and secret.end <= pii.end and pii.end - pii.start > secret.end - secret.start:
+            return h is pii
+    return rank[h.cat] < rank[k.cat]
 
 
 # A value judged sensitive once is masked wherever it occurs in the package as a whole word: other rows, other files,

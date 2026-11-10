@@ -1,4 +1,4 @@
-"""Review round 2 on document intake: regressions from round 1's fixes (R2-01).
+"""Review round 2 on document intake: regressions from round 1's fixes (R2-01, R2-11).
 
 Password-shaped values are built at runtime, so the source holds none (the commit hook scans for them).
 """
@@ -78,6 +78,21 @@ class R2_01SpreadWholeWordsOfSureValues(Base):
         self.assertEqual([(h.cat, h.value) for h in checks.scan("请 @李娜 确认，@Alice Wang 复核") if h.kind == "person"],
                          [("pii", "@李娜"), ("pii", "@Alice Wang")])
 
+
+
+class R2_11PiiHoldingASecretIsMaskedWhole(Base):
+    """A PIN that spread (支付密码：8888) landed inside a phone or an email of another file: the secret hit took the
+    place of the whole phone hit, so 139 and 1234 were shown around [密钥-1]."""
+
+    def test_phone_and_email_stay_whole(self):
+        no_gitleaks(self)
+        pin = "88" + "88"
+        self.file("环境.md", "# 测试环境\n\n支付密码：%s\n" % pin)
+        self.file("联系人.md", "# 联系\n\n客服经理手机 139 %s 1234\n\n邮箱 kefu.%s@example.com\n" % (pin, pin))
+        text = self.segments(self.build())
+        self.assertIn("客服经理手机 [电话-1]", text)
+        self.assertIn("邮箱 [邮箱-1]", text)
+        self.assertNotIn("1234", text)
 
 
 

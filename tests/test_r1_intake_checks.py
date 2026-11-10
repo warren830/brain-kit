@@ -282,7 +282,7 @@ class R1_55ClassificationMarks(Base):
 
 
 def _dedupe_reference(hits):
-    """The old quadratic _dedupe, to compare against."""
+    """The old quadratic _dedupe, to compare against (which hit replaces which: checks._replaces, R2-11)."""
     rank = {"secret": 0, "pii": 1, "business": 2, "review": 3, "link": 4, "instruction": 5}
     hits.sort(key=lambda h: (h.start, rank[h.cat], -(h.end - h.start)))
     kept = []
@@ -294,7 +294,7 @@ def _dedupe_reference(hits):
                      None)
         if clash is None:
             kept.append(h)
-        elif rank[h.cat] < rank[clash.cat]:
+        elif checks._replaces(h, clash, rank):
             kept.remove(clash)
             kept.append(h)
     return sorted(kept, key=lambda h: h.start)
