@@ -221,6 +221,17 @@ class Usage(unittest.TestCase):
         self.assertEqual([(r["intent"], r["cited"]) for r in data["runs"]], [("261108-oms-3-x", ["T-OMS-1-1"])])
         self.assertEqual(data["useful"], [1, 2])
 
+    def test_r1_80_folders_lean_does_not_take_as_intents_are_not_runs(self):
+        cites = "per T-OMS-1-2\n"
+        repo = usage_repo(os.path.join(tmpdir(self), "r"), {
+            "aidlc-docs/261108-oms-3-x/decisions.md": "按 T-OMS-1-1 做。\n",
+            "aidlc-docs/lean.json": json.dumps({"contracts_dir": "aidlc-docs/api-contracts"}),
+            "aidlc-docs/contracts/orders.md": cites, "aidlc-docs/api-contracts/v1/orders.md": cites,
+            "aidlc-docs/audit/notes.md": cites})
+        data = usage_json(repo)
+        self.assertEqual([(r["intent"], r["cited"]) for r in data["runs"]], [("261108-oms-3-x", ["T-OMS-1-1"])])
+        self.assertEqual(data["useful"], [1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

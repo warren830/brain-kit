@@ -23,7 +23,7 @@ import os
 import re
 import subprocess
 
-from . import entries as E, reflect
+from . import entries as E, lean, reflect
 from .common import git
 
 CITE_RE = re.compile(r"(?<![A-Za-z0-9-])([PTIJ]-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3})(?![0-9-])")
@@ -62,6 +62,31 @@ def _tree_files(repo, ref, prefix):
             if s.returncode == 0:
                 out[path] = s.stdout.decode("utf-8", errors="replace")
     return out
+
+
+def _read(repo, ref, rel) -> str:
+    if ref is None:
+        p = os.path.join(repo, rel)
+        if not os.path.isfile(p):
+            return ""
+        with open(p, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    s = subprocess.run(["git", "-C", repo, "show", "%s:%s" % (ref, rel)], capture_output=True)
+    return s.stdout.decode("utf-8", errors="replace") if s.returncode == 0 else ""
+
+
+def not_intents(repo, ref) -> set:
+    """Lean's reserved(): the folders under aidlc-docs/ that are not intents. audit/, contracts/, and the contracts
+    folder by its name in aidlc-docs/lean.json (contracts_dir)."""
+    try:
+        cfg = json.loads(_read(repo, ref, lean.CONFIG) or "{}")
+    except ValueError:
+        cfg = {}
+    names = {"audit", "contracts"}
+    parts = str((cfg if isinstance(cfg, dict) else {}).get("contracts_dir") or "").strip("/").split("/")
+    if len(parts) > 1 and parts[0] == lean.DOCS:
+        names.add(parts[1])
+    return names
 
 
 def page_unit(rel):
@@ -131,9 +156,10 @@ def collect(repo, cfg, ref=None) -> dict:
                     rec = dict(rec, brain_commit=None)
                 runs.setdefault(rec["intent"], []).append(rec)
     cites = {}                                    # intent -> {page under aidlc-docs/<intent>/: {id: count}}
-    for path, text in _tree_files(repo, ref, "aidlc-docs").items():
+    skip = not_intents(repo, ref)
+    for path, text in _tree_files(repo, ref, lean.DOCS).items():
         parts = path.replace(os.sep, "/").split("/")
-        if len(parts) < 3 or not path.endswith(".md"):
+        if len(parts) < 3 or not path.endswith(".md") or parts[1] in skip:
             continue
         intent = parts[1]
         body = strip_proposals(text)
