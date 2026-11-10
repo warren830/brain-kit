@@ -1122,15 +1122,31 @@ def proposals_of(text, path) -> dict:
 
 # ---------- bridge ledger and vouchers ----------
 
+def open_ledger(path):
+    """The bridge ledger (sqlite), opened read-only. BrainError when it is not there, is a directory, or is not a
+    sqlite database (sqlite only finds that out at the first query: one is made here)."""
+    if not os.path.exists(path):
+        raise BrainError("bridge ledger %s not found" % path)
+    if os.path.isdir(path):
+        raise BrainError("bridge ledger %s is a directory: give the ledger file itself (the bridge's ledger.sqlite)"
+                         % path)
+    db = None
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(path)), uri=True)
+        db.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.DatabaseError as e:
+        if db is not None:
+            db.close()
+        raise BrainError("bridge ledger %s is not a sqlite database (%s)" % (path, e))
+    db.row_factory = sqlite3.Row
+    return db
+
+
 def ledger_rows(path, key, shas=()):
     """The bridge ledger's rows for this requirement: its runs (a run id reserved while a hand-over is signed,
     state 'signing', is not a run yet), the hand-over checks of their MRs and of the commits in `shas` (the run's
     `brain handoff` commits: a refused hand-over has no run), and the runs' decisions."""
-    if not os.path.exists(path):
-        raise BrainError("bridge ledger %s not found" % path)
-    uri = "file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(path))
-    db = sqlite3.connect(uri, uri=True)
-    db.row_factory = sqlite3.Row
+    db = open_ledger(path)
     try:
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         runs = [dict(r) for r in db.execute(

@@ -71,5 +71,35 @@ class R1_95_ImpossibleDates(unittest.TestCase):
 
 
 
+class R1_99_LedgerNotSqlite(unittest.TestCase):
+    """--ledger naming a directory, or a file that is not sqlite: a traceback (a missing one was a clean error)."""
+
+    def setUp(self):
+        self.repo = tiny_repo(self)
+        self.folder = os.path.join(self.repo, "bridge")
+        os.makedirs(self.folder)
+        self.json = os.path.join(self.repo, "ledger.json")
+        with open(self.json, "w", encoding="utf-8") as f:
+            f.write('{"runs": []}\n')
+
+    def test_library_raises_brain_error(self):
+        for path, why in ((self.folder, "is a directory"), (self.json, "not a sqlite database")):
+            with self.assertRaisesRegex(BrainError, why):
+                EV.ledger_runs(path)
+            with self.assertRaisesRegex(BrainError, why):
+                trace.ledger_rows(path, "PAY-1")
+        empty = os.path.join(self.repo, "empty.sqlite")
+        open(empty, "w").close()
+        self.assertEqual(EV.ledger_runs(empty), {})        # an empty file is an empty sqlite database: no runs
+
+    def test_cli_exit_2_without_a_traceback(self):
+        for args in (("eval", "--ledger", self.folder), ("eval", "--ledger", self.json),
+                     ("trace", "PAY-1", "--ledger", self.folder), ("trace", "PAY-1", "--ledger", self.json)):
+            rc, out = run_cli(self.repo, *args)
+            self.assertEqual(rc, 2, (args, out))
+            self.assertNotIn("Traceback", out)
+            self.assertTrue(out.startswith("brain: bridge ledger "), (args, out))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -39,9 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-import sqlite3
 import statistics
-import urllib.parse
 
 from . import brainlint, entries as E, trace as T, usage
 from .common import BrainError, JIRA_RE, utcnow
@@ -119,10 +117,7 @@ def ledger_runs(path) -> dict:
     while a hand-over is signed (state 'signing') is not a run yet."""
     if not path:
         return {}
-    if not os.path.exists(path):
-        raise BrainError("bridge ledger %s not found" % path)
-    db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(path)), uri=True)
-    db.row_factory = sqlite3.Row
+    db = T.open_ledger(path)
     try:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'").fetchone():
             return {}
