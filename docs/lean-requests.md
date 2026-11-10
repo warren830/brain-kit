@@ -46,6 +46,7 @@ brain-kit 不改 Lean，只用它的命令、文件和配置。下面是这次�
   - 可是 `next_step` 拿 unit-of-work.md 里 Owner team 那一格的**原文**去比（`owner not in ("", "-", mine)`，不经 `team_key`）。单元名或团队名带 `-` 时，多团队模式下 Owner team 那格要写成 `billing_worker`，Lean 才认得是自己的单元。
 - **brain-kit 的绕法**：小需求的 Lean 团队就是单元名（按 Lean 的规则换成 `_`），在小需求自己的 worktree 里 `lean init --team`；设了 `AIDLC_LEAN_TEAM` 而且和单元对不上时，`brain start` 拒绝。多团队模式下，`brain split` 对 Owner team 和单元的团队名对不上的单元打 WARN。
 - **请求**：`next_step` 比较 Owner team 时也用 `team_key`。
+- **Lean 0.3.1 已经做了**（e8d47c7）：团队名照原样存，比较都经 `team_key`，`web-ui` 和 `web_ui` 是同一个团队。`brain split` 的这两条 WARN 跟着装的 Lean 走：0.3.1 起按 `team_key` 比，Owner team 写单元名（`web-ui`）不再报；装的还是 0.3.0 时照旧按原文比。
 
 ## R7. 大需求可能先发布，把还在做的小需求关在外面
 

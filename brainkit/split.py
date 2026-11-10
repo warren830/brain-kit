@@ -563,12 +563,12 @@ def plan(repo, cfg, me, key=None, docs=None) -> dict:
     lcfg = M._lean_cfg(M._Tree(repo, "HEAD"))
     if lcfg.get("multi_team"):
         mine = os.environ.get("AIDLC_LEAN_TEAM") or _clone_team(repo)
-        if mine and mine in {lean_team(u["name"]) for u in info["units"]}:
+        if mine and any(lean.same_team(repo, mine, lean_team(u["name"])) for u in info["units"]):
             warnings.append("multi-team: this clone's Lean team is %s, a unit's: Lean would send the parent's run to "
                             "build that unit. The parent's clone needs a team that is no unit (`lean init --team "
                             "lead`)" % mine)
         for u in info["units"]:
-            if u["owner"] and u["owner"] not in ("-", lean_team(u["name"])):
+            if u["owner"] and u["owner"] != "-" and not lean.same_team(repo, u["owner"], lean_team(u["name"])):
                 warnings.append("multi-team: unit %s has Owner team %s, but its child runs Lean as team %s: Lean's "
                                 "Next would send it elsewhere (set Owner team to %s)" % (
                                     u["name"], u["owner"], lean_team(u["name"]), lean_team(u["name"])))

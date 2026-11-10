@@ -141,8 +141,15 @@ def next_steps(text: str) -> list:
 
 
 def team_key(name) -> str:
-    """A team name as Lean compares it (aidlc_lean.py team_key): letters, digits and _, the rest as _."""
-    return re.sub(r"[^A-Za-z0-9_]", "_", str(name or "").strip("`* \t"))
+    """A team name as Lean compares it (aidlc_lean.py team_key): letters of any script, digits and _, the rest as _."""
+    return re.sub(r"[^\w]", "_", str(name or "").strip("`* \t"))
+
+
+def same_team(repo, a, b) -> bool:
+    """Would the Lean installed in `repo` read a and b as one team? 0.3.1 on compares team names through team_key
+    (`web-ui` is `web_ui`); 0.3.0 compared the Owner team cell as written."""
+    have = tuple(int(n) for n in re.findall(r"[0-9]+", version(repo))[:3])
+    return team_key(a) == team_key(b) if have >= (0, 3, 1) else a == b
 
 
 def team_next_steps(text: str, team: str) -> list:
