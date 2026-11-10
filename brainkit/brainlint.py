@@ -26,7 +26,7 @@ from . import entries as E
 from .intake import checks
 
 PLACEHOLDER_RE = re.compile(r"\[(?:%s)-[0-9]+\]" % "|".join(sorted(set(checks.Masker.LABEL.values()))))
-DOC_SRC_RE = re.compile(r"^(?:PKG-|D[0-9]{2}#S[0-9]{3})")
+DOC_SRC_RE = re.compile(r"^(?:PKG-|%s)" % E.SEGMENT_REF)
 RELAX_RE = re.compile(
     r"(?i)(跳过|不用|不需要|无需|免|关闭|关掉|去掉|放宽|降低|绕过|skip|disable|bypass|turn off|no longer|without|relax)"
     r"[^\n]{0,16}?(测试|test|日志|log|鉴权|认证|授权|auth|校验|检查|check|依赖|dependenc|审批|评审|review|lint|"

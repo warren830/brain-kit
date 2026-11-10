@@ -51,8 +51,10 @@ PURGED_RE = re.compile(r"^- ([A-Z]-[A-Z0-9-]+) · ")
 PURGED_LINE_RE = re.compile(r"^- ([A-Z]-[A-Z0-9-]+) · ([0-9]{4}-[0-9]{2}-[0-9]{2}) · (%s) · approved by "
                             r"([a-z0-9][a-z0-9._-]{0,63})(?: · props ([0-9a-f]{8}(?:,[0-9a-f]{8})*))?$"
                             % "|".join(PURGE_REASONS))
+# A segment of a material package: intake numbers documents D01 ... D99, D100 ... and segments S001 ... S999, S1000 ...
+SEGMENT_REF = r"D[0-9]{2,4}#S[0-9]{3,5}"
 # Sources are references, never free text: segments, packages, decisions, vouchers, runs, entries, intents, keys.
-SRC_ITEM_RE = re.compile(r"^(?:D[0-9]{2}#S[0-9]{3}|PKG-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3}"
+SRC_ITEM_RE = re.compile(r"^(?:" + SEGMENT_REF + r"|PKG-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3}"
                          r"|D-[1-9][0-9]{0,4}|V-[0-9a-f]{10}|RUN-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,5}"
                          r"|[A-Z]-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3}|[A-Z]-[0-9]{1,5}"
                          r"|[0-9]{6}-[a-z0-9][a-z0-9-]{0,80}|[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6})$")

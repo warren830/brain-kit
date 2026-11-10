@@ -201,6 +201,18 @@ class BrainRound1(unittest.TestCase):
         for text in ("单笔上限 $5,000", "超过 $100 要审批", "US$5 手续费", "$1.50 一件", "$2M 的合同", "1,000,000 HKD"):
             self.assertTrue(any("amount" in x for x in added(text)[0]), text)
 
+    def test_r1_86_segment_refs_from_the_100th_document(self):
+        b = brain_of(TECH=TECH)
+        b.new("TECH", "pitfall", "rule two", "OMS-2", "D100#S001,D07#S1000")
+        errs, warns = brainlint.check(b, base=brain_of(TECH=TECH))
+        self.assertEqual(errs, [])
+        self.assertTrue(any("requirement document" in w for w in warns), warns)
+        props = reflect.parse("```brain-proposal\nfile: TECH\ntype: pitfall\nsrc: D100#S001\n---\nrule two\n```\n")[0]
+        self.assertEqual(reflect.plan(brain_of(TECH=TECH), props, "OMS-2")[1], [])
+        for bad in ("D1#S001", "D100#S1", "D100#X001"):
+            t = TECH.replace("src:D-1", "src:" + bad)
+            self.assertIn("is not a reference", errors(brain_of(TECH=t), base=brain_of(TECH=t)), bad)
+
 
 if __name__ == "__main__":
     unittest.main()
