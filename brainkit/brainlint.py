@@ -11,8 +11,8 @@ Against a base:
   an approver listed in purge_approvers (.brain/kit.json on the target branch)
   archives and PURGED.md only grow
   a new entry is rel:new, or rel:replaces X with X archived in the same change
-  every new piece of text (new entries, appended text, withdraw notes, text outside entries, AGENTS.md) carries no
-  secrets, personal data, amounts, contract numbers, masked placeholders or instruction lines
+  every new piece of text (new entries, appended text, withdraw notes, text outside entries, PURGED.md's notes,
+  AGENTS.md) carries no secrets, personal data, amounts, contract numbers, masked placeholders or instruction lines
 Against the target branch's current Brain (CI): new ids must not already be taken there (parallel MRs).
 Warnings: entries from documents (review alone), entries that relax tests/logging/auth/dependencies
 (Builder + security), text outside entries, repeats >= 2 (make it a gate), one term defined twice, legacy ids.
@@ -189,16 +189,27 @@ def _boilerplate():
 BOILERPLATE = _boilerplate()
 
 
+def _added(lines, old_lines) -> list:
+    """The non-blank lines of `lines` that `old_lines` does not have (as many times)."""
+    old = Counter(old_lines)
+    added = []
+    for line in lines:
+        if old[line]:
+            old[line] -= 1
+        elif line.strip():
+            added.append(line)
+    return added
+
+
 def _free_text(b, base, errors, warnings):
-    """Lines outside entries reach every run as well: new ones get the same content checks."""
+    """Lines outside entries reach every run as well: new ones get the same content checks. So do PURGED.md's
+    headings and notes (its purge lines have a fixed form)."""
+    added = _added(b.purged_text.split("\n"), base.purged_text.split("\n"))
+    errs, warns = content_problems("\n".join(added))
+    errors += ["%s: %s" % (E.PURGED_FILE, x) for x in errs]
+    warnings += ["%s: %s" % (E.PURGED_FILE, x) for x in warns]
     for name, f in sorted(b.files.items()):
-        old = Counter(base.files[name].free_lines()) if name in base.files else Counter()
-        added = []
-        for line in f.free_lines():
-            if old[line]:
-                old[line] -= 1
-            elif line.strip():
-                added.append(line)
+        added = _added(f.free_lines(), base.files[name].free_lines() if name in base.files else [])
         if not added:
             continue
         text = "\n".join(added)
@@ -306,14 +317,7 @@ def _target(b, base, target, errors):
 
 def check_agents(head_text, base_text):
     """AGENTS.md is read by every run too: new lines get the content checks."""
-    old = Counter((base_text or "").split("\n"))
-    added = []
-    for line in (head_text or "").split("\n"):
-        if old[line]:
-            old[line] -= 1
-        elif line.strip():
-            added.append(line)
-    errs, warns = content_problems("\n".join(added))
+    errs, warns = content_problems("\n".join(_added((head_text or "").split("\n"), (base_text or "").split("\n"))))
     return ["AGENTS.md: " + x for x in errs], ["AGENTS.md: " + x for x in warns]
 
 
