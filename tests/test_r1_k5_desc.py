@@ -174,5 +174,46 @@ class IdeationSkipped(unittest.TestCase):
         self.assertNotIn("IDEATION", self.missing(events))
 
 
+
+REVIEW = """# Review: 退款上限
+
+| Finding | Severity | File:line | Fix |
+|---|---|---|---|
+| 金额比较用了浮点数 | high | src/refund.py:2 | {high} |
+| 缺少 422 的错误码文档 | low | src/refund.py:2 | fixed |
+
+结论：{end}
+"""
+
+
+class ReviewFixesRead(unittest.TestCase):
+    """R1-105: a review.md as Lean's release skill writes it (finding, severity, file:line, fix), every finding fixed:
+    「怎么审」 still said a high-severity finding was open."""
+
+    def describe(self, high, end="两条都修了，可以发布。"):
+        isolated(self)
+        repo, cfg = run_world(self, {DOCS + mrdesc.REVIEW_DOC: REVIEW.format(high=high, end=end)})
+        d = mrdesc.build(repo, cfg, "PAY-1")
+        return d, mrdesc.render(d)
+
+    def test_every_finding_fixed(self):
+        d, text = self.describe("fixed：改成整数分（D-3）")
+        self.assertFalse([p for p in d["pointers"] if "评审" in p], d["pointers"])
+        self.assertEqual(d["review"]["high"], {"fixed": 1})
+        self.assertIn("- review.md：2 条发现（高 1、低 1），都修了\n- 高：金额比较用了浮点数（修了）\n- 结论：两条都修了，可以发布。",
+                      text)
+        d, _ = self.describe("已修：改成整数分")
+        self.assertEqual(d["review"]["high"], {"fixed": 1})
+
+    def test_open_and_unmarked_findings_still_point_there(self):
+        for cell in ("", "not fixed: 下个需求改", "未修"):
+            d, text = self.describe(cell, end="还有一条没修。")
+            self.assertIn("评审还有 1 条高严重度发现没修（review.md）", d["pointers"], cell)
+            self.assertIn("- review.md：2 条发现（高 1、低 1），修了 1 条，没修 1 条\n- 高：金额比较用了浮点数（没修）", text)
+        d, text = self.describe("改成整数分")         # a fix written; nothing says it was made
+        self.assertIn("评审有 1 条高严重度发现，review.md 没写修了没有：确认修了", d["pointers"])
+        self.assertIn("- 高：金额比较用了浮点数\n", text)
+
+
 if __name__ == "__main__":
     unittest.main()

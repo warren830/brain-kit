@@ -83,6 +83,13 @@ PLAN_RE = re.compile(r"^(.+)-code-generation-plan\.md$")
 AC_ID_RE = re.compile(r"(?<![A-Za-z0-9-])((?:AC|BR)-[1-9][0-9]{0,3})(?![0-9])")
 ITEM_RE = re.compile(r"^\s*(?:[-*]|[0-9]+[.)])\s+(\S.*)$")
 SEVERITY = (("critical", "严重"), ("high", "高"), ("medium", "中"), ("low", "低"))
+# a review.md finding's state, from its Status column or the start of its Fix cell (Lean's release skill: "finding,
+# severity, file:line, fix"; "Fix what matters ... and note the remaining items"): open is read first ("not fixed")
+REVIEW_OPEN_RE = re.compile(r"(?i)^\W*(?:open|todo|to do|pending|not (?:yet )?fixed|unfixed|won'?t fix|wontfix|deferred|"
+                            r"no)\b|^\W*(?:未修|没修|还没修|待修|未解决|没解决|未改|没改|不修|暂不修|待定)")
+REVIEW_FIXED_RE = re.compile(r"(?i)^\W*(?:fixed|resolved|done|closed|addressed|yes)\b|"
+                             r"^\W*(?:已修|修了|修好|已改|改了|已解决|已处理|已完成)")
+NO_FIX = ("", "-", "—", "–", "n/a", "none", "无", "没有")
 
 
 # ---------- text: from a record into one inert Markdown line ----------
@@ -605,14 +612,28 @@ def _open_items(text) -> list:
     return [x for x in _items(_section(_sections(text or ""), "open items")) if not x.startswith("(")]
 
 
+def _finding_state(cells, fix, status) -> str:
+    """fixed | open | unmarked (a fix written, or no Fix column, and nothing says whether it was made)."""
+    st = cells[status].strip() if status is not None else ""
+    if st:
+        return "open" if REVIEW_OPEN_RE.match(st) else "fixed" if REVIEW_FIXED_RE.match(st) else "unmarked"
+    if fix is None:
+        return "unmarked"
+    f = cells[fix].strip().strip("*`").strip()
+    if f.lower() in NO_FIX or REVIEW_OPEN_RE.match(f):
+        return "open"
+    return "fixed" if REVIEW_FIXED_RE.match(f) else "unmarked"
+
+
 def _review(text):
     if text is None:
         return None
-    counts, top, total = {}, [], 0
+    counts, top, total, states, high = {}, [], 0, {}, {}
     for header, rows in _tables(text):
         s, f = _col(header, "severity", "严重"), _col(header, "finding", "发现", "问题")
         if s is None and f is None:
             continue
+        fix, status = _col(header, "fix", "修"), _col(header, "status", "状态")
         for cells in rows:
             if not any(c.strip() for c in cells):
                 continue
@@ -620,12 +641,17 @@ def _review(text):
             sev = cells[s].strip().lower() if s is not None else ""
             label = next((zh for en, zh in SEVERITY if en in sev or zh in sev), "其他")
             counts[label] = counts.get(label, 0) + 1
-            if label in ("严重", "高") and f is not None and len(top) < LIMIT["findings"]:
-                top.append({"severity": label, "finding": _one(cells[f], 100)})
+            state = _finding_state(cells, fix, status)
+            states[state] = states.get(state, 0) + 1
+            if label in ("严重", "高"):
+                high[state] = high.get(state, 0) + 1
+                if f is not None and len(top) < LIMIT["findings"]:
+                    top.append({"severity": label, "finding": _one(cells[f], 100), "state": state})
         break
     notes = [x.strip() for x in re.sub(r"<!--.*?-->", "", text, flags=re.S).split("\n")
              if x.strip() and not x.lstrip().startswith(("#", "|", "```"))]
-    return {"findings": total, "by_severity": counts, "top": top, "summary": [_one(x, 160) for x in notes[:2]]}
+    return {"findings": total, "by_severity": counts, "by_state": states, "high": high, "top": top,
+            "summary": [_one(x, 160) for x in notes[:2]]}
 
 
 def _decisions(text, bot_users, acs) -> list:
@@ -1037,10 +1063,11 @@ def _pointers(d) -> list:
     lost = [a["id"] for a in d["acceptance"] if any(t["file_exists"] is False for t in a["tests"])]
     if lost:
         out.append("%s 的测试文件不在仓库里：计划的 Tests 表和代码对不上" % _ids(lost))
-    rv = d["review"]
-    high = sum((rv or {}).get("by_severity", {}).get(k, 0) for k in ("严重", "高"))
-    if high:
-        out.append("评审还有 %d 条高严重度发现（review.md）" % high)
+    high = (d["review"] or {}).get("high") or {}
+    if high.get("open"):
+        out.append("评审还有 %d 条高严重度发现没修（review.md）" % high["open"])
+    elif high.get("unmarked"):
+        out.append("评审有 %d 条高严重度发现，review.md 没写修了没有：确认修了" % high["unmarked"])
     if d["brain"]["stale"] or d["brain"]["unknown"]:
         out.append("引用了%s的 Brain 条目 %s：确认不是过时或写错的号" % (
             "已归档" if d["brain"]["stale"] else "Brain 里没有", _ids(d["brain"]["stale"] or d["brain"]["unknown"])))
@@ -1214,12 +1241,16 @@ def render(d) -> str:
     if rv:
         out += ["", "### 评审"]
         if rv["findings"]:
-            out.append("- review.md：%d 条发现（%s）" % (rv["findings"], "、".join(
+            bs = rv["by_state"]
+            done = "，都修了" if bs.get("fixed") == rv["findings"] else "".join(
+                x % bs[k] for k, x in (("fixed", "，修了 %d 条"), ("open", "，没修 %d 条")) if bs.get(k))
+            out.append("- review.md：%d 条发现（%s）%s" % (rv["findings"], "、".join(
                 "%s %d" % (k, rv["by_severity"][k]) for k in ("严重", "高", "中", "低", "其他")
-                if rv["by_severity"].get(k))))
+                if rv["by_severity"].get(k)), done))
         else:
             out.append("- review.md 里没有发现表")
-        out += ["- %s：%s" % (t["severity"], t["finding"]) for t in rv["top"]]
+        out += ["- %s：%s%s" % (t["severity"], t["finding"], {"fixed": "（修了）", "open": "（没修）"}.get(t["state"], ""))
+                for t in rv["top"]]
         out += ["- %s" % s for s in rv["summary"]]
 
     # Brain

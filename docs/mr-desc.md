@@ -24,9 +24,9 @@ brain mr-desc KEY --json       # 结构化数据（给 KiroCrew app 用）
 | 关键决定 | ID、决定、为什么、谁定的（固定词：agent / brain 条目号 / check / P-xxxx V-xxxx / owner）、引用的 Brain 条目；agent 自己定的标出来 | decisions.md |
 | 假设和待确认 | A-n、release.md 的 Open items、park.json 里在等的问题 | requirements.md、release.md、park.json |
 | 审批 | Lean 记下的每次审批（类型、哈希、时间、声称的渠道），还缺哪些 | Lean audit |
-| 评审 | 发现数（按严重度）、高严重度的几条、结论行 | review.md |
+| 评审 | 发现数（按严重度）、修了几条、高严重度的几条、结论行。修没修看 Status 列，没有就看 Fix 列开头：`fixed`、`已修` 等算修了，空的、`not fixed`、`未修` 等算没修，只写了修法的算没写修没修 | review.md |
 | Brain | 用到的条目；过时的、不存在的条目号；等 `brain reflect` 的提案和缺口 | Lean 记录；`brain trace`（usage）；brain-proposal / brain-gap 块 |
-| 怎么审 | 2–4 条具体的先看哪里（risk path、verify 过期、agent 定的边界、假设、没测试的 AC） | 从上面的数据推出来 |
+| 怎么审 | 2–4 条具体的先看哪里（risk path、verify 过期、agent 定的边界、假设、没测试的 AC、没修或没写修没修的高严重度发现） | 从上面的数据推出来 |
 | 花费 | credits | `brain trace`（KiroCrew app 传进来时才有） |
 | 还没有 | 缺的记录，一条一行（"还没跑 verify"） | — |
 
