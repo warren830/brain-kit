@@ -2,6 +2,7 @@
 
 Synthetic worlds with exact records (no Lean install: fast). Each test is the reviewer's repro of one entry of
 delivery-loop/round-1-bugs.md, and fails on 0d52e97."""
+import hashlib
 import io
 import json
 import os
@@ -213,6 +214,39 @@ class ReviewFixesRead(unittest.TestCase):
         d, text = self.describe("改成整数分")         # a fix written; nothing says it was made
         self.assertIn("评审有 1 条高严重度发现，review.md 没写修了没有：确认修了", d["pointers"])
         self.assertIn("- 高：金额比较用了浮点数\n", text)
+
+
+
+class DesignApprovedOnlyLocally(unittest.TestCase):
+    """R1-93: a risk-path change whose DESIGN was approved only in a local Lean chat: the description said 「签名由 CI
+    核对」, but CI's brain-run-check counts only a bridge-signed DESIGN approval and fails the MR."""
+
+    def describe(self, words):
+        isolated(self)
+        design = DOCS + mrdesc.DESIGN_DOC
+        text = "# Application Design: refund\n\n退款服务放在 src/pay/refund.py。\n"
+        sha = hashlib.sha256(text.encode()).hexdigest()
+        events = STARTED + [("2026-11-01T00:30:00.000Z", "APPROVED", dict(
+            {"kind": "DESIGN", "path": design, "sha256": sha, "words": words}, **(
+                {"claimed_channel": words.split("(via ", 1)[1].rstrip(")")} if "(via " in words else {})))]
+        repo, cfg = run_world(self, {design: text, "src/pay/refund.py": "def refund():\n    return 1\n"}, events,
+                              main={"gates/risk-paths": "src/pay/**\n"})
+        d = mrdesc.build(repo, cfg, "PAY-1")
+        return sha[:8], d, mrdesc.render(d)
+
+    def test_a_local_approval_is_not_one_ci_counts(self):
+        h, d, text = self.describe("approve DESIGN 1234abcd")
+        self.assertNotIn("签名由 CI 核对", text)
+        self.assertNotIn("CI 的 brain-run-check 会核对", text)
+        self.assertEqual(d["changes"]["risk"]["design"]["state"], "lean_local")
+        self.assertIn("- 设计批准：Lean 记了 DESIGN %s 的批准，但只是在本地会话里批的；CI 的 brain-run-check 不认它，只认桥签过的 "
+                      "DESIGN 批准，没有就会拦（在 MR 上问：park.json 写 lean_request DESIGN …）。" % h, text)
+        self.assertIn("改到了 risk path src/pay/refund.py：DESIGN %s 只在本地批过，CI 不认（要桥签的批准）" % h, d["pointers"])
+
+    def test_the_bridge_s_approval_is_still_checked_by_ci(self):
+        h, d, text = self.describe("approve DESIGN 1234abcd (via gitlab P-ABCD V-0123456789)")
+        self.assertEqual(d["changes"]["risk"]["design"]["state"], "lean_approved")
+        self.assertIn("改到了 risk path src/pay/refund.py：Lean 记了 DESIGN %s 的批准，签名由 CI 核对" % h, d["pointers"])
 
 
 if __name__ == "__main__":

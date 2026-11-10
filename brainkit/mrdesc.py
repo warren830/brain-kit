@@ -518,9 +518,15 @@ def _doc_state(events, tree, path) -> dict:
     return {"state": "draft", "event": None}
 
 
-def _channel(d) -> str:
+def _claimed(d) -> bool:
+    """Did the approval line claim a channel (`(via gitlab …)`, as the bridge's do)? Without one it was typed in a
+    local Lean chat."""
     c = d.get("claimed_channel")
-    return "经 %s" % _one(c, 80) if isinstance(c, str) and c.strip() else "本地会话"
+    return isinstance(c, str) and bool(c.strip())
+
+
+def _channel(d) -> str:
+    return "经 %s" % _one(d["claimed_channel"], 80) if _claimed(d) else "本地会话"
 
 
 def ideation_in_use(events) -> bool:
@@ -834,6 +840,16 @@ def _design_cover(repo, cfg, rec, key, tree, ch, events, docs, approvals, vouche
                 "short": "没有能覆盖它的设计批准，CI 会拦"}
     st = _doc_state(events, tree, design)
     e = st["event"]
+    if st["state"] in ("approved", "stale") and not _claimed(_d(e)):
+        # approved in a local Lean chat: no bridge voucher comes of it, and CI's brain-run-check counts only those
+        h = str(_covered_sha(_d(e), design) or "")[:8]
+        later = "" if st["state"] == "approved" else "，之后设计又改了"
+        how = ("小需求在 MR 上拿不到桥签的 DESIGN 批准：要改这些路径就不拆，或者让大需求自己改" if rec.get("parent") else
+               "在 MR 上问：park.json 写 lean_request DESIGN …")
+        return {"state": "lean_local", "design": h,
+                "text": "Lean 记了 DESIGN %s 的批准，但只是在本地会话里批的%s；CI 的 brain-run-check 不认它，只认桥签过的 "
+                        "DESIGN 批准，没有就会拦（%s）" % (h, later, how),
+                "short": "DESIGN %s 只在本地批过%s，CI 不认（要桥签的批准）" % (h, later)}
     if st["state"] in ("approved", "stale"):
         return {"state": "lean_" + st["state"], "design": str(_covered_sha(_d(e), design) or "")[:8],
                 "text": "Lean 记了 DESIGN %s 的批准（%s）%s；签名本机没核对（CI 的 brain-run-check 会核对）" % (

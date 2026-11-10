@@ -20,7 +20,7 @@ brain mr-desc KEY --json       # 结构化数据（给 KiroCrew app 用）
 | 一句话 | Goal 的第一句、Size、run 在哪（Lean 阶段、本地还是运行机、在等什么） | requirements.md；Lean audit 的阶段事件；run.json 的 `handoff`；park.json；没答的审批请求 |
 | 做了什么 / 没做什么 | Goal、Not doing、每个单元的计划做完几步 | requirements.md；代码生成计划的勾选框 |
 | 验收标准和证据 | AC 表：要求、测试、结果（通过/没过 · 日期 · 代码指纹；代码在 verify 之后又改了就写出来） | requirements.md 的 AC 表；计划的 Tests 表；Lean audit 里最近一次 VERIFY；Lean 自己算的当前代码指纹 |
-| 改了什么 | 和默认分支分叉点的 diff，按顶层目录计数；代码文件；改到的 risk path，以及有没有设计批准覆盖 | `git diff --no-renames -z --numstat`（不含 MR.md 本身）；main 上的 `gates/risk-paths`；`ci.check_route`（有签名凭证时），否则 Lean 记下的 DESIGN 批准 |
+| 改了什么 | 和默认分支分叉点的 diff，按顶层目录计数；代码文件；改到的 risk path，以及有没有设计批准覆盖 | `git diff --no-renames -z --numstat`（不含 MR.md 本身）；main 上的 `gates/risk-paths`；`ci.check_route`（有签名凭证时），否则 Lean 记下的 DESIGN 批准（只在本地会话批的，写明 CI 不认：CI 只认桥签过的） |
 | 关键决定 | ID、决定、为什么、谁定的（固定词：agent / brain 条目号 / check / P-xxxx V-xxxx / owner）、引用的 Brain 条目；agent 自己定的标出来 | decisions.md |
 | 假设和待确认 | A-n、release.md 的 Open items、park.json 里在等的问题 | requirements.md、release.md、park.json |
 | 审批 | Lean 记下的每次审批（类型、哈希、时间、声称的渠道），还缺哪些 | Lean audit |
