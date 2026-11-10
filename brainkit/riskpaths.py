@@ -5,7 +5,8 @@ meets() for a run's expected path (a file, a folder or a glob that names everyth
 One pattern per line (the kit cuts a line at '#'):
   src/pay      the file or folder src/pay and everything below it. A '/' at the start or in the middle anchors a
                pattern at the top of the repository: /src/pay is the same.
-  src/pay/     a trailing '/' means folders only: everything below the folder src/pay.
+  src/pay/     a trailing '/' means folders only: everything below the folder src/pay, and a submodule at src/pay
+               (git reads a submodule as a folder).
   *.sql, pay   no '/' (but a trailing one): at any depth (db/migrations/001.sql; the folder src/pay).
   src/**/k.*   '**' as a whole name: '**/' at the start is any folder, '/**/' zero or more folders, '/**' at the end
                everything inside. '*', '?' and [a-z] / [!a-z] stay inside one name.
@@ -23,17 +24,22 @@ _ANY = re.compile(r"[^/]+")     # an item: one name, whatever it is
 _CACHE = {}
 
 
-class Pattern:
-    """A parsed risk-path pattern. `items` are the paths it covers name by name: STAR, or the regex of one name."""
+def _regex(items):
+    return re.compile("".join("(?:[^/]+/)*" if x is STAR else x.pattern + "/" for x in items))
 
-    def __init__(self, text, items):
+
+class Pattern:
+    """A parsed risk-path pattern. `items` are the files it covers name by name: STAR, or the regex of one name;
+    `folder_items` the folders it covers."""
+
+    def __init__(self, text, items, folder_items):
         self.text = text
         self.items = items
-        self.rx = re.compile("".join("(?:[^/]+/)*" if x is STAR else x.pattern + "/" for x in items))
+        self.rx, self.folder_rx = _regex(items), _regex(folder_items)
 
-    def matches(self, path) -> bool:
-        """Does it cover `path` (a file as git names it)?"""
-        return self.rx.fullmatch(str(path) + "/") is not None
+    def matches(self, path, folder=False) -> bool:
+        """Does it cover `path` (a file as git names it; folder: a folder, such as a submodule's gitlink)?"""
+        return (self.folder_rx if folder else self.rx).fullmatch(str(path) + "/") is not None
 
 
 def _bad(text, why):
@@ -115,8 +121,9 @@ def parse(text) -> Pattern:
     items = _squash(items)
     if names[-1] == "**":                                         # 'x/**': everything inside x, not x itself
         items[-1:] = [_ANY, STAR]
-    items += [_ANY, STAR] if folder else [STAR]                   # a folder it matches covers all below it
-    p = Pattern(text, _squash(items))
+    folder_items = _squash(items + [STAR])                        # a folder it matches covers all below it
+    file_items = _squash(items + [_ANY, STAR]) if folder else folder_items    # x/: a file x is not the folder x
+    p = Pattern(text, file_items, folder_items)
     if len(_CACHE) > 4096:
         _CACHE.clear()
     _CACHE[text] = p
@@ -132,9 +139,10 @@ def problem(text) -> str:
     return ""
 
 
-def matches(path, pattern) -> bool:
-    """Is the file `path` (as git names it) under the risk-path `pattern`? BrainError for a pattern not supported."""
-    return parse(pattern).matches(path)
+def matches(path, pattern, folder=False) -> bool:
+    """Is the file `path` (as git names it) under the risk-path `pattern`? folder=True: `path` is a folder to git (a
+    submodule's gitlink), which src/pay/ covers too. BrainError for a pattern not supported."""
+    return parse(pattern).matches(path, folder)
 
 
 def _meet(names, items, below) -> bool:

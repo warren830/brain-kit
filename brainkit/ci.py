@@ -215,10 +215,11 @@ class Target:
         return cfg
 
 
-def glob_match(path, pattern) -> bool:
+def glob_match(path, pattern, folder=False) -> bool:
     """Is the file `path` under the gates/risk-paths `pattern`? The .gitignore rules (riskpaths): src/pay, /src/pay/,
-    *.sql, src/**/x. BrainError for a pattern those rules do not support."""
-    return riskpaths.matches(path, pattern)
+    *.sql, src/**/x. folder=True: `path` is a submodule, a folder to git. BrainError for a pattern those rules do not
+    support."""
+    return riskpaths.matches(path, pattern, folder)
 
 
 def lean_events(repo, intent):
@@ -251,6 +252,16 @@ def changed_paths(repo, *revs, paths=()) -> list:
     if p.returncode != 0:
         raise BrainError("git diff %s failed: %s" % (" ".join(revs), p.stderr.decode("utf-8", "replace").strip()))
     return [x for x in p.stdout.decode("utf-8", "surrogateescape").split("\0") if x]
+
+
+def gitlinks(repo, *revs) -> set:
+    """The paths `git diff <revs>` changes that are a submodule (a gitlink, mode 160000) on either side."""
+    p = subprocess.run(["git", "-C", repo, "diff", "--no-renames", "--no-ext-diff", "-z", "--raw"] + list(revs),
+                       capture_output=True)
+    if p.returncode != 0:
+        raise BrainError("git diff %s failed: %s" % (" ".join(revs), p.stderr.decode("utf-8", "replace").strip()))
+    out = p.stdout.decode("utf-8", "surrogateescape").split("\0")
+    return {path for meta, path in zip(out[::2], out[1::2]) if "160000" in meta[1:].split()[:2]}
 
 
 def _fold(path) -> str:
@@ -359,8 +370,8 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
     bad = ["%s: %s: brain-ci fails every run MR until it is fixed" % (cfg["risk_paths_file"], why)
            for why in (riskpaths.problem(x) for x in pats) if why]
     pats = [x for x in pats if not riskpaths.problem(x)]
-    changed = changed_paths(repo, base, "HEAD")
-    risky = sorted({f for f in changed if any(glob_match(f, x) for x in pats)})
+    changed, links = changed_paths(repo, base, "HEAD"), gitlinks(repo, base, "HEAD")
+    risky = sorted({f for f in changed if any(glob_match(f, x, f in links) for x in pats)})
     if not risky:
         return bad
     shown = ", ".join(risky[:5])
