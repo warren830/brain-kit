@@ -160,9 +160,13 @@ class GitLab(Rest):
     def mr(self, project, iid):
         return self.call("GET", "/projects/%s/merge_requests/%d" % (q(project), int(iid)))
 
+    def mrs_for_branch(self, project, branch):
+        """The open MRs from `branch`, whatever branch they go into."""
+        return [m for m in self.call("GET", "/projects/%s/merge_requests" % q(project),
+                                     {"state": "opened", "source_branch": branch}) or [] if isinstance(m, dict)]
+
     def mr_for_branch(self, project, branch):
-        rows = self.call("GET", "/projects/%s/merge_requests" % q(project),
-                         {"state": "opened", "source_branch": branch}) or []
+        rows = self.mrs_for_branch(project, branch)
         return rows[0] if rows else None
 
     def create_mr(self, project, source, target, title, labels, description=None):

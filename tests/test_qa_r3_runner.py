@@ -20,7 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from brainkit import ci, cli, pre_receive, sign  # noqa: E402
+from brainkit import ci, cli, lean, pre_receive, sign  # noqa: E402
 from brainkit.common import load_json, write_json  # noqa: E402
 from tests.helpers import LEAN_SRC, ROOT, commit_file, git_repo, keypair, sh, tmpdir  # noqa: E402
 from tests.test_cli import brain, fake_tools  # noqa: E402
@@ -308,7 +308,8 @@ class AdapterVersionIsChecked(unittest.TestCase):
         with open(state) as f:
             text = f.read()
         with open(state, "w") as f:
-            f.write(text.replace("Status: Inception: starting", "Status: Construction app: step 1 of 3 done"))
+            f.write(text.replace("Status: Inception: starting", "Status: Construction app: step 1 of 3 done")
+                    .replace(lean.TEMPLATE_NEXT[0], "Write step 2 of 3"))
         sh("git", "-C", repo, "commit", "-q", "-am", "work and an old adapter")
         rc, out = brain(repo, "handoff", "--no-push")
         self.assertEqual(rc, 2)
@@ -576,7 +577,8 @@ class HandoffWarnsAboutRiskPaths(unittest.TestCase):
         with open(self.state) as f:
             text = f.read()
         with open(self.state, "w") as f:
-            f.write(text.replace("Status: Inception: starting", "Status: Construction app: step 1 of 3 done"))
+            f.write(text.replace("Status: Inception: starting", "Status: Construction app: step 1 of 3 done")
+                    .replace(lean.TEMPLATE_NEXT[0], "Write step 2 of 3"))
 
     def handoff(self):
         sh("git", "-C", self.repo, "commit", "-q", "-am", "work")

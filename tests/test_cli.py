@@ -133,7 +133,8 @@ class LocalFlow(unittest.TestCase):
         state = lean.state_path(self.repo, rec["intent"])
         with open(state) as f:
             text = f.read()
-        text = text.replace(lean.TEMPLATE_STATUS, "Status: Construction app: step 1 of 3 done")
+        text = text.replace(lean.TEMPLATE_STATUS, "Status: Construction app: step 1 of 3 done").replace(
+            lean.TEMPLATE_NEXT[0], "Write step 2 of 3")
         with open(state, "w") as f:
             f.write(text)
         rc, out = brain(self.repo, "handoff", "--no-push")
@@ -236,13 +237,14 @@ class LocalFlow(unittest.TestCase):
         with open(state) as f:
             text = f.read()
         with open(state, "w") as f:
-            f.write(text.replace(lean.TEMPLATE_STATUS, "Status: Inception: requirements drafted"))
+            f.write(text.replace(lean.TEMPLATE_STATUS, "Status: Inception: requirements drafted").replace(
+                lean.TEMPLATE_NEXT[0], "Ask for the REQUIREMENTS approval"))
         sh("git", "-C", self.repo, "commit", "-q", "-am", "work")
         # no origin for the project repo: hand-over stays local, but materials are pushed to brain-intake
         sh("git", "-C", self.repo, "remote", "add", "origin", os.path.join(d, "nowhere.git"))
         sh("git", "init", "-q", "--bare", "-b", "main", os.path.join(d, "nowhere.git"))
         rc, out = brain(self.repo, "handoff", "--no-label", "--store", store)
-        self.assertEqual(rc, 0, out)
+        self.assertEqual(rc, 1, out)            # pushed, not labelled: nothing handed over (R1-26)
         files = sh("git", "-C", remote, "ls-tree", "-r", "--name-only", "main").stdout
         self.assertIn("packages/PKG-PAY-1-1/manifest.json", files)
 

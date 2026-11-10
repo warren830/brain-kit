@@ -31,8 +31,25 @@ TEAM_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")                     # a team as `l
 CLONE_RE = re.compile(r"^[0-9a-f]{6}$")
 
 
+MAX_PATHS = 50
+
+
 def path(runs_dir: str, key: str) -> str:
     return os.path.join(runs_dir, key, "run.json")
+
+
+def path_problem(p) -> str:
+    """Why `p` cannot be one of expected_paths (the rule validate applies), or ''."""
+    if isinstance(p, str) and PATH_RE.match(p) and ".." not in p:
+        return ""
+    return ("%r is not a path run.json can hold: ASCII letters, digits, _ . / * - and spaces only (no @ ( ) [ ] + or "
+            "non-ASCII characters; write * in their place, e.g. packages/*acme/pay), no '..', at most 200 characters"
+            % (p,))
+
+
+def package_key(pkg) -> str:
+    """The requirement key a material package id PKG-<KEY>-<n> is for ('' when it is not one)."""
+    return pkg[len("PKG-"):].rsplit("-", 1)[0] if PKG_RE.match(str(pkg or "")) else ""
 
 
 def new(key, owner, branch, intent, brain_commit, kit_version, expected_paths, created_at, claim_checked,
@@ -73,8 +90,7 @@ def validate(rec, branch=None, prefix="ai") -> list:
     if rec.get("origin") not in ORIGINS:
         p.append("origin must be one of %s" % (ORIGINS,))
     eps = rec.get("expected_paths", [])
-    if not isinstance(eps, list) or len(eps) > 50 or not all(isinstance(x, str) and PATH_RE.match(x) and ".." not in x
-                                                           for x in eps):
+    if not isinstance(eps, list) or len(eps) > MAX_PATHS or any(path_problem(x) for x in eps):
         p.append("expected_paths must be a list of up to 50 repo paths")
     mats = rec.get("materials", [])
     if not isinstance(mats, list):

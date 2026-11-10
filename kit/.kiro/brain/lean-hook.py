@@ -21,8 +21,9 @@ as in the reference commit: on the team runner the hand-over commit (the sha in 
 runnerd prepared this workspace from, <spool_dir>/requests/<RUN-ID>.json, verified with allowed_signers), in a local
 session HEAD. A file there changed, added or deleted, a symlink or a hard link: PreToolUse is refused (exit 2), the
 other events do not reach Lean (approvals in that message are not recorded), and the session is told that a person
-has to restore the files. The same when this cannot be checked (fail closed). Whatever made the change (a write tool,
-any shell command, git), the next call sees it. A file-write tool call whose target resolves under KIT_PATHS is
+has to restore the files. The same when this cannot be checked (fail closed). Whatever made the change (a write
+tool, any shell command, git), the next call sees it. An OS's or an editor's leftover that git ignores (.DS_Store,
+a vim swap file: JUNK_NAMES) is no change. A file-write tool call whose target resolves under KIT_PATHS is
 refused up front as well; where Lean refuses such writes itself (its .kiro/hooks/, .kiro/aidlc-lean/,
 .kiro/agents/lean-*) the call goes to Lean, which records it.
 
@@ -43,6 +44,7 @@ approval or rejection read from it, the turn not counted). Text the bridge forwa
 that string, so it is escaped (HOST_MARK_SAFE) in the prompt Lean gets, and alike in the prompts a delegation tool
 call hands to subagents: Lean matches a subagent's prompt to its dispatch by hash.
 """
+import fnmatch
 import hashlib
 import json
 import os
@@ -86,6 +88,11 @@ KEY_RE = re.compile(r"^[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}$")
 BRANCH_RE = re.compile(r"^[a-z]+/[a-z0-9][a-z0-9._-]{0,63}/([A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6})"
                        r"(?:-[a-z0-9][a-z0-9-]{0,39})?$")   # brainkit.common.BRANCH_RE
 PART_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$")
+# Names of files an OS or an editor leaves next to the files it shows or edits (Finder's .DS_Store, vim's swap
+# files, backups). Added under KIT_PATHS and ignored by git, such a file is no change to the kit: no agent spec, hook,
+# script or module has such a name. Any other added file counts, git-ignored or not: Kiro and Python read the kit
+# folders whatever git ignores.
+JUNK_NAMES = (".DS_Store", "Thumbs.db", "desktop.ini", ".*.sw[a-p]", "*~", "#*#")
 # environment that would point git at another repository or add configuration
 GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
                 "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_REPLACE_REF_BASE", "GIT_GRAFT_FILE",
@@ -96,15 +103,16 @@ class Refused(Exception):
     """The kit's own files cannot be checked: the session may not go on."""
 
 
-def git(cwd, *args) -> str:
-    """stdout of a read-only git command (replace refs off: a commit id names that commit); Refused when it fails."""
+def git(cwd, *args, ok=(0,), stdin=None) -> str:
+    """stdout of a read-only git command (replace refs off: a commit id names that commit) that reads `stdin` (bytes,
+    if given); Refused when it fails (exits with a status not in `ok`)."""
     env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_DROP and not k.startswith("GIT_CONFIG_")}
     env.update(GIT_NO_REPLACE_OBJECTS="1", GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
     try:
-        p = subprocess.run(["git", "-C", cwd] + list(args), capture_output=True, timeout=60, env=env)
+        p = subprocess.run(["git", "-C", cwd] + list(args), input=stdin, capture_output=True, timeout=60, env=env)
     except (OSError, subprocess.SubprocessError) as e:
         raise Refused("git %s: %s" % (args[0], e))
-    if p.returncode != 0:
+    if p.returncode not in ok:
         raise Refused("git %s failed: %s" % (args[0], p.stderr.decode("utf-8", "replace").strip()[:200]
                                              or "exit %d" % p.returncode))
     return p.stdout.decode("utf-8", "surrogateescape")
@@ -309,6 +317,8 @@ def kit_differences(root, ref, contents=None) -> list:
             out[path] = "added"
         elif w[1] == "blob" and w[0] in REGULAR and w[2] not in _blob_ids(data, algo):
             out[path] = "changed"
+    for path in _ignored_junk(root, [p for p, how in out.items() if how == "added"]):
+        del out[path]
     for path, (mode, kind, _) in want.items():
         if path in out or any(path.startswith(o + "/") for o in odd):
             continue
@@ -317,6 +327,16 @@ def kit_differences(root, ref, contents=None) -> list:
         elif path not in have:
             out[path] = "deleted"
     return sorted(out.items())
+
+
+def _ignored_junk(root, added) -> list:
+    """Those of the added regular files that git ignores and that are named like an OS's or an editor's leftovers
+    (JUNK_NAMES): no change to the kit."""
+    junk = [p for p in added if any(fnmatch.fnmatchcase(p.rsplit("/", 1)[-1], j) for j in JUNK_NAMES)]
+    if not junk:
+        return []
+    names = "".join(p + "\0" for p in junk).encode("utf-8", "surrogateescape")
+    return [p for p in git(root, "check-ignore", "-z", "--stdin", ok=(0, 1), stdin=names).split("\0") if p in junk]
 
 
 def _case_insensitive(root) -> bool:

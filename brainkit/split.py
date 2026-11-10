@@ -41,6 +41,18 @@ UNITS_DOC = "inception/application-design/unit-of-work.md"
 STORIES_DOC = "inception/user-stories/stories.md"
 STAGE_EVENTS = ("STAGE_STARTED", "STAGE_COMPLETED", "STAGE_SKIPPED")
 ID_RE = re.compile(r"(?<![A-Za-z0-9-])((?:US|AC|BR)-[1-9][0-9]{0,3})(?![0-9])")
+# a range of ids in Stories / ACs: AC-1..AC-3, AC-1..3, AC-1~3, AC-1–3; spaced dashes and words (AC-1 – AC-3,
+# AC-1 to AC-3, AC-1 到 AC-3) only with both ends named ("US-1 – 3 screens" is not a range)
+RANGE_RE = re.compile(r"(?<![A-Za-z0-9-])(US|AC|BR)-([1-9][0-9]{0,3})"
+                      r"(?:\s*(?:\.{2,3}|…|~|～)\s*(?:(US|AC|BR)-)?|[–—](?:(US|AC|BR)-)?"
+                      r"|\s*(?:[–—]|\bto\b|到|至)\s*(US|AC|BR)-)"
+                      r"([1-9][0-9]{0,3})(?![0-9])")
+# a Stories / ACs column, by its whole name ("Data store" is not one): stories, ACs, or both (Stories / ACs)
+_S = r"(?:user\s+)?stor(?:y|ies)(?:\s+ids?)?|用户故事|故事"
+_A = r"acs?(?:\s+ids?)?|acceptance\s+criteria|验收标准|验收条件"
+_J = r"\s*(?:/|&|\+|,|\band\b|和|与|及)\s*"
+STORIES_COL_RE = re.compile(r"^(?:(?:{s})(?:{j}(?:{a}))?|(?:{a})(?:{j}(?:{s}))?)$".format(s=_S, a=_A, j=_J))
+LOOSE_RANGE_RE = re.compile(r"(?<![A-Za-z0-9-])(?:US|AC|BR)-[0-9]+(?:\s*(?:\.{2,3}|…|~|～)|\s*[–—]\s*[0-9])")
 CLONE_RE = re.compile(r"^[0-9a-f]{6}$")
 FIELDS = ("title", "body", "acs", "refs", "expected_paths", "depends_on", "contracts")
 BEGIN_MARK = "<!-- lean:begin progress -->"          # aidlc_lean.py BEGIN_MARK / END_MARK
@@ -103,16 +115,47 @@ def _items(cell) -> list:
     return out
 
 
-def parse_units(text) -> tuple:
+def _ids(cell, unit, warnings) -> list:
+    """The US-/AC-/BR- ids in a Stories / ACs cell, in order, ranges (AC-1..AC-3) expanded. A range that cannot be
+    expanded keeps its two ends and adds a warning: an id is never dropped silently."""
+    cell, out, pos = cell or "", [], 0
+
+    def plain(part):
+        out.extend(ID_RE.findall(part))
+        for m in LOOSE_RANGE_RE.finditer(part):
+            warnings.append("unit %s: %r in Stories / ACs reads like a range brain-kit cannot expand: write "
+                            "AC-n..AC-m or the ids it means" % (unit, m.group(0).strip()))
+
+    for m in RANGE_RE.finditer(cell):
+        plain(cell[pos:m.start()])
+        pos = m.end()
+        kind, a, b = m.group(1), int(m.group(2)), int(m.group(6))
+        kind2 = m.group(3) or m.group(4) or m.group(5) or kind
+        why = ("it mixes %s and %s" % (kind, kind2) if kind2 != kind else "it runs backwards" if b < a else
+               "it has more than %d ids" % intents.LIMITS["acs"] if b - a >= intents.LIMITS["acs"] else "")
+        if why:
+            warnings.append("unit %s: %r in Stories / ACs is not expanded (%s): only %s-%d and %s-%d are taken; "
+                            "write the ids it means" % (unit, m.group(0), why, kind, a, kind2, b))
+            out += ["%s-%d" % (kind, a), "%s-%d" % (kind2, b)]
+        else:
+            out += ["%s-%d" % (kind, n) for n in range(a, b + 1)]
+    plain(cell[pos:])
+    return out
+
+
+def parse_units(text, warnings=None) -> tuple:
     """(units, problems) of unit-of-work.md. A unit: {name, owner, paths, depends_on (unit names), contracts,
-    stories (US-/AC-/BR- ids), status}. Names and paths as Lean's Project.units() reads them (first table, first
-    column, the first header with "path" / "owner" or "team"); the other columns as the template names them."""
+    stories (US-/AC-/BR- ids, ranges expanded), status}. Names and paths as Lean's Project.units() reads them (first
+    table, first column, the first header with "path" / "owner" or "team"); the other columns as the template names
+    them, Stories / ACs by the whole name (every such column). `warnings` (a list) gets what is read but not as
+    written: a range that cannot be expanded, no Stories / ACs column."""
+    warnings = [] if warnings is None else warnings
     header, rows = _lean_first_table(text)
     pcol = _col(header, lambda h: "path" in h)
     ocol = _col(header, lambda h: "owner" in h or "team" in h)
     dcol = _col(header, lambda h: "depend" in h)
     ccol = _col(header, lambda h: "contract" in h)
-    scol = _col(header, lambda h: "stor" in h or re.search(r"\bacs?\b", h) is not None)
+    scols = [i for i, h in enumerate(header) if STORIES_COL_RE.match(" ".join(re.sub(r"[`*]", " ", h.lower()).split()))]
     stcol = _col(header, lambda h: "status" in h)
     units, problems, seen = [], [], set()
     for cells in rows:
@@ -132,10 +175,14 @@ def parse_units(text) -> tuple:
                       "paths": _lean_paths(_cell(cells, pcol)) if pcol is not None else [],
                       "depends_on": [d for d in deps if d and d.lower() not in ("-", "—", "none", "n/a")],
                       "contracts": _items(_cell(cells, ccol)),
-                      "stories": list(dict.fromkeys(ID_RE.findall(_cell(cells, scol)))),
+                      "stories": list(dict.fromkeys(_ids("; ".join(_cell(cells, i) for i in scols), name,
+                                                          warnings))),
                       "status": _cell(cells, stcol)})
     if pcol is None and units:
         problems.append("unit-of-work.md has no Paths column (Lean's gates read it)")
+    if not scols and units:
+        warnings.append("unit-of-work.md has no Stories / ACs column (its columns: %s): the children get no stories "
+                        "or ACs from it; name the column Stories / ACs" % ", ".join(h for h in header if h))
     names = {u["name"] for u in units}
     for u in units:
         if not u["paths"]:
@@ -273,7 +320,7 @@ def approved_split(tree, intent) -> dict:
             probs.append("application-design.md is %s: it needs a current DESIGN (or INCEPTION) approval"
                          % des["state"])
     raw = tree.raw(paths["units"])
-    units, units_sha = [], None
+    units, units_sha, read_warnings = [], None, []
     if raw is None:
         probs.append("%s is missing: run Units Generation (`lean stage start units`)" % UNITS_DOC)
     else:
@@ -310,14 +357,14 @@ def approved_split(tree, intent) -> dict:
                              "application-design.md only). Ask for DESIGN again: `lean request DESIGN`; approving the "
                              "unchanged design again is fine" % (units_sha[:8], str(d_ev.get("ts") or "")[:10]))
         text = raw.decode("utf-8", "replace")
-        units, uprobs = parse_units(text)
+        units, uprobs = parse_units(text, read_warnings)
         probs += uprobs
         if not uprobs and len(units) < 2:
             probs.append("unit-of-work.md lists %d unit: there is nothing to split (build it in this run)"
                          % len(units))
     if probs:
         raise BrainError("no approved unit split in %s:\n  - %s" % (docs, "\n  - ".join(probs)))
-    warnings = []
+    warnings = list(read_warnings)
     for i, a in enumerate(units):
         for b in units[i + 1:]:
             both = sorted({p for p in a["paths"] for q in b["paths"] if paths_overlap(p, q)})
@@ -837,8 +884,13 @@ def start_child(repo, cfg, a, doc, me, version) -> int:
         waiting.remove(on)
     if waiting:
         who = ["%s (unit %s, %s)" % (k, (by_key.get(k) or {}).get("unit"), _who(by_key.get(k))) for k in waiting]
-        hint = (" Wait for it, or build on its branch: `brain start --key %s --on %s`." % (key, waiting[0])
-                if len(waiting) == 1 else " Wait for them to merge.")
+        if on:                                    # --on builds on one branch: the others have to merge first
+            hint = " --on builds on one dependency's branch (%s's); wait for %s to merge." % (
+                on, "it" if len(waiting) == 1 else "them")
+        elif len(waiting) == 1:
+            hint = " Wait for it, or build on its branch: `brain start --key %s --on %s`." % (key, waiting[0])
+        else:
+            hint = " Wait for them to merge."
         raise BrainError("%s depends on %s, which %s not merged into %s yet.%s" % (
             key, ", ".join(who), "has" if len(waiting) == 1 else "have", sp["branch"], hint))
     rp = runrec.path(cfg["runs_dir"], key).replace(os.sep, "/")
@@ -854,7 +906,14 @@ def start_child(repo, cfg, a, doc, me, version) -> int:
         raise BrainError("slug must be lowercase letters, digits and '-' (max 40)")
     br = branch_name(cfg["branch_prefix"], me, key, slug)
     wt = os.path.abspath(os.path.expanduser(a.worktree)) if getattr(a, "worktree", None) else worktree_path(repo, key)
-    if os.path.exists(wt) and os.listdir(wt):
+    if os.path.exists(wt) and not os.path.isdir(wt):
+        raise BrainError("%s is a file, not a folder: pass --worktree a folder that does not exist yet (or is empty)"
+                         % wt)
+    try:
+        used = os.path.exists(wt) and bool(os.listdir(wt))
+    except OSError as e:
+        raise BrainError("cannot read the worktree folder %s: %s" % (wt, e))
+    if used:
         raise BrainError("%s exists and is not empty: remove it (`git worktree remove %s`) or pass --worktree" % (
             wt, wt))
     fields, warns = child_fields(pkey, pdoc.get("title"), info, units[unit], keys, _parent_rec(sp), sp["commit"])
@@ -972,16 +1031,30 @@ def _parent_rec(sp) -> dict:
 # ---------- brain sync: merge the parent's branch (or any ref) in, Lean's generated files resolved ----------
 
 def _blocks(text) -> list:
-    """[(heading line or '', text)] of Session notes split at ### headings, in order."""
+    """[(heading line or '', [lines])] of Session notes split at ### headings, in order. The newline that ends the
+    text is not a line of the last subsection: the same subsection reads the same at the end and in the middle."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
     out, head, buf = [], "", []
-    for line in text.split("\n"):
+    for line in lines:
         if line.startswith("### "):
-            out.append((head, "\n".join(buf)))
+            out.append((head, buf))
             head, buf = line.strip(), [line]
         else:
             buf.append(line)
-    out.append((head, "\n".join(buf)))
+    out.append((head, buf))
     return out
+
+
+def _bare(lines):
+    """A subsection's lines without its trailing blank lines (what is compared), or None."""
+    if lines is None:
+        return None
+    n = len(lines)
+    while n and not lines[n - 1].strip():
+        n -= 1
+    return tuple(lines[:n])
 
 
 def _keyed(blocks) -> dict:
@@ -1001,18 +1074,20 @@ def merge_notes(base, ours, theirs) -> tuple:
     out, conflicts = [], []
     for k in order:
         bo, oo, to = b.get(k), o.get(k), t.get(k)
-        if oo == to:
-            r = oo
-        elif oo == bo:
+        nb, no, nt = _bare(bo), _bare(oo), _bare(to)
+        if no == nt:
+            r = oo if oo is not None else to
+        elif no == nb:
             r = to
-        elif to == bo:
+        elif nt == nb:
             r = oo
         else:
             conflicts.append(k[0] or "(top)")
-            r = "<<<<<<< ours\n%s\n=======\n%s\n>>>>>>> theirs" % (oo or "", to or "")
+            r = ["<<<<<<< ours"] + list(oo or []) + ["======="] + list(to or []) + [">>>>>>> theirs"]
         if r is not None:
-            out.append(r)
-    return "\n".join(out), conflicts
+            out += r
+    end = "\n" if out and (ours.endswith("\n") or theirs.endswith("\n")) else ""
+    return "\n".join(out) + end, conflicts
 
 
 def _state_parts(text):
@@ -1050,15 +1125,43 @@ def _stage(repo, n, path):
     return p.stdout if p.returncode == 0 else None
 
 
+UNMERGED = ("DD", "AU", "UD", "UA", "DU", "AA", "UU")      # git status --porcelain: a path git has not merged
+MARKER_RE = re.compile(r"(?m)^(?:<{7}|>{7})(?: |$)")
+
+
+def _unfinished_merge(repo) -> tuple:
+    """(MERGE_HEAD is set, [paths git still has unmerged]) here."""
+    rows = git(repo, "status", "--porcelain", "--untracked-files=no").stdout.split("\n")
+    merging = git(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0
+    return merging, [l[3:] for l in rows if l[:2] in UNMERGED]
+
+
+def _marked(repo, path) -> bool:
+    """The file has conflict markers (<<<<<<< or >>>>>>> at a line start)."""
+    try:
+        with open(os.path.join(repo, path), encoding="utf-8", errors="replace") as f:
+            return MARKER_RE.search(f.read()) is not None
+    except OSError:
+        return False
+
+
 def sync(repo, cfg, src=None, me=None) -> int:
     """Merge `src` (default: this child run's target branch, fetched) into the run branch checked out here. A
     conflict in Lean's own files is resolved: aidlc-state.md (merge_state, then `lean status` writes the region
     again), build-and-test-summary.md (ours: the next `lean verify` writes it). Anything else, a Lean ledger file
-    included, is left for the person. Exit 0 when merged, 1 when conflicts are left."""
+    included, is left for the person. Exit 0 when merged, 1 when conflicts are left. A merge left unfinished here
+    (MERGE_HEAD, unmerged paths) is refused, and a file with conflict markers is never committed for you."""
     from .cli import _current
     br, b, rp, rec = _current(repo, cfg)
     if me and rec["owner"] != me:
         raise BrainError("this run belongs to %s" % rec["owner"])
+    merging, unmerged = _unfinished_merge(repo)
+    if merging or unmerged:
+        # what an earlier sync left: committing it now would commit the conflict markers
+        raise BrainError("the last merge here is not finished (%s): resolve the conflicts by hand, `git add` the files "
+                         "and `git commit` (or undo it: `git merge --abort`), then `brain sync` again. Nothing was "
+                         "committed" % "; ".join((["MERGE_HEAD is set"] if merging else []) +
+                                                 (["unmerged: " + ", ".join(unmerged[:10])] if unmerged else [])))
     if src is None:
         target = rec.get("target_branch")
         if not target:
@@ -1081,6 +1184,10 @@ def sync(repo, cfg, src=None, me=None) -> int:
         # Lean writes its ledger and aidlc-state.md all the time (hooks, `lean status`): those are committed for you
         if not all(x == state_doc or x.startswith(lean.DOCS + "/audit/") for x in dirty):
             raise BrainError("commit or stash your changes first:\n  " + "\n  ".join(dirty[:10]))
+        marked = [x for x in dirty if _marked(repo, x)]
+        if marked:
+            raise BrainError("%s %s conflict markers (<<<<<<< / >>>>>>>): resolve them by hand first. Nothing was "
+                             "committed" % (", ".join(marked), "has" if len(marked) == 1 else "have"))
         git(repo, "add", "--", *dirty)
         git(repo, "commit", "-q", "-m", "%s: Lean records before merging %s" % (b["key"], src))
     p = git(repo, "merge", "--no-edit", src, check=False)
@@ -1125,6 +1232,13 @@ def sync(repo, cfg, src=None, me=None) -> int:
         print("Resolve them, `git add` them, then `git commit`; `lean status` writes Lean's progress again.")
         return 1
     _refresh_state(repo, rec["intent"], state_doc, None)
+    marked = [x for x in conflicted if _marked(repo, x)]
+    if marked:                                    # markers that came with a side: never committed for you
+        print("Merged %s with conflicts left for you:" % src)
+        for x in marked:
+            print("  %s: has conflict markers (<<<<<<< / >>>>>>>)" % x)
+        print("Resolve them, `git add` them, then `git commit`; `lean status` writes Lean's progress again.")
+        return 1
     git(repo, "commit", "-q", "--no-edit")
     print("Merged %s into %s; Lean's generated files were resolved (aidlc-state.md written again from the merged "
           "ledger)." % (src, br))

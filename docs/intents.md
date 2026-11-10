@@ -90,7 +90,7 @@ brain claim --release PAY-8     # 放回去，又是待认领
 - 待认领：`"owner": null`，`"filed_by"` 是登记的人。`brain intent list` 里 owner 一栏是 `-`。
 - `brain claim KEY`：主人从"没有"变成你。两个人同时认领，先推上去的算；后到的看到 `PAY-8 was just claimed by alice: their claim reached the server first`，再试一次看到 `PAY-8 is claimed by alice`。
 - `brain start <slug> --key KEY` 碰到待认领的，顺便认领。
-- `brain claim --release KEY`：只有主人能放。你已经有这个需求的 run 分支（本地或 origin）时不让放，先交接或删掉分支。
+- `brain claim --release KEY`：只有主人能放。你已经有这个需求的 run 分支（本地或 origin）时不让放：先把分支删掉，本地和 origin 都要删（`git branch -D <分支>`、`git push origin --delete <分支>`）。交接了也不行，交接以后分支还在。
 - 没人认领时，登记的人可以改、关、删它；小需求还有大需求的主人。有人认领以后，只有主人能。
 - `brain split` 登记的小需求都是待认领的（[安装和使用.md](安装和使用.md) 4.7）。
 - 老的 claim 没有这些字段，照旧读：老的 claim 都写着主人。

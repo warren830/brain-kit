@@ -129,6 +129,7 @@ def cmd_show(a):
     doc = intents.get(repo, a.key)
     if not doc:
         raise BrainError("%s is not claimed" % a.key)
+    filed_text = intents.is_intent(doc)     # as filed: listing() adds "source" to every claim, plain ones too
     family = None
     if doc.get("parent") or doc.get("source") == "split" or _has_children(repo, a.key):
         cfg = config.load(repo)
@@ -139,7 +140,7 @@ def cmd_show(a):
     if a.json:
         print(json.dumps(doc, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
-    if intents.is_intent(doc):
+    if filed_text:
         print(intents.render_md(doc).rstrip())
     else:                                   # a plain claim (`brain start` / `brain claim`): no text was filed with it
         print("# %s · %s\n\nSource: product · claimed by %s at %s" % (doc.get("key"), doc.get("title", ""),
