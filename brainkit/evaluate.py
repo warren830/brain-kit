@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import statistics
 
 from . import brainlint, entries as E, trace as T, usage
@@ -112,6 +113,33 @@ def run_branches(repo, cfg, have=()) -> dict:
                     (k not in out or T.merged_at(repo, cfg, k, rec, sha, refs)):
                 out[k] = r
     return dict(sorted(out.items()))
+
+
+def removed_runs(repo, cfg, ref=None, have=()) -> dict:
+    """{key: {"read_at", "removed_in", "revert"}} of the runs whose runs/<KEY>/run.json the tree read once had and a
+    later commit on its first-parent line (`ref`, or HEAD for the working tree) took away (GitLab's Revert of the
+    whole MR; with the source branch deleted on merge the run is nowhere else), for the keys not in `have`: read at
+    the first parent of the last commit that removed it (where it was last there). revert: that commit is a revert
+    ('Revert "...' subject, or "This reverts commit")."""
+    tip = T._commit(repo, ref or "HEAD")
+    if not tip:
+        return {}
+    out = T._g(repo, "log", "--first-parent", "--diff-filter=D", "--no-renames", "-z", "--name-only",
+               "--format=%x01%H%x02%P%x02%s%x02%b%x03", tip, "--", cfg["runs_dir"]) or ""
+    rx = re.compile(T.RUN_JSON_RE % re.escape(cfg["runs_dir"]))
+    found = {}
+    for chunk in out.split("\x01")[1:]:
+        head, _, paths = chunk.partition("\x03")
+        sha, parents, subject, body = (head.split("\x02") + ["", "", ""])[:4]
+        first = parents.split()[0] if parents.split() else None
+        if not first:
+            continue
+        revert = subject.startswith('Revert "') or bool(T.REVERTS_RE.search(body))
+        for p in paths.replace("\n", "").split("\0"):
+            m = rx.match(p)
+            if m and m.group(1) not in have and m.group(1) not in found:     # newest first: the last removal
+                found[m.group(1)] = {"read_at": first, "removed_in": sha, "revert": revert}
+    return dict(sorted(found.items()))
 
 
 def ledger_runs(path) -> dict:
@@ -228,17 +256,19 @@ def build_traces(repo, cfg, ref=None, ledger_path=None, vouchers_dir=None, credi
         raise BrainError("bridge ledger %s not found" % ledger_path)
     keys = run_keys(repo, cfg, ref)
     branches = run_branches(repo, cfg, set(keys))
+    removed = removed_runs(repo, cfg, ref, set(keys) | set(branches))
     led = ledger_runs(ledger_path)
-    gone = sorted(k for k in led if JIRA_RE.match(k) and k not in keys and k not in branches)
+    gone = sorted(k for k in led if JIRA_RE.match(k) and k not in keys and k not in branches and k not in removed)
     if found is not None:
-        found.update(branches=dict(branches), ledger_only=list(gone))
+        found.update(branches=dict(branches), ledger_only=list(gone), removed=dict(removed))
     note = None
-    n = len(keys) + len(branches) + len(gone)     # the ledger's runs not readable here are requirements too
+    n = len(keys) + len(branches) + len(removed) + len(gone)  # the ledger's runs not readable here count too
     if T.credits_shape(credits) == "one" and n > 1:
         note = "--credits 只有一条记录，却有 %d 个需求：不知道是谁的，没有算给任何一个（请按 run 号或需求号给）" % n
         credits = {"runs": {}}
     traces, skipped, made = [], [], {}       # made: a split parent's trace makes its children's; each is made once
-    for k, r, u in [(k, ref, _usage) for k in keys] + [(k, branches[k], None) for k in sorted(branches)]:
+    for k, r, u in [(k, ref, _usage) for k in keys] + [(k, branches[k], None) for k in sorted(branches)] + \
+            [(k, removed[k]["read_at"], None) for k in removed]:
         try:
             traces.append(T.build(repo, cfg, k, ref=r, ledger_path=ledger_path, vouchers_dir=vouchers_dir,
                                   credits=credits, as_of=as_of, allowed_signers=allowed_signers, _usage=u,
@@ -618,6 +648,7 @@ def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouc
             "runs": len(traces), "skipped": skipped, "completed": [t["key"] for t in completed],
             "states": {k: v for k, v in sorted(states.items())}, "stuck_hours": stuck_hours,
             "open_branches": found.get("branches", {}), "ledger_only": found.get("ledger_only", []),
+            "removed": found.get("removed", {}),
             "batch": batch(active, skipped, states), "families": families(active, states, claims),
             "autonomy": autonomy, "delivery": delivery, "judgment": judgment,
             "repeat_rate": u["repeat_rate"], "useful": u["useful"],
@@ -823,6 +854,11 @@ def report(data) -> str:
     if data.get("open_branches"):
         out.append("没合并的 %d 个从分支读：%s" % (len(data["open_branches"]), "，".join(
             "%s（%s）" % (k, T._short_ref(r)) for k, r in sorted(data["open_branches"].items()))))
+    if data.get("removed"):
+        out.append("%s 的历史里 run.json 被删掉的 %d 个，从删掉它之前的提交读：%s" % (
+            data["ref"], len(data["removed"]), "，".join("%s（%s%s）" % (k, r["read_at"][:12], "，MR 被 revert" if
+                                                                     r["revert"] else "")
+                                                   for k, r in sorted(data["removed"].items()))))
     cov = data["coverage"]
     lack = [n for n, ok in (("桥 ledger", cov["ledger"]), ("凭证", cov["vouchers"])) if not ok]
     if lack:

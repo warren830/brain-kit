@@ -115,11 +115,12 @@ brain golden summarize results.json --tasks tasks
 
 ## 3. 指标
 
-**E1 哪些需求**：`brain eval` 读三处，一个需求只算一次：
+**E1 哪些需求**：`brain eval` 读四处，一个需求只算一次：
 
 1. 读的那棵树（工作区或 `--ref`）里的 `runs/<KEY>/run.json`：在 main 上读，就是已经合并的；
 2. 这里的 run 分支（本地的和 origin 的 `ai/<人>/<KEY>-<名字>`）里，上面没有的需求：没合并的 run，从它的分支读（几份里取新的那份，和第 2 节"读哪一份分支"一样；一个需求有几个分支时，取 tip 有 run.json、而且最后提交的那个；别的分支上的 run 按 H0 列在 `other_runs`）。报告开头写"没合并的 n 个从分支读"，JSON 的 `open_branches`。`brain trace KEY` 不给 `--ref`、或者 `--ref` 是默认分支（`--ref origin/main`），那里又没有它的 run.json 时，读的也是这个分支；
 3. 给了 `--ledger` 时，ledger 里有 run、这里却读不到 run.json 的需求（分支没 fetch、MR 关了分支也删了）：列在 `skipped`（带它在 ledger 里的状态，`ledger_only`），也进下面那张表，报告第一行写"另有 n 个只在桥上"。桥签交接凭证时先占的 run 号（ledger 的状态是 `signing`）还不是 run，哪里都不算。
+4. 读的那棵树的历史（`--ref`，或工作区的 HEAD）里有过、后来被它第一父链上的一个提交删掉的 `runs/<KEY>/run.json`，上面几处都没有的需求：从删掉它之前的那个提交读（最后一次删的那个提交的第一个父提交）。最常见的是 GitLab 上把整个 MR Revert 了，源分支合并时又删了：不这样，这个交付错了的 run 会从交付正确率的分母里消失。合并和 14 天里的回滚照常从 main 认。JSON 的 `removed`（`read_at`、`removed_in`、`revert`：删它的是不是回滚提交），报告开头写一行。`brain trace KEY` 不给 `--ref`、或者 `--ref` 是默认分支时，也从那里读。
 
 `--credits` 只给了一条没有键的记录、需求却不止一个时（只在桥上的也算），不知道是谁的，不算给任何一个。
 

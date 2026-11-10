@@ -5,6 +5,7 @@ import io
 import json
 import os
 import sys
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
@@ -15,6 +16,7 @@ from brainkit import claims, cli, config, intents, split, trace  # noqa: E402
 from brainkit import evaluate as EV  # noqa: E402
 from brainkit.common import BrainError  # noqa: E402
 from tests.helpers import tmpdir  # noqa: E402
+from tests import test_qa_trace_eval as Q  # noqa: E402
 from tests import test_split_trace as SP  # noqa: E402
 from tests.test_trace import AS_OF, commit, git_repo, world  # noqa: E402
 
@@ -278,6 +280,51 @@ class R1_89_FamilyLikeIntentList(unittest.TestCase):
         f = EV.collect(w.repo, w.cfg, as_of=SP.AS_OF, stuck_hours=40)["families"][0]
         self.assertEqual((f["children"], f["merged"], f["total"], f["not_started"], f["closed"]),
                          (["PAY-2", "PAY-3"], 1, 2, [], []))
+
+
+class R1_92_RevertedWithItsBranchGone(unittest.TestCase):
+    """GitLab's Revert of a merged MR (the revert of its merge commit) takes runs/<KEY>/run.json off main; with the
+    source branch deleted on merge (GitLab's default) brain eval found the run nowhere: it left the 交付正确率
+    denominator (1/1 instead of 1/2), and `brain trace KEY --ref main` said not found (the review's sM.py)."""
+
+    @classmethod
+    def setUpClass(cls):
+        w = cls.w = Q.World(types.SimpleNamespace(addCleanup=cls.addClassCleanup))
+        w.merge(w.run("PAY-4", "export", 4, runner_events=[Q.release()]), "merge", date="2026-11-05T00:00:00Z",
+                delete_branch=True)
+        cls.merge = w.merge(w.run("PAY-1", "refund", 6, runner_events=[Q.release()]), "merge",
+                            date="2026-11-07T00:00:00Z", delete_branch=True)
+        env = {"GIT_COMMITTER_DATE": "2026-11-09T00:00:00Z", "GIT_AUTHOR_DATE": "2026-11-09T00:00:00Z",
+               "GIT_COMMITTER_EMAIL": "lead@example.com", "GIT_AUTHOR_EMAIL": "lead@example.com"}
+        w.git("revert", "--no-commit", "-m", "1", cls.merge, env=env)
+        w.git("commit", "-q", "-m", 'Revert "%s"\n\nThis reverts merge request !12' % w.git(
+            "log", "-1", "--format=%s", cls.merge).stdout.strip(), env=env)
+        cls.revert = w.rev("main")
+
+    def test_eval_reads_it_where_it_was_last_there(self):
+        for ref in ("main", None):               # --ref main, and the working tree on main
+            with self.subTest(ref=ref):
+                d = EV.collect(self.w.repo, self.w.cfg(), ref=ref, as_of=Q.AS_OF)
+                self.assertEqual(d["removed"], {"PAY-1": {"read_at": self.merge, "removed_in": self.revert,
+                                                          "revert": True}})
+                self.assertEqual(d["delivery"]["by_run"], {"PAY-1": "wrong", "PAY-4": "correct"})
+                self.assertEqual(d["delivery"]["value"], [1, 2])
+                t = next(t for t in d["traces"] if t["key"] == "PAY-1")
+                self.assertEqual(t["ref"], self.merge)
+                self.assertTrue(t["outcome"]["reverted_or_hotfixed_within_14d"]["value"])
+                self.assertIn("从删掉它之前的提交读：PAY-1（%s，MR 被 revert）" % self.merge[:12], EV.report(d))
+
+    def test_trace_finds_it_too(self):
+        for args in (["--ref", "main"], []):
+            with self.subTest(args=args):
+                rc, out, err = Q.run_cli(self.w.repo, ["trace", "PAY-1", "--json", "--as-of", Q.AS_OF] + args)
+                self.assertEqual(rc, 0, out + err)
+                t = json.loads(out)
+                self.assertEqual((t["ref"], t["outcome"]["merged_at"]["commit"]), (self.merge, self.merge))
+
+    def test_a_run_never_on_main_is_not_brought_back(self):
+        self.assertEqual(EV.removed_runs(self.w.repo, self.w.cfg(), "main", have={"PAY-1"}), {})
+        self.assertEqual(EV.removed_runs(self.w.repo, self.w.cfg(), self.merge), {})     # before the revert
 
 
 def audit(recs, email="alice@example.com"):
