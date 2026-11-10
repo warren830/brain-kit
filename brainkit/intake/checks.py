@@ -61,7 +61,7 @@ ROLE_SUFFIXES_1 = tuple("方员員长長会會岗崗师師")       # one-charact
 NOT_NAMES = set(("产品 產品 运维 運維 运营 運營 开发 開發 测试 測試 客服 财务 財務 法务 法務 设计 設計 前端 后端 後端 研发 研發 "
                  "业务 業務 用户 用戶 客户 客戶 系统 系統 平台 待定 暂无 暫無 本人 自己 全员 全員 大家 双方 雙方 甲方 乙方 "
                  "我方 对方 對方 各方 管理员 管理員 机器人 機器人 值班 未定 未知 不限 任意 所有人 任何人 安全 安排 文本 文字 "
-                 "文档 文檔 文件 金额 金額 金融 高级 高級 高层 高層 高管 高优 高峰 方案 方式 方法 方面 周期 週期 周末 週末 周报 "
+                 "文档 文檔 文件 金额 金額 金融 高级 高級 高层 高層 高管 高优 方案 方式 方法 方面 周期 週期 周末 週末 周报 "
                  "週報 周会 常规 常規 常量 程序 余额 餘額 万一 萬一 严重 嚴重 温度 溫度 白天 周一 周二 周三 周四 周五 周六 "
                  "周日 周天 週一 週二 週三 週四 週五 週六 週日 董事 董事会 董事會 董事长 董事長 理事会 理事會 股东 股東 "
                  "顾客 顧客 顾问 顧問 任务 任務 任何 白班 常务 常務 常驻 常駐 常用 文员 文員 文案 钱包 錢包 钱款 錢款 关键 關鍵 "
@@ -537,12 +537,13 @@ def _replaces(h, k, rank) -> bool:
 # the hidden area and file names. That holds for values found by their own form (check digits, phone, card and
 # address formats, key formats, amounts, company suffixes) and for names and passwords found next to a label (R1-48,
 # the user's decision of 2026-11-10). Only a sure find spreads: a name the name check is not sure of (提出人：顾客,
-# 负责人列的 风控) is never a value. A password that is a common word of requirements (password: admin) or names its own
+# 负责人列的 风控) is never a value, and a name that is also a word (负责人：高峰, but 高峰期) is masked only where found. A password that is a common word of requirements (password: admin) or names its own
 # field (token=refresh_token, api_key: X-Api-Key) is masked where it was found but does not spread, so the word
 # elsewhere (a role, /api/admin, the refresh_token field) stays readable.
 PROPAGATE_KINDS = {"hkid", "cnid", "phone", "email", "card", "private_key", "cloud_key", "bearer", "token",
                    "amount", "company", "contract", "person", "kv_secret"}
 WORD_PASSWORDS = set("admin administrator root test demo guest user default monkey".split())
+WORD_NAMES = set("高峰".split())         # a name that is also a word (高峰期): masked where found, not spread
 SECRET_FIELD_WORDS = set("password passwd pwd secret token key api apikey".split())
 _WORD_CHAR = re.compile(r"[A-Za-z0-9_]")
 
@@ -550,6 +551,8 @@ _WORD_CHAR = re.compile(r"[A-Za-z0-9_]")
 def _spreads(kind, v) -> bool:
     if len(v) < 2:
         return False
+    if kind == "person":
+        return v not in WORD_NAMES
     if kind == "kv_secret":
         return v.lower() not in WORD_PASSWORDS and not set(re.split(r"[^a-z0-9]+", v.lower())) & SECRET_FIELD_WORDS
     return True

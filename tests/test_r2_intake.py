@@ -39,7 +39,7 @@ class R2_01SpreadWholeWordsOfSureValues(Base):
                      "The Billing API returns 201.", "@所有人 请在周五前确认。", "订单详情页所有人都可以查看",
                      "高峰期支付成功率"):
             self.assertIn(kept, text)
-        self.assertNotIn("[人名-", text)
+        self.assertEqual(text.count("[人名-"), 2)               # 负责人：高峰 and its cell (R3-01), nothing else
 
     def test_unsure_name_column_values_are_listed_to_check(self):
         self.file("清单.md", "# 清单\n\n| 需求 | 负责人 |\n|---|---|\n| 退款 | 风控 |\n| 对账 | Billing |\n")
