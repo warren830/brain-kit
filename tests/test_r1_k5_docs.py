@@ -7,7 +7,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from brainkit import ci  # noqa: E402
 from brainkit.bridge import decisions  # noqa: E402
+from tests.helpers import git_repo, sh, tmpdir  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -62,6 +64,63 @@ class R13GraphqlDownDoc(unittest.TestCase):
         self.assertEqual(len(told), 1)
         self.assertIn("回答先等着", told[0])
         self.assertIn("不用重新回复", told[0])
+
+
+class R20SplitChildRiskPaths(unittest.TestCase):
+    """A split child that changes a risk path can never pass brain-run-check: it is not handed to the runner, and
+    the parent's DESIGN was approved in local Lean. 4.7 says so; the check says why and what to do."""
+    INTENT = "261109-pay-1-big"
+
+    @classmethod
+    def setUpClass(cls):
+        scope = type("Scope", (), {})()
+        scope.addCleanup = cls.addClassCleanup
+        cls.repo = repo = git_repo(os.path.join(tmpdir(scope), "proj"))
+        design = "aidlc-docs/%s/inception/application-design/application-design.md" % cls.INTENT
+        for rel, text in (("gates/risk-paths", "services/api/**\n"), (design, "# Application Design\n")):
+            p = os.path.join(repo, *rel.split("/"))
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+        sh("git", "-C", repo, "add", "-A")
+        sh("git", "-C", repo, "commit", "-q", "-m", "base")
+        cls.base = sh("git", "-C", repo, "rev-parse", "HEAD").stdout.strip()
+        os.makedirs(os.path.join(repo, "services", "api"))
+        with open(os.path.join(repo, "services", "api", "refunds.py"), "w") as f:
+            f.write("def refund(): pass\n")
+        sh("git", "-C", repo, "add", "-A")
+        sh("git", "-C", repo, "commit", "-q", "-m", "PAY-2: api")
+
+    class Target:
+        trusted = True
+
+        def file(self, path):
+            return "services/api/**\n" if path == "gates/risk-paths" else None
+
+    def route(self, **rec):
+        rec = dict({"key": "PAY-2", "intent": self.INTENT, "brain_commit": self.base}, **rec)
+        return ci.check_route(self.repo, rec, {"risk_paths_file": "gates/risk-paths"}, self.Target(), self.base, [])
+
+    def test_a_split_child_is_told_why_and_what_to_do(self):
+        probs = self.route(parent="PAY-1", unit="api")
+        self.assertEqual(len(probs), 1, probs)
+        p = probs[0]
+        self.assertTrue(p.startswith("risk paths changed (services/api/refunds.py): no design approval signed by the "
+                                     "bridge for PAY-2 or its parent PAY-1"), p)
+        for part in ("split child", "cannot get one", "local Lean", "do not split", "parent run"):
+            self.assertIn(part, p)
+        self.assertNotIn("ask through the MR", p)          # what a normal run does; a child cannot
+
+    def test_a_normal_run_keeps_its_message(self):
+        self.assertEqual(self.route(), ["risk paths changed (services/api/refunds.py): no design approval signed by "
+                                        "the bridge for PAY-2 (ask through the MR: park.json with lean_request "
+                                        "DESIGN ...)"])
+
+    def test_the_doc_says_a_child_may_not_change_risk_paths(self):
+        s = section(usage_doc(), "### 4.7")
+        self.assertFalse("CI 查 risk-paths 时，大需求经桥签过的 DESIGN 批准也算数。" in s, "the old sentence is still there")
+        for part in ("小需求不能改 risk-paths", "不拆", "让大需求自己改"):
+            self.assertIn(part, s)
 
 
 if __name__ == "__main__":
