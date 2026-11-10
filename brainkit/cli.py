@@ -297,6 +297,8 @@ def attach_package(repo, store, pkg) -> dict:
     """Copy a checked package read-only into the run's workspace; return its run.json entry."""
     src = _checked_package(store, pkg)
     _readonly_copy(src, os.path.join(repo, MATERIALS_DIR, pkg))
+    if intake.is_old_version(src):
+        print("WARN: package %s: %s" % (pkg, intake.OLD_PACKAGE))
     return {"package": pkg, "manifest_sha256": intake.manifest_digest(src)}
 
 
@@ -1067,18 +1069,25 @@ def _is_clone_root(path) -> bool:
 
 
 def publish_materials(store, rec) -> list:
-    """Make sure each package is in the shared intake repo. Returns warnings (empty when all published)."""
+    """Make sure each package is intact and in the shared intake repo. Returns warnings (empty when all published and
+    none is an old-version package)."""
     warn = []
     for m in rec.get("materials", []):
         pdir = os.path.join(store, "packages", m["package"])
         if not os.path.isdir(pdir) or intake.manifest_digest(pdir) != m["manifest_sha256"]:
             raise BrainError("package %s in %s does not match run.json" % (m["package"], store))
+        probs = intake.verify_package(pdir)
+        if probs:
+            raise BrainError("package %s in %s is damaged: %s" % (m["package"], store, "; ".join(probs)))
+        if intake.is_old_version(pdir):
+            warn.append("package %s: %s" % (m["package"], intake.OLD_PACKAGE))
     if not rec.get("materials"):
         return warn
     if not _is_clone_root(store):
         # only the store's own clone: inside an enclosing repo (a dotfiles repo in $HOME holding ~/.brain/intake)
         # a commit and push would publish the masked materials to that repo's remote
-        return ["intake store %s is not a git clone of brain-intake: the team runner cannot get the materials" % store]
+        return warn + ["intake store %s is not a git clone of brain-intake: the team runner cannot get the materials"
+                       % store]
     for m in rec["materials"]:
         pkg = "packages/" + m["package"]
         git(store, "add", "--", pkg, *[":(exclude,glob)%s/**/%s" % (pkg, n) for n in sorted(intake.SKIP_NAMES)])

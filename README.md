@@ -172,7 +172,7 @@ brain-kit/bin/brain install <项目目录> --lean <AI-DLC Lean 的 checkout 目�
 - **文档接收**：
   - 自造的 docx 和 xlsx 里各种隐藏内容都识别出来了，HTML 的隐藏元素和脚本也去掉了；
   - 五道关和 dry-run 都测了；
-  - 材料包被改动能查出来；
+  - 材料包被改动能查出来（旧版 brain-kit 做的材料包没有记 README.md、toc.md、findings.md、extras/ 的哈希，这几个被改查不出来，会提醒核对得没有新版严）；
   - 用一份真实的需求文件夹跑过：打码过的值，在材料包的任何文件里都找不到原值（设 `BRAIN_TEST_REAL_DOCS` 可以重跑）。
 - **桥**：
   - 接手核对的每种拒绝情况：Jira 模式和不接 Jira 模式都有；
