@@ -594,5 +594,14 @@ class R1_46_ChildCommitAsDocumented(SplitChild):
                          ["runs/PAY-4/MR.md", "runs/PAY-4/run.json"])
 
 
+class R1_34_ReadmeCountsTheTests(unittest.TestCase):
+    def test_r1_34_readme_gives_the_number_of_tests_there_are(self):
+        from tests.helpers import ROOT
+        with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as f:
+            said = re.findall(r"本机 (\d+) 个测试", f.read())
+        n = unittest.TestLoader().discover(os.path.join(ROOT, "tests"), top_level_dir=ROOT).countTestCases()
+        self.assertEqual(said, [str(n)], "README.md 测过什么: write 本机 %d 个测试" % n)
+
+
 if __name__ == "__main__":
     unittest.main()
