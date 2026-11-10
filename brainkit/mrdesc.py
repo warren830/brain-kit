@@ -15,8 +15,10 @@ Sources (working tree, or --ref)
   release.md          operations/release.md: Open items
   decisions.md        the decision table (Who in the fixed vocabulary), brain-proposal and brain-gap blocks
   park.json           runs/<KEY>/park.json: the question the run is waiting on
-  git                 the diff against the merge base with the default branch (runs/<KEY>/MR.md itself left out);
-                      gates/risk-paths from the default branch; DESIGN coverage by brainkit.ci (signed vouchers)
+  git                 the diff against the merge base with the default branch (runs/<KEY>/MR.md itself left out; a
+                      split child: its parent's branch; read where the run merged: the diff that merge brought in);
+                      gates/risk-paths from the default branch; DESIGN coverage by brainkit.ci (signed vouchers);
+                      a split child's own lines of decisions.md and requirements.md (git blame, as brain trace)
   run trace           brainkit.trace.build(), when it works: Brain citations that are archived or unknown, credits
 Current code: Lean's own code fingerprint (Lean's Project.fingerprint(), run in a subprocess) against the one the
 latest verify recorded; with --ref, the files changed since the verify's commit.
@@ -761,7 +763,7 @@ def _landed(repo, cfg, rec, key, ref, into):
     return {"base": b, "tip": t, "commit": m["commit"], "how": how, "into": into}
 
 
-def _changes(repo, cfg, key, tree, base, label=None, rec=None, into=None):
+def _changes(repo, cfg, key, tree, base, rec=None, into=None):
     """(changes, why not): the diff from the merge base with the default branch (`into`: (its cfg, the ref), a split
     child's parent's branch) to the tip, by top-level folder. A tip already on that branch is a run that merged: the
     diff that merge brought in."""
@@ -772,7 +774,7 @@ def _changes(repo, cfg, key, tree, base, label=None, rec=None, into=None):
         b = _commit(repo, base)
         if not b:
             raise BrainError("--base %s is not a commit here" % base)
-        label = label or "%s（%s）" % (_one(base, 60), b[:12])
+        label = "%s（%s）" % (_one(base, 60), b[:12])
     else:
         icfg, iref = into or (cfg, dref)
         if not iref:
