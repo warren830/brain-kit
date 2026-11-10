@@ -97,10 +97,12 @@ class PreReceive(unittest.TestCase):
                                             ".kiro", "brain", "lean-hook.py"))
         adapter = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(adapter)
-        self.assertEqual(tuple(adapter.KIT_PATHS), pre_receive.KIT_PATHS)
+        self.assertEqual(sorted(adapter.KIT_PATHS + adapter.RUNNER_KIT_PATHS), sorted(pre_receive.KIT_PATHS))
+        runner = adapter.KIT_PATHS + adapter.RUNNER_KIT_PATHS
         for path in (".kiro/steering/brain.md", ".kiro/skills/brain-split/SKILL.md"):
-            self.assertEqual(adapter.protected_target(self.repo, {"tool_name": "fs_write",
-                                                                  "tool_input": {"path": path}}), path)
+            call = {"tool_name": "fs_write", "tool_input": {"path": path}}
+            self.assertEqual(adapter.protected_target(self.repo, call, runner), path)     # on the team runner
+            self.assertIsNone(adapter.protected_target(self.repo, call))                  # a person's own session
 
     def test_bot_cannot_delete_or_force_push(self):
         self.assertIn("delete", self.decide([(self.c1, ZERO_SHA, BR)], "brain-bot")[0])
