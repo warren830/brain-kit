@@ -646,7 +646,7 @@ class Bridge(DecisionLoop):
         """The risk-path patterns (kit risk_paths_file on the default branch) that the run's expected paths meet,
         when the bridge has signed no DESIGN approval for `key` yet: brain-run-check (ci.check_route) wants one for
         a change there, and a local Lean approval is not one. A hint for the hand-over; CI decides."""
-        paths = [str(x).strip().rstrip("/") for x in paths or [] if str(x).strip().rstrip("/")]
+        paths = [str(x).strip() for x in paths or [] if str(x).strip().rstrip("/")]     # conf.d/ is a folder
         if not paths:
             return []
         raw = self.gl.file_raw(project, kit.get("risk_paths_file") or "gates/risk-paths", kit["default_branch"])

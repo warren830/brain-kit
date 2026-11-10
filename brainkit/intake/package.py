@@ -442,11 +442,21 @@ def manifest_digest(pkg_dir) -> str:
     return hashlib.sha256(canonical(load_json(os.path.join(pkg_dir, "manifest.json")))).hexdigest()
 
 
+OLD_UNHASHED = ("README.md", "toc.md", "findings.md", "extras/hidden.md")
+OLD_PACKAGE = ("old-version package, checked less strictly than a new one (its manifest records no hashes for "
+               "README.md, toc.md, findings.md and extras/, so a change to them is not found)")
+
+
+def is_old_version(pkg_dir) -> bool:
+    """Built before brain-kit recorded the hashes of the OLD_UNHASHED files in the manifest ('files')."""
+    return not isinstance(load_json(os.path.join(pkg_dir, "manifest.json")).get("files"), dict)
+
+
 def verify_package(pkg_dir) -> list:
     """Problems with a package: every file in it is the manifest, a segment or a file the manifest lists, with the
     hash recorded there; no file is missing, nothing is extra, and nothing is a symbolic link (a copy would take in
-    whatever it points to). A package whose manifest records no file hashes (built before brain-kit recorded them)
-    cannot be checked and is refused too."""
+    whatever it points to). What Finder or Explorer leaves in a folder (SKIP_NAMES) is no part of a package. An
+    old-version package (is_old_version) cannot vouch for its OLD_UNHASHED files: they are not checked."""
     if os.path.islink(pkg_dir):
         return ["the package folder is a symbolic link"]
     m = load_json(os.path.join(pkg_dir, "manifest.json"))
@@ -454,13 +464,12 @@ def verify_package(pkg_dir) -> list:
     expected = {}                               # path relative to the package, '/'-separated -> sha256
     for s in m.get("segments", []):
         expected[os.path.normpath(s["file"]).replace(os.sep, "/")] = s["sha256"]
-    files = m.get("files")
-    if not isinstance(files, dict):
-        probs.append("manifest.json records no hashes for README.md, toc.md, findings.md and extras/ (built by an "
-                     "older brain-kit): run brain intake again")
-        files = {}
-    for rel, sha in files.items():
-        expected[os.path.normpath(rel).replace(os.sep, "/")] = sha
+    unchecked = {"manifest.json"}
+    if is_old_version(pkg_dir):
+        unchecked.update(OLD_UNHASHED)
+    else:
+        for rel, sha in m["files"].items():
+            expected[os.path.normpath(rel).replace(os.sep, "/")] = sha
     found = set()
     for root, dirs, names in os.walk(pkg_dir):
         for n in sorted(dirs + names):
@@ -470,7 +479,7 @@ def verify_package(pkg_dir) -> list:
                 probs.append("symbolic link %s" % rel)
             elif n in names and not os.path.isfile(p):
                 probs.append("not a regular file: %s" % rel)
-            elif n in names:
+            elif n in names and n not in SKIP_NAMES:
                 found.add(rel)
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
     for rel, sha in sorted(expected.items()):
@@ -480,6 +489,6 @@ def verify_package(pkg_dir) -> list:
         with open(os.path.join(pkg_dir, *rel.split("/")), "rb") as f:
             if hashlib.sha256(f.read()).hexdigest() != sha:
                 probs.append("changed %s" % rel)
-    for rel in sorted(found - set(expected) - {"manifest.json"}):
+    for rel in sorted(found - set(expected) - unchecked):
         probs.append("extra %s" % rel)
     return probs

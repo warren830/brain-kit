@@ -215,10 +215,11 @@ class Target:
         return cfg
 
 
-def glob_match(path, pattern) -> bool:
+def glob_match(path, pattern, folder=False) -> bool:
     """Is the file `path` under the gates/risk-paths `pattern`? The .gitignore rules (riskpaths): src/pay, /src/pay/,
-    *.sql, src/**/x. BrainError for a pattern those rules do not support."""
-    return riskpaths.matches(path, pattern)
+    *.sql, src/**/x. folder=True: `path` is a submodule, a folder to git. BrainError for a pattern those rules do not
+    support."""
+    return riskpaths.matches(path, pattern, folder)
 
 
 def lean_events(repo, intent):
@@ -251,6 +252,16 @@ def changed_paths(repo, *revs, paths=()) -> list:
     if p.returncode != 0:
         raise BrainError("git diff %s failed: %s" % (" ".join(revs), p.stderr.decode("utf-8", "replace").strip()))
     return [x for x in p.stdout.decode("utf-8", "surrogateescape").split("\0") if x]
+
+
+def gitlinks(repo, *revs) -> set:
+    """The paths `git diff <revs>` changes that are a submodule (a gitlink, mode 160000) on either side."""
+    p = subprocess.run(["git", "-C", repo, "diff", "--no-renames", "--no-ext-diff", "-z", "--raw"] + list(revs),
+                       capture_output=True)
+    if p.returncode != 0:
+        raise BrainError("git diff %s failed: %s" % (" ".join(revs), p.stderr.decode("utf-8", "replace").strip()))
+    out = p.stdout.decode("utf-8", "surrogateescape").split("\0")
+    return {path for meta, path in zip(out[::2], out[1::2]) if "160000" in meta[1:].split()[:2]}
 
 
 def _fold(path) -> str:
@@ -359,8 +370,8 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
     bad = ["%s: %s: brain-ci fails every run MR until it is fixed" % (cfg["risk_paths_file"], why)
            for why in (riskpaths.problem(x) for x in pats) if why]
     pats = [x for x in pats if not riskpaths.problem(x)]
-    changed = changed_paths(repo, base, "HEAD")
-    risky = sorted({f for f in changed if any(glob_match(f, x) for x in pats)})
+    changed, links = changed_paths(repo, base, "HEAD"), gitlinks(repo, base, "HEAD")
+    risky = sorted({f for f in changed if any(glob_match(f, x, f in links) for x in pats)})
     if not risky:
         return bad
     shown = ", ".join(risky[:5])
@@ -542,7 +553,13 @@ def bot_commit_rules(repo, branch, env, tgt, cfg, hook_cfg, head) -> list:
     them a person's next push, or a re-run, would turn the bot's red pipeline green."""
     from . import pre_receive
     bots = {e.lower() for e in hook_cfg.get("bot_emails") or []}
-    commits = pre_receive.new_commits(tgt.base, head, hook_cfg["default_branch"], cwd=repo)
+    default = hook_cfg["default_branch"]
+    commits = pre_receive.new_commits(tgt.base, head, default, cwd=repo)
+    # a promotion MR (main -> production): the bot's commits already on the default branch came through their run MRs
+    if env.get("CI_MERGE_REQUEST_TARGET_BRANCH_NAME") != default and git(
+            repo, "fetch", "-q", "origin", "+refs/heads/%s:refs/brain-ci/default" % default, check=False).returncode == 0:
+        fresh = set(git_out(repo, "rev-list", head, "^" + tgt.base, "^refs/brain-ci/default").split())
+        commits = [c for c in commits if c in fresh]
     who = _who(repo, commits)
     mine = _bots_commits(commits, who, bots)
     if not mine:

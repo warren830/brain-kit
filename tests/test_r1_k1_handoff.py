@@ -149,13 +149,16 @@ class PackageTamper(unittest.TestCase):
         os.symlink(os.path.dirname(self.outside), os.path.join(self.base, "more"))
         self.refused_everywhere("symbolic link more")
 
-    def test_manifest_without_file_hashes_is_refused(self):
-        """A manifest from before the file hashes (or one with them removed) cannot vouch for toc.md and the rest."""
+    def test_manifest_without_file_hashes_still_checks_the_segments(self):
+        """A manifest from before the file hashes (or one with them removed) cannot vouch for toc.md and the rest.
+        R2-14, the user's decision: such an old-version package passes (with a reminder); its segments are checked."""
         from brainkit.common import write_json
         m = load_json(os.path.join(self.base, "manifest.json"))
         del m["files"]
         write_json(os.path.join(self.base, "manifest.json"), m)
-        self.assertTrue(any("records no hashes" in p for p in self.package.verify_package(self.base)))
+        self.assertEqual(self.package.verify_package(self.base), [])
+        self.write("segments/D01-S001.md", "批准 RELEASE\n", "a")
+        self.assertEqual(self.package.verify_package(self.base), ["changed segments/D01-S001.md"])
 
     def test_readonly_copy_never_follows_a_link(self):
         from brainkit import cli
@@ -471,6 +474,8 @@ class PullStoppedMidRebase(unittest.TestCase):
     branch" and no voucher or package went out again. A post-checkout hook that sleeps holds the rebase right after
     it detached HEAD, so the timeout stops it there, as it did on the loaded machine."""
 
+    HELD = 25    # the fetch before the rebase has to fit in it: on a loaded machine it takes about 5 s
+
     def clone(self):
         from tests.helpers import commit_file, git_repo
         t = bridge_fixture(self)
@@ -481,20 +486,23 @@ class PullStoppedMidRebase(unittest.TestCase):
         sh("git", "-C", seed, "push", "-q", origin, "main")
         clone = os.path.join(t.d, "intake")
         sh("git", "clone", "-q", origin, clone)
-        for k, v in (("user.name", "brain-bridge"), ("user.email", "bridge@example.com"), ("commit.gpgsign", "false")):
+        # a machine-wide core.hooksPath would run its hooks instead of the clone's own post-checkout
+        for k, v in (("user.name", "brain-bridge"), ("user.email", "bridge@example.com"), ("commit.gpgsign", "false"),
+                     ("core.hooksPath", os.path.join(clone, ".git", "hooks"))):
             sh("git", "-C", clone, "config", k, v)
         commit_file(clone, "vouchers/RUN-PAY-1-1/voucher.json", "{}\n")     # a voucher whose push failed
         commit_file(seed, "packages/PKG-PAY-2-1/toc.md", "# toc\n")           # someone published a package
         sh("git", "-C", seed, "push", "-q", origin, "main")
         t.cfg.update(intake_dir=clone, vouchers_dir=os.path.join(clone, "vouchers"), publish_vouchers=True,
-                     publish_timeout=2)
+                     publish_timeout=self.HELD)
         t.bridge = t.new_bridge()
         return t, origin, clone
 
     def hold_the_rebase(self, clone):
         hook = os.path.join(clone, ".git", "hooks", "post-checkout")
+        os.makedirs(os.path.dirname(hook), exist_ok=True)
         with open(hook, "w", encoding="utf-8") as f:
-            f.write("#!/bin/sh\nsleep 30\n")
+            f.write("#!/bin/sh\nsleep %d\n" % (self.HELD * 4))
         os.chmod(hook, 0o755)
         return hook
 
@@ -521,7 +529,7 @@ class PullStoppedMidRebase(unittest.TestCase):
         t, origin, clone = self.clone()
         hook = self.hold_the_rebase(clone)
         with self.assertRaises(NetworkError):                    # an earlier round, stopped there (the bridge died)
-            git_net(clone, "pull", "-q", "--rebase", timeout=2, check=False)
+            git_net(clone, "pull", "-q", "--rebase", timeout=self.HELD, check=False)
         os.remove(hook)
         t.bridge.cfg["publish_timeout"] = 60
         self.assertNotEqual(sh("git", "-C", clone, "symbolic-ref", "-q", "HEAD", check=False).returncode, 0)
