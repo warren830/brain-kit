@@ -8,7 +8,7 @@ from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from brainkit import cli  # noqa: E402
+from brainkit import brainlint, cli  # noqa: E402
 from brainkit import entries as E  # noqa: E402
 from tests.helpers import commit_file, git_repo, sh, tmpdir  # noqa: E402
 
@@ -88,6 +88,35 @@ class Reflect(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertEqual(brain_branches(repo), ["brain/OMS-3-reflect-1"], out)
         self.assertIn(wt, out)
+
+    def test_r1_73_rerun_after_the_id_was_taken_writes_again(self):
+        repo = project(os.path.join(self.d, "r"), ONE)
+        rc, out = run_cli(repo, "reflect", "--apply", "--worktree", os.path.join(self.d, "wt1"))
+        self.assertEqual(rc, 0, out)
+        # another MR, made before this one was visible, merges first and takes T-OMS-3-1
+        sh("git", "-C", repo, "switch", "-q", "main")
+        b = E.Brain.load(os.path.join(repo, "brain"))
+        self.assertEqual(b.new("TECH", "pitfall", "对账按自然日切。", "OMS-3", "D-9"), "T-OMS-3-1")
+        b.save()
+        sh("git", "-C", repo, "commit", "-q", "-am", "other MR")
+        sh("git", "-C", repo, "switch", "-q", "ai/alice/OMS-3-x")
+
+        def ci_errors(branch):
+            mb = sh("git", "-C", repo, "merge-base", "main", branch).stdout.strip()
+            return brainlint.check(E.Brain.from_git(repo, branch), base=E.Brain.from_git(repo, mb),
+                                   target=E.Brain.from_git(repo, "main"))[0]
+        self.assertIn("taken on the target branch", " ".join(ci_errors("brain/OMS-3-reflect-1")))
+        rc, out = run_cli(repo, "reflect", "--apply", "--worktree", os.path.join(self.d, "wt2"))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(brain_branches(repo), ["brain/OMS-3-reflect-1", "brain/OMS-3-reflect-2"], out)
+        self.assertIn("brain/OMS-3-reflect-1", out)
+        self.assertEqual(ci_errors("brain/OMS-3-reflect-2"), [])
+        new = E.Brain.from_git(repo, "brain/OMS-3-reflect-2").main()
+        self.assertEqual([e.text() for eid, (f, e) in new.items() if eid not in ("T-OMS-1-1", "T-OMS-3-1")],
+                         ["金额一律用十进制计算，不用浮点。"])
+        rc, out = run_cli(repo, "reflect", "--apply", "--worktree", os.path.join(self.d, "wt3"))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(len(brain_branches(repo)), 2, out)
 
 
 if __name__ == "__main__":

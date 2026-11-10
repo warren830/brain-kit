@@ -1359,8 +1359,8 @@ def cmd_reflect(a):
         print("%s 里没有 brain-proposal 块：这个 run 没有提出 Brain 条目。" % label)
         return 0
     brain = entries.Brain.from_git(repo, base, mcfg["brain_dir"])
-    used, pending = reflect.open_branches(repo, mcfg["brain_dir"])
-    ops, more, notes = reflect.plan(brain, proposals, key, pending=pending, used_extra=used)
+    used, pending, stuck = reflect.open_branches(repo, mcfg["brain_dir"], base)
+    ops, more, notes = reflect.plan(brain, proposals, key, pending=pending, used_extra=used, stuck=stuck)
     probs += more
     rows, more = reflect.plan_gaps(repo, cfg, gaps, key)
     probs += more

@@ -299,8 +299,9 @@ def _target(b, base, target, errors):
     mine = base.used_ids()
     for eid, (f, e) in list(b.main().items()) + list(b.archived().items()):
         if eid not in mine and eid in taken:
-            errors.append("%s: this id was taken on the target branch meanwhile (another MR merged first): rebase "
-                          "on it and run brain reflect again" % eid)
+            errors.append("%s: this id was taken on the target branch meanwhile (another MR merged first): close "
+                          "this MR and run brain reflect again (it writes the proposals again on a new branch, with "
+                          "free ids)" % eid)
 
 
 def check_agents(head_text, base_text):

@@ -232,12 +232,14 @@ class Op:
         self.note = ""
 
 
-def plan(brain, proposals, key, pending=None, used_extra=()) -> tuple:
+def plan(brain, proposals, key, pending=None, used_extra=(), stuck=None) -> tuple:
     """(ops, problems, notes). Problems block the whole reflect; notes are shown.
-    `pending`: {proposal hash: branch} already written on open brain/* branches (MRs not merged yet)."""
+    `pending`: {proposal hash: branch} already written on open brain/* branches (MRs not merged yet).
+    `stuck`: {proposal hash: (branch, ids)} written on a branch that cannot merge (open_branches): written again."""
     ops, probs, notes = [], [], []
     props = brain.props()
     pending = pending or {}
+    stuck = stuck or {}
     main = brain.main()
     texts = {e.text(): eid for eid, (f, e) in main.items()}
     seen = {}
@@ -254,6 +256,10 @@ def plan(brain, proposals, key, pending=None, used_extra=()) -> tuple:
         if p.hash in pending:
             notes.append("%s: already on %s (MR not merged yet), skipped" % (where, pending[p.hash]))
             continue
+        if p.hash in stuck:
+            branch, taken = stuck[p.hash]
+            notes.append("%s: on %s, which cannot merge (%s taken on the target branch meanwhile): written again on "
+                         "a new branch; close that MR" % (where, branch, ", ".join(taken)))
         unknown = set(f) - {"file", "type", "rel", "section", "src"}
         if unknown:
             probs.append("%s: unknown fields %s" % (where, ", ".join(sorted(unknown))))
@@ -400,22 +406,41 @@ def rejected_without_correction(vouchers_dir, key, proposals) -> list:
 
 # ---------- git side ----------
 
-def open_branches(repo, brain_dir) -> tuple:
-    """(ids, {proposal hash: branch}) on open Brain branches (local and origin, and what a worktree of one holds
-    uncommitted, as `reflect --apply --no-commit` leaves it): parallel reflects and `brain entry` never pick an id
-    that is already taken there, and a re-run never writes the same proposal twice."""
+def open_branches(repo, brain_dir, main_ref=None) -> tuple:
+    """(ids, {proposal hash: branch}, {proposal hash: (branch, ids)}) on open Brain branches (local and origin, and
+    what a worktree of one holds uncommitted, as `reflect --apply --no-commit` leaves it): parallel reflects and
+    `brain entry` never pick an id that is already taken there, and a re-run never writes the same proposal twice.
+    With `main_ref`: a branch with an id that main took after the branch left it (another MR merged first; CI's
+    brain-lint refuses its MR) holds nothing pending. Its proposals come in the third dict, to be written again."""
     refs = git_out(repo, "for-each-ref", "--format=%(refname)", "refs/heads/brain/", "refs/remotes/origin/brain/")
-    views = [(ref.replace("refs/heads/", "").replace("refs/remotes/", ""), E.Brain.from_git(repo, ref, brain_dir))
+    views = [(ref.replace("refs/heads/", "").replace("refs/remotes/", ""), ref, E.Brain.from_git(repo, ref, brain_dir))
              for ref in refs.split()]
     for path, branch in brain_worktrees(repo):
         if os.path.isdir(os.path.join(path, brain_dir)):
-            views.append(("%s in %s, not committed" % (branch, path), E.Brain.load(os.path.join(path, brain_dir))))
-    ids, props = set(), {}
-    for where, b in views:
+            views.append(("%s in %s, not committed" % (branch, path), "refs/heads/" + branch,
+                          E.Brain.load(os.path.join(path, brain_dir))))
+    main = E.Brain.from_git(repo, main_ref, brain_dir) if main_ref else None
+    ids, props, stuck = set(), {}, {}
+    for where, ref, b in views:
         ids |= b.used_ids()
+        taken = taken_meanwhile(repo, brain_dir, ref, b, main_ref, main) if main else []
         for h in b.props():
-            props.setdefault(h, where)
-    return ids, props
+            if taken:
+                stuck.setdefault(h, (where, taken))
+            else:
+                props.setdefault(h, where)
+    return ids, props, {h: v for h, v in stuck.items() if h not in props}
+
+
+def taken_meanwhile(repo, brain_dir, ref, b, main_ref, main) -> list:
+    """Ids `b` (the Brain on branch `ref`) adds since it left `main_ref` that `main` (the Brain there now) has too:
+    the ids CI's brain-lint refuses as taken on the target branch meanwhile."""
+    p = git(repo, "merge-base", main_ref, ref, check=False)
+    if p.returncode != 0:
+        return []
+    mine = E.Brain.from_git(repo, p.stdout.strip(), brain_dir).used_ids()
+    taken = main.used_ids()
+    return sorted(eid for eid in list(b.main()) + list(b.archived()) if eid not in mine and eid in taken)
 
 
 def brain_worktrees(repo) -> list:
