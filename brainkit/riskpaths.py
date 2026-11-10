@@ -164,14 +164,24 @@ def _meet(names, items, below) -> bool:
     return go(0, 0)
 
 
+def _plain_file(path) -> bool:
+    """Is a run's expected path plainly a file: no glob, no trailing '/', an extension in its last name (guide.md,
+    .eslintrc.json)? Anything else may be a folder (pay, Makefile, .github, conf.d/): Lean reads a plain Path as
+    itself and everything below it, and `brain start --paths` asks for modules."""
+    s = str(path).strip()
+    return not any(c in s for c in "*?[") and re.fullmatch(r".+\.[^.]+", s.rsplit("/", 1)[-1]) is not None
+
+
 def meets(path, pattern) -> bool:
     """Could a file that `path` names be under the risk-path `pattern`? `path` is a run's expected path (run.json
-    expected_paths, a split unit's Paths): a file or a folder, which names everything below it too, so a parent
-    folder of a risk path (src for src/pay/**) meets it. A glob counts as its folder (common.path_base: Lean reads
-    Paths as fnmatch globs, where * also matches '/'); one at the top level (*.py, **) meets every pattern. Errs on
-    the side of yes: it feeds warnings. BrainError for a pattern these rules do not support."""
+    expected_paths, a split unit's Paths). Plainly a file (docs/guide.md) names only itself: it meets what covers
+    it. Anything else may be a folder, which names everything below it too, so a parent folder of a risk path (src
+    for src/pay/**) meets it, and so does a pattern at any depth (*.sql, pay). A glob counts as its folder
+    (common.path_base: Lean reads Paths as fnmatch globs, where * also matches '/'); one at the top level (*.py, **)
+    meets every pattern. Errs on the side of yes: it feeds warnings. BrainError for a pattern these rules do not
+    support."""
     p = parse(pattern)
     if not str(path or "").strip():
         return False
     base = path_base(path)
-    return not base or _meet(base.split("/"), p.items, True)
+    return not base or _meet(base.split("/"), p.items, not _plain_file(path))
