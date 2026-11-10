@@ -456,9 +456,13 @@ class Brain:
         if not body:
             raise BrainError("entry text is empty")
         lines = body.split("\n")
-        if any(LOOSE_HEADER_RE.search(l) or HEADING_RE.match(l) for l in lines):
-            raise BrainError("entry text may not contain headings or entry headers")
-        if sum(1 for l in lines if FENCE_RE.match(l)) % 2:
+        fence = False                        # read as BrainFile._parse does: in a code block "# x" is a comment
+        for line in lines:
+            if FENCE_RE.match(line):
+                fence = not fence
+            elif not fence and (LOOSE_HEADER_RE.search(line) or HEADING_RE.match(line)):
+                raise BrainError("entry text may not contain headings or entry headers (outside code blocks)")
+        if fence:
             raise BrainError("entry text has an unclosed code fence")
         return lines
 

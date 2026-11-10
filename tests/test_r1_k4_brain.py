@@ -163,6 +163,21 @@ class BrainRound1(unittest.TestCase):
             edit(b)
             self.assertEqual(errors(b, base), "")                           # what the tool writes passes
 
+    def test_r1_77_comment_lines_in_a_code_block(self):
+        text = "停服务前先摘流量：\n```sh\n# 先摘流量\ncurl -X POST localhost:8080/drain\n## 再停\nsystemctl stop app\n```"
+        b = brain_of(TECH=TECH)
+        eid = b.new("TECH", "pitfall", text, "OMS-2", "D-2")
+        self.assertEqual(errors(b), "")
+        again = E.Brain({"TECH.md": b.files["TECH.md"].render()})
+        self.assertEqual(again.main()[eid][1].text(), text)                 # the file reads back the same entry
+        b.adds_to(eid, "```python\n# 注释\nx = 1\n```", "D-3")
+        self.assertEqual(errors(b), "")
+        props = reflect.parse("```brain-proposal\nfile: TECH\ntype: pitfall\nsrc: D-2\n---\n%s\n```\n" % text)[0]
+        self.assertEqual(reflect.plan(brain_of(TECH=TECH), props, "OMS-2")[1], [])
+        for bad in ("## 标题", "x\n<!-- id:T-OMS-9-9 type:pitfall -->", "```\n# x\n```\n# 块外的标题", "```\nx"):
+            with self.assertRaises(BrainError):
+                brain_of(TECH=TECH).new("TECH", "pitfall", bad, "OMS-2", "D-2")
+
 
 if __name__ == "__main__":
     unittest.main()
