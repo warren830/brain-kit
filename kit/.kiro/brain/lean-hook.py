@@ -16,8 +16,8 @@ PreToolUse blocks the tool). Lean runs in this process from the bytes the kit ch
 from a second read of the file. Without Lean nothing can be checked, so PreToolUse is refused.
 
 The kit's own files (KIT_PATHS: .kiro/brain/, .kiro/agents/, .kiro/hooks/, .kiro/aidlc-lean/, .brain/kit.json,
-gates/) decide what a session may do. On every call, before anything else, they must be in the working tree exactly
-as in the reference commit: on the team runner the hand-over commit (the sha in the bridge-signed hand-over request
+gates/; on the team runner also RUNNER_KIT_PATHS: .kiro/steering/, .kiro/skills/) decide what a session may do. On
+every call, before anything else, they must be in the working tree exactly as in the reference commit: on the team runner the hand-over commit (the sha in the bridge-signed hand-over request
 runnerd prepared this workspace from, <spool_dir>/requests/<RUN-ID>.json, verified with allowed_signers), in a local
 session HEAD. A file there changed, added or deleted, a symlink or a hard link: PreToolUse is refused (exit 2), the
 other events do not reach Lean (approvals in that message are not recorded), and the session is told that a person
@@ -59,6 +59,10 @@ ADAPTER_VERSION = 3
 
 # The kit's own files (brainkit.pre_receive.KIT_PATHS: bot commits may not change them either).
 KIT_PATHS = (".kiro/brain/", ".kiro/agents/", ".kiro/hooks/", ".kiro/aidlc-lean/", ".brain/kit.json", "gates/")
+# Kit files checked on the team runner only: every session reads them, and the run may not change them, but people
+# change their own steering and skills while they work, so a local session is not frozen over an uncommitted skill
+# (bot commits may not change them either way: pre_receive.KIT_PATHS is both lists).
+RUNNER_KIT_PATHS = (".kiro/steering/", ".kiro/skills/")
 # Those of them Lean's own write guard refuses (KIT_PATHS in aidlc_lean.py): a write tool call there goes to Lean.
 LEAN_KIT_PATHS = (".kiro/hooks/", ".kiro/aidlc-lean/", ".kiro/agents/lean-")
 # Lean's tool classes (SHELL_TOOLS, READ_TOOL_RE in aidlc_lean.py): any other tool given a path writes a file.
@@ -293,20 +297,20 @@ def _scan(root, top, have, odd):
         _scan_file(cur, top, st, have, odd)
 
 
-def kit_differences(root, ref, contents=None) -> list:
+def kit_differences(root, ref, contents=None, tops=KIT_PATHS) -> list:
     """[(path, how)] where the kit's own files (KIT_PATHS) in the working tree at `root` are not those of commit
     `ref`: changed, added, deleted, a symlink, a hard link, not a regular file, not a folder. Contents count, as git
     stores them (line ends aside), not file modes. `contents` (a dict) gets the bytes read of each regular file there.
     Refused or OSError when it cannot be told."""
     want = {}
-    for rec in git(root, "ls-tree", "-r", "-z", ref, "--", *KIT_PATHS).split("\0"):
+    for rec in git(root, "ls-tree", "-r", "-z", ref, "--", *tops).split("\0"):
         if rec:
             meta, _, path = rec.partition("\t")
             mode, kind, oid = (meta.split(" ") + ["", "", ""])[:3]
             want[path] = (mode, kind, oid)
     algo = hashlib.sha256 if any(len(w[2]) == 64 for w in want.values()) else hashlib.sha1
     have, odd = {}, {}
-    for top in KIT_PATHS:
+    for top in tops:
         _scan(root, top, have, odd)
     if contents is not None:
         contents.update(have)
@@ -358,7 +362,7 @@ def _under(rel, prefixes) -> bool:
     return False
 
 
-def protected_target(root, payload):
+def protected_target(root, payload, tops=KIT_PATHS):
     """The kit path a file-write tool call names, resolved as Lean resolves it (symlinks followed, relative to the
     project, letter case as the file system compares it), or None. Those Lean guards itself are left to Lean."""
     tool = str(payload.get("tool_name") or "")
@@ -373,7 +377,7 @@ def protected_target(root, payload):
         p = given if os.path.isabs(given) else os.path.join(root, given)
         r = os.path.relpath(os.path.realpath(p), os.path.realpath(root)).replace(os.sep, "/")
         key = r.casefold() if fold else r
-        if _under(key, KIT_PATHS) and not _under(key, LEAN_KIT_PATHS):
+        if _under(key, tops) and not _under(key, LEAN_KIT_PATHS):
             return r
     return None
 
@@ -519,7 +523,8 @@ def main(argv=None) -> int:
     files = {}
     try:
         root, ref, what, fix = locate(start, runner)
-        diffs = kit_differences(root, ref, files)
+        tops = KIT_PATHS + (RUNNER_KIT_PATHS if runner is not None else ())
+        diffs = kit_differences(root, ref, files, tops)
         if not diffs and LEAN not in files:
             raise Refused("%s is not a regular file" % LEAN)
     except Exception as e:  # noqa: BLE001  fail closed: what cannot be checked is not let through
@@ -547,14 +552,14 @@ def main(argv=None) -> int:
         if allowed:
             return 0
         try:
-            hit = protected_target(root, payload)
+            hit = protected_target(root, payload, tops)
         except Exception as e:  # noqa: BLE001  fail closed
             return refuse(event, "[brain-kit] blocked (kit file): the target of this tool call could not be checked "
                                  "(%s).\n" % e)
         if hit:
             return refuse(event, "[brain-kit] blocked (kit file): %s is one of the kit's own files (%s): a session "
                                  "may not change it. People change these through a merge request to the default "
-                                 "branch.\n" % (hit, ", ".join(KIT_PATHS)))
+                                 "branch.\n" % (hit, ", ".join(tops)))
         if "tool_input" in payload:
             payload["tool_input"] = neutral(payload["tool_input"])
     elif isinstance(payload.get("prompt"), str):

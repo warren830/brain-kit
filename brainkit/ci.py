@@ -373,6 +373,14 @@ def check_route(repo, rec, cfg, tgt, base, vouchers) -> list:
         return bad + ["risk paths changed (%s) but application design was %s: this change needs the design stage"
                       % (shown, "skipped" if skipped else "not written")]
     approvals = [v for v in latest_design_answers(repo, vouchers) if v.get("choice") == "approve"]
+    if not approvals and rec.get("parent"):
+        return ["risk paths changed (%s): no design approval signed by the bridge for %s or its parent %s. A split "
+                "child cannot get one: it is not handed over to the team runner, so the bridge never asks for its "
+                "DESIGN on an MR, and in the split flow the parent's DESIGN is approved in local Lean, which CI does "
+                "not count (the parent is handed over only after every child has merged). Either do not split this "
+                "requirement, or move the risk-path change out of the units into the parent run, which asks for "
+                "the DESIGN approval through the bridge once it is handed over (docs 4.7)"
+                % (shown, rec["key"], rec["parent"])]
     if not approvals:
         return bad + ["risk paths changed (%s): no design approval signed by the bridge for %s (ask through the MR: "
                       "park.json with lean_request DESIGN ...)" % (shown, rec["key"])]

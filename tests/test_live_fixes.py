@@ -142,7 +142,7 @@ class ReflectWorktreeNamedAfterTheRepo(unittest.TestCase):
 
 
 class GitLabEditSignalAsMeasured(unittest.TestCase):
-    """Measured on gitlab.aws.dev 2026-11-09 (MR !2 of the trial): an award emoji moves REST updated_at and GraphQL
+    """Measured on a self-managed GitLab 2026-11-09 (MR !2 of the trial): an award emoji moves REST updated_at and GraphQL
     lastEditedAt but leaves lastEditedBy empty; a text edit sets lastEditedBy; an untouched note has lastEditedAt equal
     to its creation time. A reply someone only reacted to must still count."""
 

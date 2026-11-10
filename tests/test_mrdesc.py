@@ -448,7 +448,7 @@ class MrDescJustStarted(unittest.TestCase):
             "- 需求还没写（requirements.md 还是模板）",
             "- 还没有代码生成计划（不知道哪个测试对应哪条验收标准）",
             "- 还没跑 verify"])
-        self.assertIn("- 还缺：REQUIREMENTS（写了，还没请求审批）；DESIGN（还没写 application-design.md）；"
+        self.assertIn("- 还缺：REQUIREMENTS（还是模板，还没写）；DESIGN（还没写 application-design.md）；"
                       "RELEASE（还没跑 lean release）", section(text, "审批"))
         # nothing the records do not hold: no evidence, decisions, changes, review, Brain, pointers or cost
         self.assertRegex(section(text, "改了什么"), r"^- 还没改代码；和 main 的分叉点 [0-9a-f]{12} 比，只有记录："

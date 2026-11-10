@@ -381,7 +381,7 @@ def edit_state(note, edit_info) -> str:
         return "original"
     if not isinstance(edit_info, dict):
         return "unknown"
-    # Measured on gitlab.aws.dev 2026-11-09: a note nobody touched has lastEditedAt == its creation time; an award
+    # Measured on a self-managed GitLab 2026-11-09: a note nobody touched has lastEditedAt == its creation time; an award
     # emoji moves updated_at AND lastEditedAt but leaves lastEditedBy empty; a text edit sets lastEditedBy to the
     # editor. So lastEditedBy is the edit signal, lastEditedAt is not.
     by = str(edit_info.get("last_edited_by") or "").lower()

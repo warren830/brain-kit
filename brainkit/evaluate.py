@@ -24,10 +24,11 @@ Brain usage (brainkit.usage); read-only.
   这一批            one row per requirement: state, autonomous or not (a run that failed on the runner or whose MR
                     was closed never is), human acts at / outside judgment points, questions asked, credits,
                     delivered correctly or still open
-  大需求            a split (brainkit/split.py): one row per parent (families), its children, how many merged into
-                    its branch, judgment / questions / credits of the parent and its children together (trace's
+  大需求            a split (brainkit/split.py): one row per parent (families), its children, 已合并 n/m counted as
+                    `brain intent list` counts it (m: the children not closed, started or not; n: those merged into
+                    its branch), judgment / questions / credits of the parent and its children together (trace's
                     family roll-up); a child merged into its parent's branch and not yet into main is
-                    merged_into_parent (已合进大需求): not open, never stuck
+                    merged_into_parent (已合进大需求): not open, never stuck; a child whose claim is closed is closed
 Runs are found in the tree read (runs/<KEY>/run.json: merged ones, on main), on run branches here (<prefix>/*, local
 and origin's: the unmerged ones, read from the branch; a split child merged into its parent's run branch, its own
 branch there or gone: from the parent's branch, as merged) and in the bridge ledger (a run whose run.json is nowhere
@@ -38,10 +39,10 @@ evaluated.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
-import sqlite3
+import re
 import statistics
-import urllib.parse
 
 from . import brainlint, entries as E, trace as T, usage
 from .common import BrainError, JIRA_RE, utcnow
@@ -71,7 +72,7 @@ STATE_LABEL = {"merged": "已合并", "accepted": "验收过了、没合并", "w
                "closed": "MR 关了（没合并）", "failed": "运行机失败", "unknown": "派单结果不明",
                "merged_not_here": "桥说已合并（这里的 main 没有）", "not_readable": "读不到（只有桥上的记录）",
                "unreadable": "run.json 读不了", "merged_into_parent": "已合进大需求"}
-FAMILY_LABEL = {"in_progress": "小需求在做", "ready_to_release": "小需求都合进了，等发布"}
+FAMILY_LABEL = {"in_progress": "小需求在做", "ready_to_release": "小需求都合并了，等大需求评审和发布"}   # as intent list
 DELIVERY_LABEL = {"correct": "对", "wrong": "不对", "pending": "14 天未满", "wrong_open": "有问题（14 天未满）",
                   "unknown": "没有验收记录", "open": "还没合并", "closed": "没合并",
                   "merged_not_here": "桥说合并了（这里读不到合并，对不对不知道）"}
@@ -114,15 +115,39 @@ def run_branches(repo, cfg, have=()) -> dict:
     return dict(sorted(out.items()))
 
 
+def removed_runs(repo, cfg, ref=None, have=()) -> dict:
+    """{key: {"read_at", "removed_in", "revert"}} of the runs whose runs/<KEY>/run.json the tree read once had and a
+    later commit on its first-parent line (`ref`, or HEAD for the working tree) took away (GitLab's Revert of the
+    whole MR; with the source branch deleted on merge the run is nowhere else), for the keys not in `have`: read at
+    the first parent of the last commit that removed it (where it was last there). revert: that commit is a revert
+    ('Revert "...' subject, or "This reverts commit")."""
+    tip = T._commit(repo, ref or "HEAD")
+    if not tip:
+        return {}
+    out = T._g(repo, "log", "--first-parent", "--diff-filter=D", "--no-renames", "-z", "--name-only",
+               "--format=%x01%H%x02%P%x02%s%x02%b%x03", tip, "--", cfg["runs_dir"]) or ""
+    rx = re.compile(T.RUN_JSON_RE % re.escape(cfg["runs_dir"]))
+    found = {}
+    for chunk in out.split("\x01")[1:]:
+        head, _, paths = chunk.partition("\x03")
+        sha, parents, subject, body = (head.split("\x02") + ["", "", ""])[:4]
+        first = parents.split()[0] if parents.split() else None
+        if not first:
+            continue
+        revert = subject.startswith('Revert "') or bool(T.REVERTS_RE.search(body))
+        for p in paths.replace("\n", "").split("\0"):
+            m = rx.match(p)
+            if m and m.group(1) not in have and m.group(1) not in found:     # newest first: the last removal
+                found[m.group(1)] = {"read_at": first, "removed_in": sha, "revert": revert}
+    return dict(sorted(found.items()))
+
+
 def ledger_runs(path) -> dict:
     """{requirement key: [run rows, oldest first]} from the bridge ledger (opened read-only). A run id reserved
     while a hand-over is signed (state 'signing') is not a run yet."""
     if not path:
         return {}
-    if not os.path.exists(path):
-        raise BrainError("bridge ledger %s not found" % path)
-    db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(path)), uri=True)
-    db.row_factory = sqlite3.Row
+    db = T.open_ledger(path)
     try:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runs'").fetchone():
             return {}
@@ -231,17 +256,19 @@ def build_traces(repo, cfg, ref=None, ledger_path=None, vouchers_dir=None, credi
         raise BrainError("bridge ledger %s not found" % ledger_path)
     keys = run_keys(repo, cfg, ref)
     branches = run_branches(repo, cfg, set(keys))
+    removed = removed_runs(repo, cfg, ref, set(keys) | set(branches))
     led = ledger_runs(ledger_path)
-    gone = sorted(k for k in led if JIRA_RE.match(k) and k not in keys and k not in branches)
+    gone = sorted(k for k in led if JIRA_RE.match(k) and k not in keys and k not in branches and k not in removed)
     if found is not None:
-        found.update(branches=dict(branches), ledger_only=list(gone))
+        found.update(branches=dict(branches), ledger_only=list(gone), removed=dict(removed))
     note = None
-    n = len(keys) + len(branches) + len(gone)     # the ledger's runs not readable here are requirements too
+    n = len(keys) + len(branches) + len(removed) + len(gone)  # the ledger's runs not readable here count too
     if T.credits_shape(credits) == "one" and n > 1:
         note = "--credits 只有一条记录，却有 %d 个需求：不知道是谁的，没有算给任何一个（请按 run 号或需求号给）" % n
         credits = {"runs": {}}
     traces, skipped, made = [], [], {}       # made: a split parent's trace makes its children's; each is made once
-    for k, r, u in [(k, ref, _usage) for k in keys] + [(k, branches[k], None) for k in sorted(branches)]:
+    for k, r, u in [(k, ref, _usage) for k in keys] + [(k, branches[k], None) for k in sorted(branches)] + \
+            [(k, removed[k]["read_at"], None) for k in removed]:
         try:
             traces.append(T.build(repo, cfg, k, ref=r, ledger_path=ledger_path, vouchers_dir=vouchers_dir,
                                   credits=credits, as_of=as_of, allowed_signers=allowed_signers, _usage=u,
@@ -259,14 +286,41 @@ def build_traces(repo, cfg, ref=None, ledger_path=None, vouchers_dir=None, credi
     return traces, skipped, note
 
 
-def run_state(t, as_of=None, stuck_hours=STUCK_HOURS) -> dict:
+def claims_here(repo, refs=None) -> dict:
+    """{key: claim document} of the claims here (claim/<KEY>; origin's copy as last fetched when there is one, else
+    the local one: eval does not fetch). What `brain intent list` reads (intents.scan), without asking origin."""
+    refs = T._refs(repo) if refs is None else refs
+    pick = {}
+    for space in ("refs/heads/claim/", "refs/remotes/origin/claim/"):       # origin's last: its copy wins
+        for r in sorted(refs):
+            if r.startswith(space) and JIRA_RE.match(r[len(space):]):
+                pick[r[len(space):]] = r
+    keys = sorted(pick)
+    out = {}
+    for k, text in zip(keys, T._blobs(repo, ["%s:claim.json" % refs[pick[k]] for k in keys])):
+        try:
+            doc = json.loads(text) if text is not None else None
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and doc.get("key") == k:
+            out[k] = doc
+    return out
+
+
+def _closed(doc):
+    return isinstance(doc, dict) and bool(doc.get("closed"))
+
+
+def run_state(t, as_of=None, stuck_hours=STUCK_HOURS, claim=None) -> dict:
     """Where a run is: {"value", "bridge" (the ledger state of its last run), "last_activity", "idle_hours",
     "stuck", "waiting_on", "answered"}. value: merged | merged_not_here (the ledger says merged; git here has no
-    merge) | closed (MR closed, not merged) | failed (the runner could not start it) | unknown (a *_unknown ledger
-    state: the bridge cannot tell whether it was sent) | answered (parked on a question the bridge already has the
-    answer to: delivered, or on its way; the run did not go on) | waiting (parked on a question nobody answered yet,
-    or a bridge question is open) | accepted (accepted, not merged yet) | open. Stuck: not merged, closed or failed,
-    and nothing new for `stuck_hours` (commits, Lean records, park questions, ledger rows, vouchers)."""
+    merge) | closed (MR closed, not merged; a split child also when its claim was closed, `brain intent close`:
+    "closed_by": "claim") | failed (the runner could not start it) | unknown (a *_unknown ledger state: the bridge
+    cannot tell whether it was sent) | answered (parked on a question the bridge already has the answer to:
+    delivered, or on its way; the run did not go on) | waiting (parked on a question nobody answered yet, or a bridge
+    question is open) | accepted (accepted, not merged yet) | open. Stuck: not merged, closed or failed, and nothing
+    new for `stuck_hours` (commits, Lean records, park questions, ledger rows, vouchers). `claim`: the run's claim
+    document (claims_here)."""
     o = t["outcome"]
     fam = t.get("family") or {}
     br = sorted(o.get("bridge_runs") or [], key=lambda r: (r.get("created") or "", r.get("run_id") or ""))
@@ -282,6 +336,8 @@ def run_state(t, as_of=None, stuck_hours=STUCK_HOURS) -> dict:
         v = "merged_into_parent"
     elif last in ("merged", "closed", "failed"):
         v = {"merged": "merged_not_here"}.get(last, last)
+    elif fam.get("role") == "child" and _closed(claim):     # as `brain intent list`: closed, not in progress
+        v = "closed"
     elif last and last.endswith("_unknown"):
         v = "unknown"
     elif o.get("answered"):
@@ -295,6 +351,8 @@ def run_state(t, as_of=None, stuck_hours=STUCK_HOURS) -> dict:
     stuck = v in ("open", "waiting", "answered", "accepted", "unknown") and idle is not None and idle >= stuck_hours
     st = {"value": v, "bridge": last, "last_activity": la, "idle_hours": idle, "stuck": stuck,
           "waiting_on": o.get("waiting_on"), "answered": o.get("answered")}
+    if v == "closed" and last != "closed":
+        st["closed_by"] = "claim"
     if fam.get("role") == "parent":
         st["family_activity"] = fam["rollup"]["last_activity"]
     return st
@@ -323,7 +381,10 @@ def open_reasons(t, st, stuck_hours=STUCK_HOURS) -> list:
         out.append({"rule": "stuck", "text": "%.0f 小时没有进展（最后一次 %s，≥%g 小时算停住）%s" % (
             st["idle_hours"], st["last_activity"], stuck_hours, _stuck_on(st)),
             "evidence": [(st.get("family_activity") or t["outcome"].get("last_activity") or {}).get("src")]})
-    if v == "closed":
+    if v == "closed" and st.get("closed_by") == "claim":
+        out.append({"rule": "closed_unmerged", "text": "需求关了（brain intent close），没有合并",
+                    "evidence": "claim/%s" % t["key"]})
+    elif v == "closed":
         out.append({"rule": "closed_unmerged", "text": "MR 关了，没有合并", "evidence": "bridge ledger runs"})
     if v == "failed":
         out.append({"rule": "runner_failed", "text": "运行机没能开始这个 run（桥上是 failed：brain-runnerd 失败）",
@@ -374,8 +435,8 @@ def batch(traces, skipped, states) -> list:
     run that failed on the runner or whose MR was closed), beyond (what kept it from being autonomous: people's acts
     after the hand-over besides the required approvals, runner_failed, closed_unmerged), judgment [at judgment
     points, outside], questions, credits, delivery (correct | wrong | pending | wrong_open | unknown | open | closed |
-    merged_not_here)}. A skipped run gets a row too: not_readable (only the ledger has it), unreadable (its run.json
-    cannot be read)."""
+    merged_not_here)}; a split child also has parent, and closed_by "claim" when its claim was closed (run_state).
+    A skipped run gets a row too: not_readable (only the ledger has it), unreadable (its run.json cannot be read)."""
     rows = []
     for t in sorted(traces, key=lambda x: x["key"]):
         st = states[t["key"]]
@@ -388,6 +449,8 @@ def batch(traces, skipped, states) -> list:
                      "credits": t["cost"]["credits"], "delivery": _delivery(t, st)})
         if (t.get("family") or {}).get("role") == "child":
             rows[-1]["parent"] = t["family"]["parent"]
+        if st.get("closed_by"):
+            rows[-1]["closed_by"] = st["closed_by"]
     for s in skipped:
         if s.get("state") == "not_readable":
             last = (s.get("bridge_runs") or [{}])[-1]
@@ -402,22 +465,34 @@ def batch(traces, skipped, states) -> list:
     return sorted(rows, key=lambda r: r["key"])
 
 
-def families(traces, states) -> list:
-    """One row per split parent among `traces` (its trace's family): {key, children (the keys of the child runs, a
-    child not started has none), merged (into the parent's branch), total, state (the parent's when it is merged,
-    closed or cannot go on; else ready_to_release when every child merged, in_progress), judgment [at, outside],
-    questions, credits (None when none is known): the parent's and its children's together (family.rollup.total)."""
-    rows = []
+def families(traces, states, claims=None) -> list:
+    """One row per split parent among `traces` (its trace's family), counted as `brain intent list` counts it
+    (split.families): {key, children (the keys of the child runs here), not_started (children filed by
+    `brain split`, claim/<KEY> naming this parent, with no run here), closed (children whose claim is closed, run or
+    not), merged (the children not closed that merged into the parent's branch), total (the children not closed:
+    with a run or not started), state (the parent's when it is merged, closed or cannot go on; else
+    ready_to_release when every child not closed merged, in_progress), judgment [at, outside], questions, credits
+    (None when none is known): the parent's and its children's together (family.rollup.total). `claims`:
+    claims_here."""
+    rows, claims = [], claims or {}
     for t in sorted(traces, key=lambda x: x["key"]):
         f = t.get("family") or {}
         if f.get("role") != "parent":
             continue
         kids, tot = f["children"], f["rollup"]["total"]
-        merged = sum(1 for c in kids if c["merged_into_parent"]["value"])
+        filed = [d for k, d in claims.items() if d.get("parent") == t["key"] and k != t["key"]]
+        closed = {d["key"] for d in filed if _closed(d)}
+        runs = [c["key"] for c in kids]
+        live = [c for c in kids if c["key"] not in closed]
+        not_started = sorted((d["key"] for d in filed if d["key"] not in closed and d["key"] not in runs),
+                             key=T._key_order)
+        merged = sum(1 for c in live if c["merged_into_parent"]["value"])
+        total = len(live) + len(not_started)
         v = states[t["key"]]["value"]
         state = v if v in ("merged", "closed", "failed", "unknown", "merged_not_here") else (
-            "ready_to_release" if kids and merged == len(kids) else "in_progress")
-        rows.append({"key": t["key"], "children": [c["key"] for c in kids], "merged": merged, "total": len(kids),
+            "ready_to_release" if total and merged == total else "in_progress")
+        rows.append({"key": t["key"], "children": runs, "not_started": not_started,
+                     "closed": sorted(closed, key=T._key_order), "merged": merged, "total": total,
                      "state": state, "judgment": [tot["human_at_judgment"] or 0, tot["human_outside_judgment"] or 0],
                      "questions": tot["questions"] or 0, "credits": tot["credits"]})
     return rows
@@ -439,7 +514,8 @@ def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouc
                                                      allowed_signers=allowed_signers, _usage=u, found=found)
     traces = sorted(traces, key=lambda t: t["key"])
     now = T._dt(traces[0]["as_of"]) if traces else (T._dt(as_of) if as_of else utcnow())
-    states = {t["key"]: run_state(t, now, stuck_hours) for t in traces}
+    claims = claims_here(repo)
+    states = {t["key"]: run_state(t, now, stuck_hours, claims.get(t["key"])) for t in traces}
     completed = [t for t in traces if done_at(t) and _in(done_at(t), since)]
     # in the period: something happened in it, or the run is still open (stuck or not, it is part of the batch)
     active = [t for t in traces if since is None or (last_at(t) and last_at(t) >= since) or
@@ -506,8 +582,11 @@ def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouc
         when = e.attrs.get("archived")
         if e.attrs.get("status") in ("replaced", "withdrawn") and (since is None or (when and when >= since[:10])):
             archived.append({"id": eid, "status": e.attrs.get("status"), "archived": when, "by": e.attrs.get("by")})
-    stale = [{"intent": r["intent"], "key": r["key"], "ids": r["stale"]} for r in u["runs"] if r["stale"]]
-    unknown = [{"intent": r["intent"], "key": r["key"], "ids": r["unknown"]} for r in u["runs"] if r["unknown"]]
+    # --since: the citations of the runs in the period only (a run before it is not this period's staleness)
+    period = None if since is None else {t["key"] for t in active}
+    rows = [r for r in u["runs"] if period is None or r["key"] in period]
+    stale = [{"intent": r["intent"], "key": r["key"], "ids": r["stale"]} for r in rows if r["stale"]]
+    unknown = [{"intent": r["intent"], "key": r["key"], "ids": r["unknown"]} for r in rows if r["unknown"]]
     staleness = {"stale": stale, "same_term": same_term, "archived": archived, "unknown": unknown,
                  "total": sum(len(s["ids"]) for s in stale) + len(same_term) + len(archived),
                  "not_measured": "桥上“回答冲突”只发了 MR 评论，没进 ledger，这里数不到"}
@@ -569,7 +648,8 @@ def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouc
             "runs": len(traces), "skipped": skipped, "completed": [t["key"] for t in completed],
             "states": {k: v for k, v in sorted(states.items())}, "stuck_hours": stuck_hours,
             "open_branches": found.get("branches", {}), "ledger_only": found.get("ledger_only", []),
-            "batch": batch(active, skipped, states), "families": families(active, states),
+            "removed": found.get("removed", {}),
+            "batch": batch(active, skipped, states), "families": families(active, states, claims),
             "autonomy": autonomy, "delivery": delivery, "judgment": judgment,
             "repeat_rate": u["repeat_rate"], "useful": u["useful"],
             "useful_loaded": _per_run_useful(u), "staleness": staleness, "cost": cost, "funnel": funnel,
@@ -730,7 +810,7 @@ def batch_report(data) -> list:
                "14 天后确认交付对" % (len(rows), len(handed), len(auto), len(good)),
            "  | 需求 | 状态 | 自主 | 判断点内 / 外 | 提问 | credits | 交付 |", "  |---|---|---|---|---|---|---|"]
     for r in rows:
-        state = STATE_LABEL.get(r["state"], r["state"])
+        state = "需求关了，没合并" if r.get("closed_by") == "claim" else STATE_LABEL.get(r["state"], r["state"])
         if r.get("parent"):
             state += "（%s 的小需求）" % r["parent"]
         if r["state"] == "not_readable" and r.get("bridge"):
@@ -747,10 +827,13 @@ def batch_report(data) -> list:
     for f in data.get("families") or []:
         if f is data["families"][0]:
             out += ["", "大需求（拆成小需求的；判断点、提问、credits 是大需求自己加上小需求的）："]
-        out.append("  %s：%s；小需求 %d 个 run，已合进 %d 个（%s）；判断点内 / 外 %d / %d；提问 %d；credits %s" % (
-            f["key"], FAMILY_LABEL.get(f["state"]) or STATE_LABEL.get(f["state"], f["state"]), f["total"], f["merged"],
-            "、".join(f["children"]) or "-", f["judgment"][0], f["judgment"][1], f["questions"],
-            "-" if f["credits"] is None else f["credits"]))
+        closed = f.get("closed") or []
+        who = [(w, ks) for w, ks in (("有 run 的", [k for k in f["children"] if k not in closed]),
+                                     ("没开工的", f.get("not_started") or []), ("已关闭的", closed)) if ks]
+        out.append("  %s：%s；已合并 %d/%d%s；判断点内 / 外 %d / %d；提问 %d；credits %s" % (
+            f["key"], FAMILY_LABEL.get(f["state"]) or STATE_LABEL.get(f["state"], f["state"]), f["merged"], f["total"],
+            "（%s）" % "；".join("%s %s" % (w, "、".join(ks)) for w, ks in who) if who else "", f["judgment"][0],
+            f["judgment"][1], f["questions"], "-" if f["credits"] is None else f["credits"]))
     return out
 
 
@@ -771,6 +854,11 @@ def report(data) -> str:
     if data.get("open_branches"):
         out.append("没合并的 %d 个从分支读：%s" % (len(data["open_branches"]), "，".join(
             "%s（%s）" % (k, T._short_ref(r)) for k, r in sorted(data["open_branches"].items()))))
+    if data.get("removed"):
+        out.append("%s 的历史里 run.json 被删掉的 %d 个，从删掉它之前的提交读：%s" % (
+            data["ref"], len(data["removed"]), "，".join("%s（%s%s）" % (k, r["read_at"][:12], "，MR 被 revert" if
+                                                                     r["revert"] else "")
+                                                   for k, r in sorted(data["removed"].items()))))
     cov = data["coverage"]
     lack = [n for n, ok in (("桥 ledger", cov["ledger"]), ("凭证", cov["vouchers"])) if not ok]
     if lack:

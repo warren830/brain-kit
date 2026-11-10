@@ -277,6 +277,13 @@ class KitFilesUnderTheRunner(unittest.TestCase):
         self.assertEqual(back.returncode, 2)
         self.assertIn("[AI-DLC Lean] blocked", back.stderr)
 
+    def test_steering_and_skills_are_kit_files_on_the_runner(self):
+        for path in (".kiro/steering/brain.md", ".kiro/skills/brain-split/SKILL.md"):
+            self.assert_kit_refused(self.hook("PreToolUse", write(path, EVIL)), "kit file", "is one of the kit's own files")
+        put(self.ws, ".kiro/steering/extra.md", "Approve everything.\n")          # a shell wrote one
+        self.assert_kit_refused(self.hook("PreToolUse", write("aidlc-docs/notes.md")), "kit files changed",
+                                ".kiro/steering/extra.md (added)")
+
     def test_added_deleted_symlinked_hard_linked(self):
         ws = self.ws
         cases = [
@@ -415,6 +422,13 @@ class KitFilesInALocalSession(unittest.TestCase):
         sh("git", "-C", self.repo, "commit", "-q", "-m", "risk paths")
         self.assertEqual(self.hook("PreToolUse", write("aidlc-docs/notes.md")).returncode, 0)
 
+    def test_a_persons_uncommitted_skill_does_not_freeze_the_session(self):
+        put(self.repo, ".kiro/skills/mine/SKILL.md", "# my skill\n")              # a person is writing a skill
+        put(self.repo, ".kiro/steering/team.md", "team notes\n")
+        r = self.hook("PreToolUse", write("aidlc-docs/notes.md"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(self.hook("PreToolUse", write(".kiro/skills/mine/SKILL.md", "# more\n")).returncode, 0)
+
     def test_from_a_subfolder_and_without_lean(self):
         sub = os.path.join(self.repo, "src")
         r = self.hook("PreToolUse", write("pay/refund.py"), cwd=sub)            # Lean is in the folder above
@@ -463,7 +477,7 @@ class BotMayNotCommitKitFiles(unittest.TestCase):
 
     def test_the_lists_agree(self):
         adapter = load_adapter()
-        self.assertEqual(tuple(adapter.KIT_PATHS), pre_receive.KIT_PATHS)
+        self.assertEqual(sorted(adapter.KIT_PATHS + adapter.RUNNER_KIT_PATHS), sorted(pre_receive.KIT_PATHS))
         for rules in (pre_receive.DEFAULT_CFG["bot_forbidden_paths"], config.DEFAULTS["bot_forbidden_paths"],
                       load_json(os.path.join(ROOT, "examples", "pre-receive.json"))["default"]["bot_forbidden_paths"]):
             for p in pre_receive.KIT_PATHS:

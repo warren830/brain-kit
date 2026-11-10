@@ -74,6 +74,12 @@ from .common import BRANCH_RE, JIRA_RE, USER_RE, ZERO_SHA, BrainError, git, iso,
 SCHEMA = 1
 WINDOW_DAYS = 14
 STAGE_STATE = {"STAGE_STARTED": "started", "STAGE_COMPLETED": "done", "STAGE_SKIPPED": "skipped"}
+# Lean 0.3's optional phases (aidlc_lean.py PHASES, IDEATION_STAGES, IDEATION_REQUIRED): a whole phase skipped is one
+# PHASE_SKIPPED {phase, stages, reason} record
+PHASE_NAMES = {"ideation": "Ideation", "operations": "Operations"}
+IDEATION_IDS = ("intent-capture", "market-research", "feasibility", "scope-definition", "team-formation",
+                "rough-mockups", "approval-handoff")
+IDEATION_REQUIRED = ("intent-capture", "scope-definition", "approval-handoff")
 LEAN_APPROVALS = ("IDEATION", "REQUIREMENTS", "DESIGN", "INCEPTION", "PLAN", "RELEASE")
 ACCEPT_WHAT = ("RELEASE", "acceptance")
 VOUCHER_RE = re.compile(r"(?<![0-9A-Za-z])V-[0-9a-f]{10}(?![0-9a-f])")
@@ -138,11 +144,16 @@ def audit_labels(paths) -> dict:
 
 
 def _utc(s):
-    """Any ISO time (Lean ms + Z, git +08:00) -> YYYY-MM-DDTHH:MM:SSZ; a bare date stays a date; junk -> None."""
+    """Any ISO time (Lean ms + Z, git +08:00) -> YYYY-MM-DDTHH:MM:SSZ; a bare date stays a date; junk, and a day that
+    does not exist (2026-02-30, 2026-13-01), -> None."""
     if not isinstance(s, str) or not s.strip():
         return None
     s = s.strip()
     if DATE_RE.match(s):
+        try:
+            datetime.strptime(s, "%Y-%m-%d")
+        except ValueError:
+            return None
         return s
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -268,20 +279,57 @@ def _data(e) -> dict:
     return d if isinstance(d, dict) else {}
 
 
-def stages_of(events) -> list:
-    rows = {}
-    for e in events:
-        if e.get("event") not in STAGE_STATE:
-            continue
+def ideation_in_use(events) -> bool:
+    """Lean 0.3's rule (aidlc_lean.py Project.ideation_in_use): an Ideation stage has a start or done record newer
+    than the last phase skip of Ideation (with no phase skip: any start or done record)."""
+    used = skip = -1
+    for k, e in enumerate(events):
         d = _data(e)
-        sid = str(d.get("stage") or "?") + ("/" + str(d["unit"]) if d.get("unit") else "")
-        row = rows.setdefault(sid, {"id": sid, "first_at": e["_at"], "times": {}})
-        st = STAGE_STATE[e["event"]]
+        if e.get("event") == "PHASE_SKIPPED" and d.get("phase") == "ideation":
+            skip = k
+        elif e.get("event") in ("STAGE_STARTED", "STAGE_COMPLETED") and d.get("stage") in IDEATION_IDS:
+            used = k
+    return used > skip
+
+
+def stages_of(events) -> list:
+    """Each stage's last state (done / skipped / started), by Lean 0.3's rule (aidlc_lean.py stage_event): the
+    stage's own last STAGE_* record, or a later PHASE_SKIPPED {phase, stages, reason} that covered it (`lean new`
+    without --ideation, `lean stage skip ideation|operations`; the row's `phase_skipped` names the phase). Once
+    Ideation is in use again, its phase skips no longer count, and a stage Ideation needs (IDEATION_REQUIRED) that was
+    skipped on its own before has no record until it is started or done. Rows in the order of their first record;
+    the stages of one phase skip in Lean's order."""
+    in_use = ideation_in_use(events)
+    rows = {}
+
+    def put(sid, st, note, e, phase=None, pos=0):
+        row = rows.setdefault(sid, {"id": sid, "first_at": e["_at"], "times": {},
+                                    "_order": (0, pos, "") if phase else (1, 0, sid)})
         row["times"][st] = row["times"].get(st, 0) + 1
-        note = d.get("note") if e["event"] == "STAGE_COMPLETED" else d.get("reason") if e["event"] == "STAGE_SKIPPED" \
-            else None
         row.update(state=st, at=e["_at"], note=scrub(note) if isinstance(note, str) else None, src=e["_src"])
-    return sorted(rows.values(), key=lambda r: (r["first_at"] or "", r["id"]))
+        if phase:
+            row["phase_skipped"] = phase
+        else:
+            row.pop("phase_skipped", None)
+
+    for e in events:
+        ev, d = e.get("event"), _data(e)
+        if ev in STAGE_STATE:
+            sid = str(d.get("stage") or "?") + ("/" + str(d["unit"]) if d.get("unit") else "")
+            put(sid, STAGE_STATE[ev], d.get("note") if ev == "STAGE_COMPLETED" else d.get("reason")
+                if ev == "STAGE_SKIPPED" else None, e)
+        elif ev == "PHASE_SKIPPED" and d.get("phase") in PHASE_NAMES and isinstance(d.get("stages"), list) and \
+                not (d["phase"] == "ideation" and in_use):
+            for pos, sid in enumerate(s for s in d["stages"] if isinstance(s, str) and s):
+                put(sid, "skipped", d.get("reason"), e, d["phase"], pos)
+    if in_use:
+        for sid in IDEATION_REQUIRED:
+            if rows.get(sid, {}).get("state") == "skipped":
+                del rows[sid]
+    out = sorted(rows.values(), key=lambda r: (r["first_at"] or "",) + r["_order"])
+    for r in out:
+        del r["_order"]
+    return out
 
 
 def checks_of(events, tree, intent) -> dict:
@@ -770,6 +818,28 @@ def _ancestry(log, sha) -> set:
     return seen
 
 
+def fresher_than_worktree(repo, rp, hist):
+    """{"head", "read", "note"} when the working tree is behind what the run's history is read at (hist["tip"]: the
+    freshest copy of its branch, or the copy that merged): HEAD is an ancestor of that commit and not the commit
+    itself (the owner's checkout stopped at the hand-over; fetched, not pulled). The run is then read where a clone
+    without that checkout reads it: the default branch once it merged there (when its run.json is there), else that
+    commit (by the ref that names it). None: the working tree is read."""
+    tip, head = hist.get("tip"), _commit(repo, "HEAD")
+    if not tip or not head or head == tip or not _ancestor(repo, head, tip):
+        return None
+    src = hist.get("tip_src")
+    cands = [(hist["default_ref"], "the default branch: the run merged")] if hist.get("merge") and \
+        hist.get("default_ref") else []
+    cands.append((src if isinstance(src, str) and src.startswith("refs/") and _commit(repo, src) == tip else tip,
+                  src or "the run's last commit"))
+    for r, why in cands:
+        if r and _show(repo, r, rp) is not None:
+            label = r if r != tip else tip[:12]
+            return {"head": head, "read": r, "note": "HEAD %s is behind %s (%s): the run is read there, not from the "
+                    "working tree (its uncommitted changes are not read)" % (head[:12], label, why)}
+    return None
+
+
 def git_history(repo, cfg, rec, ref, key, refs=None, target=None):
     """Commits of the run branch, the hand-over commit, the merge, park.json history. `target` (a split child):
     (the parent's run branch name, the ref or commit it is read at, or None): the run's own commits are judged against
@@ -1117,15 +1187,31 @@ def proposals_of(text, path) -> dict:
 
 # ---------- bridge ledger and vouchers ----------
 
+def open_ledger(path):
+    """The bridge ledger (sqlite), opened read-only. BrainError when it is not there, is a directory, or is not a
+    sqlite database (sqlite only finds that out at the first query: one is made here)."""
+    if not os.path.exists(path):
+        raise BrainError("bridge ledger %s not found" % path)
+    if os.path.isdir(path):
+        raise BrainError("bridge ledger %s is a directory: give the ledger file itself (the bridge's ledger.sqlite)"
+                         % path)
+    db = None
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(path)), uri=True)
+        db.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.DatabaseError as e:
+        if db is not None:
+            db.close()
+        raise BrainError("bridge ledger %s is not a sqlite database (%s)" % (path, e))
+    db.row_factory = sqlite3.Row
+    return db
+
+
 def ledger_rows(path, key, shas=()):
     """The bridge ledger's rows for this requirement: its runs (a run id reserved while a hand-over is signed,
     state 'signing', is not a run yet), the hand-over checks of their MRs and of the commits in `shas` (the run's
     `brain handoff` commits: a refused hand-over has no run), and the runs' decisions."""
-    if not os.path.exists(path):
-        raise BrainError("bridge ledger %s not found" % path)
-    uri = "file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(path))
-    db = sqlite3.connect(uri, uri=True)
-    db.row_factory = sqlite3.Row
+    db = open_ledger(path)
     try:
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         runs = [dict(r) for r in db.execute(
@@ -1823,6 +1909,12 @@ def _build(repo, cfg, key, ref, ledger_path, vouchers_dir, credits, as_of, allow
     hist = git_history(repo, cfg, rec, ref, key, refs, target=target[:2] if target else None) if branch else {
         "tip": None, "tip_src": None, "tip_note": None, "default_ref": default_ref(repo, cfg, ref, refs), "merge": None,
         "commits": None, "range": None, "handover_commit": None, "park": None, "requests": [], "_log": [], "_rp": rp}
+    stale = fresher_than_worktree(repo, rp, hist) if ref is None else None
+    if stale:      # the owner's old checkout of the run branch: read what any other clone reads (docs/eval.md §2)
+        t = _build(repo, cfg, key, stale["read"], ledger_path, vouchers_dir, credits, as_of, allowed_signers, None,
+                   _cache)
+        t["src"]["working_tree"] = stale
+        return t
     if hist["tip"] is None:
         missing.append("run branch %s (not found locally, on origin, or as a merge on the default branch)"
                        % branch)
@@ -2242,6 +2334,10 @@ def render(t) -> str:
         out.append("Lean 日志：" + "；".join("%s %d 条 %s" % (os.path.basename(p), c["records"],
                                                            "链完好" if c["chain"] == "ok" else c["chain"])
                                          for p, c in sorted(chains.items())))
+    wt = t["src"].get("working_tree")
+    if wt:
+        out.append("工作区（HEAD %s）比 %s 旧：读的是那里，工作区里没提交的改动不算" % (
+            wt["head"][:12], wt["read"] if wt["read"].startswith("refs/") else wt["read"][:12]))
     g = t["src"]["git"]
     if g.get("tip_note"):
         out.append("分支：用的是 %s；%s" % (g["tip_src"], g["tip_note"]))
@@ -2250,7 +2346,16 @@ def render(t) -> str:
         mark = {"done": "x", "skipped": "S", "started": "-"}
         out.append("")
         out.append("阶段：")
-        out += ["  [%s] %s · %s" % (mark[s["state"]], s["id"], s["at"] or "-") for s in t["stages"]]
+        said = set()
+        for s in t["stages"]:
+            ph = s.get("phase_skipped")
+            if not ph:
+                out.append("  [%s] %s · %s" % (mark[s["state"]], s["id"], s["at"] or "-"))
+            elif s["src"] not in said:          # a phase skipped whole: one line for the record, as Lean shows it
+                said.add(s["src"])
+                n = sum(1 for x in t["stages"] if x.get("phase_skipped") and x["src"] == s["src"])
+                out.append("  [S] %s（整段跳过 %d 个阶段：%s）· %s" % (PHASE_NAMES.get(ph, ph), n, s["note"] or "-",
+                                                             s["at"] or "-"))
     c = t["checks"]
     if c and c["verify"]:
         out.append("verify：%d 次，失败 %d 次；最后一次 %s" % (len(c["verify"]), c["verify_failed"],

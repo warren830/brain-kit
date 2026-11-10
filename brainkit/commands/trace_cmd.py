@@ -53,13 +53,16 @@ def common_args(s, suppress=False):
 def ref_for(repo, cfg, key, ref):
     """What to read: --ref (or the working tree) when run.json is there; when it is not and --ref is not given or
     names the default branch (`--ref origin/main` for a run not merged yet), the run branch `brain eval` reads
-    (evaluate.run_branches); else --ref as given (the trace says what is missing)."""
+    (evaluate.run_branches), or, when there is none, the commit before the one that took run.json off that history
+    (GitLab's Revert of the whole MR, its branch deleted: evaluate.removed_runs); else --ref as given (the trace says
+    what is missing)."""
     if T.Tree(repo, ref).read("%s/%s/run.json" % (cfg["runs_dir"], key)) is not None:
         return ref
     if ref and T._short_ref(ref) != cfg["default_branch"]:
         return ref
     from .. import evaluate as EV
-    return EV.run_branches(repo, cfg).get(key) or ref
+    return EV.run_branches(repo, cfg).get(key) or (EV.removed_runs(repo, cfg, ref).get(key) or {}).get("read_at") \
+        or ref
 
 
 def cmd_trace(a):

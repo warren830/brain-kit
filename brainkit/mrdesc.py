@@ -15,8 +15,10 @@ Sources (working tree, or --ref)
   release.md          operations/release.md: Open items
   decisions.md        the decision table (Who in the fixed vocabulary), brain-proposal and brain-gap blocks
   park.json           runs/<KEY>/park.json: the question the run is waiting on
-  git                 the diff against the merge base with the default branch (runs/<KEY>/MR.md itself left out);
-                      gates/risk-paths from the default branch; DESIGN coverage by brainkit.ci (signed vouchers)
+  git                 the diff against the merge base with the default branch (runs/<KEY>/MR.md itself left out; a
+                      split child: its parent's branch; read where the run merged: the diff that merge brought in);
+                      gates/risk-paths from the default branch; DESIGN coverage by brainkit.ci (signed vouchers);
+                      a split child's own lines of decisions.md and requirements.md (git blame, as brain trace)
   run trace           brainkit.trace.build(), when it works: Brain citations that are archived or unknown, credits
 Current code: Lean's own code fingerprint (Lean's Project.fingerprint(), run in a subprocess) against the one the
 latest verify recorded; with --ref, the files changed since the verify's commit.
@@ -83,6 +85,13 @@ PLAN_RE = re.compile(r"^(.+)-code-generation-plan\.md$")
 AC_ID_RE = re.compile(r"(?<![A-Za-z0-9-])((?:AC|BR)-[1-9][0-9]{0,3})(?![0-9])")
 ITEM_RE = re.compile(r"^\s*(?:[-*]|[0-9]+[.)])\s+(\S.*)$")
 SEVERITY = (("critical", "严重"), ("high", "高"), ("medium", "中"), ("low", "低"))
+# a review.md finding's state, from its Status column or the start of its Fix cell (Lean's release skill: "finding,
+# severity, file:line, fix"; "Fix what matters ... and note the remaining items"): open is read first ("not fixed")
+REVIEW_OPEN_RE = re.compile(r"(?i)^\W*(?:open|todo|to do|pending|not (?:yet )?fixed|unfixed|won'?t fix|wontfix|deferred|"
+                            r"no)\b|^\W*(?:未修|没修|还没修|待修|未解决|没解决|未改|没改|不修|暂不修|待定)")
+REVIEW_FIXED_RE = re.compile(r"(?i)^\W*(?:fixed|resolved|done|closed|addressed|yes)\b|"
+                             r"^\W*(?:已修|修了|修好|已改|改了|已解决|已处理|已完成)")
+NO_FIX = ("", "-", "—", "–", "n/a", "none", "无", "没有")
 
 
 # ---------- text: from a record into one inert Markdown line ----------
@@ -489,7 +498,8 @@ def _approval_sha(tree, path):
 
 
 def _doc_state(events, tree, path) -> dict:
-    """missing | draft | requested | approved | stale | rejected, as Lean's approval_state and pending_request."""
+    """missing | draft | requested | approved | stale | rejected, as Lean's approval_state and pending_request
+    (_approvals() tells a requirements.md that is still the template from a draft)."""
     cur = _approval_sha(tree, path)
     if cur is None:
         return {"state": "missing", "event": None}
@@ -510,9 +520,27 @@ def _doc_state(events, tree, path) -> dict:
     return {"state": "draft", "event": None}
 
 
-def _channel(d) -> str:
+def _claimed(d) -> bool:
+    """Did the approval line claim a channel (`(via gitlab …)`, as the bridge's do)? Without one it was typed in a
+    local Lean chat."""
     c = d.get("claimed_channel")
-    return "经 %s" % _one(c, 80) if isinstance(c, str) and c.strip() else "本地会话"
+    return isinstance(c, str) and bool(c.strip())
+
+
+def _channel(d) -> str:
+    return "经 %s" % _one(d["claimed_channel"], 80) if _claimed(d) else "本地会话"
+
+
+def ideation_in_use(events) -> bool:
+    """Lean's Project.ideation_in_use: a start or done record of an Ideation stage newer than the last phase skip of
+    Ideation (`lean new` without --ideation, `lean stage skip ideation`); `events`: the intent's, oldest first."""
+    used = skip = -1
+    for k, e in enumerate(events):
+        if e.get("event") == "PHASE_SKIPPED" and _d(e).get("phase") == "ideation":
+            skip = k
+        elif e.get("event") in ("STAGE_STARTED", "STAGE_COMPLETED") and _d(e).get("stage") in IDEATION_IDS:
+            used = k
+    return used > skip
 
 
 def _approvals(events, tree, docs, plans, lcfg, req) -> dict:
@@ -531,8 +559,8 @@ def _approvals(events, tree, docs, plans, lcfg, req) -> dict:
     stage = lambda sid: next((e for e in reversed(events) if e.get("event") in STAGE_STATE  # noqa: E731
                               and _d(e).get("stage") == sid), None)
     need = [("REQUIREMENTS", None, "%s/%s" % (docs, REQ_DOC))]
-    if any(e.get("event") in STAGE_STATE and _d(e).get("stage") in IDEATION_IDS for e in events):
-        need.insert(0, ("IDEATION", None, "%s/%s" % (docs, IDEATION_DOC)))     # Ideation used (not PHASE_SKIPPED)
+    if ideation_in_use(events):
+        need.insert(0, ("IDEATION", None, "%s/%s" % (docs, IDEATION_DOC)))
     skipped = stage("application-design")
     if skipped and skipped["event"] == "STAGE_SKIPPED" and (req or {}).get("size") == "small":
         design_skipped = True
@@ -548,7 +576,10 @@ def _approvals(events, tree, docs, plans, lcfg, req) -> dict:
         st = _doc_state(events, tree, path) if path else {"state": "missing", "event": None}
         if st["state"] == "approved":
             continue
-        missing.append({"kind": kind, "unit": unit, "state": st["state"], "who": APPROVER[kind],
+        state = st["state"]
+        if kind == "REQUIREMENTS" and state == "draft" and req is not None and not req["written"]:
+            state = "template"          # Lean's template as `lean new` wrote it: there, but not written yet
+        missing.append({"kind": kind, "unit": unit, "state": state, "who": APPROVER[kind],
                         "sha": str(_covered_sha(_d(st["event"]), path) or "")[:8] or None if st["event"] else None})
     released = _doc_state(events, tree, "%s/%s" % (docs, RELEASE_DOC))
     return {"recorded": recorded, "missing": missing, "design_skipped": design_skipped,
@@ -589,14 +620,28 @@ def _open_items(text) -> list:
     return [x for x in _items(_section(_sections(text or ""), "open items")) if not x.startswith("(")]
 
 
+def _finding_state(cells, fix, status) -> str:
+    """fixed | open | unmarked (a fix written, or no Fix column, and nothing says whether it was made)."""
+    st = cells[status].strip() if status is not None else ""
+    if st:
+        return "open" if REVIEW_OPEN_RE.match(st) else "fixed" if REVIEW_FIXED_RE.match(st) else "unmarked"
+    if fix is None:
+        return "unmarked"
+    f = cells[fix].strip().strip("*`").strip()
+    if f.lower() in NO_FIX or REVIEW_OPEN_RE.match(f):
+        return "open"
+    return "fixed" if REVIEW_FIXED_RE.match(f) else "unmarked"
+
+
 def _review(text):
     if text is None:
         return None
-    counts, top, total = {}, [], 0
+    counts, top, total, states, high = {}, [], 0, {}, {}
     for header, rows in _tables(text):
         s, f = _col(header, "severity", "严重"), _col(header, "finding", "发现", "问题")
         if s is None and f is None:
             continue
+        fix, status = _col(header, "fix", "修"), _col(header, "status", "状态")
         for cells in rows:
             if not any(c.strip() for c in cells):
                 continue
@@ -604,19 +649,25 @@ def _review(text):
             sev = cells[s].strip().lower() if s is not None else ""
             label = next((zh for en, zh in SEVERITY if en in sev or zh in sev), "其他")
             counts[label] = counts.get(label, 0) + 1
-            if label in ("严重", "高") and f is not None and len(top) < LIMIT["findings"]:
-                top.append({"severity": label, "finding": _one(cells[f], 100)})
+            state = _finding_state(cells, fix, status)
+            states[state] = states.get(state, 0) + 1
+            if label in ("严重", "高"):
+                high[state] = high.get(state, 0) + 1
+                if f is not None and len(top) < LIMIT["findings"]:
+                    top.append({"severity": label, "finding": _one(cells[f], 100), "state": state})
         break
     notes = [x.strip() for x in re.sub(r"<!--.*?-->", "", text, flags=re.S).split("\n")
              if x.strip() and not x.lstrip().startswith(("#", "|", "```"))]
-    return {"findings": total, "by_severity": counts, "top": top, "summary": [_one(x, 160) for x in notes[:2]]}
+    return {"findings": total, "by_severity": counts, "by_state": states, "high": high, "top": top,
+            "summary": [_one(x, 160) for x in notes[:2]]}
 
 
-def _decisions(text, bot_users, acs) -> list:
+def _decisions(text, bot_users, acs, lines=None) -> list:
+    """decisions.md rows; `lines` (a split child): only the rows on these line numbers (its own)."""
     out = []
     for n, row in T.decision_rows(text or ""):
         did, dec = row.get("id", "").strip("`* "), row.get("decision", "")
-        if not re.match(r"^D-[1-9][0-9]*$", did) or not dec.strip():
+        if not re.match(r"^D-[1-9][0-9]*$", did) or not dec.strip() or (lines is not None and n not in lines):
             continue
         by, who = T.classify_who(row.get("who"), bot_users)
         whole = " ".join(v for k, v in row.items() if k != "id")
@@ -646,12 +697,31 @@ def _who_text(d) -> str:
     return "没按约定写（第 %d 行）" % d["line"]
 
 
-def _cites(tree, docs) -> list:
+def _cites(tree, docs, unit=None) -> list:
+    """Brain ids cited in the intent's pages (outside proposal blocks); `unit` (a split child): only its unit's
+    pages, as brainkit.usage gives them to it (the other pages are the parent's)."""
     found = set()
     for path in tree.files(docs):
-        if path.endswith(".md"):
+        if path.endswith(".md") and (unit is None or usage.page_unit(path[len(docs) + 1:]) == unit):
             found.update(usage.CITE_RE.findall(usage.strip_proposals(tree.read(path) or "")))
     return sorted(found)
+
+
+def _own_commits(repo, tr, base, tree) -> set:
+    """A split child's own commits: the ones its trace found; without a trace, those since the fork point with the
+    parent's branch (`base`); none when neither is known."""
+    commits = ((tr or {}).get("actions") or {}).get("commits") if isinstance(tr, dict) else None
+    if isinstance(commits, list):
+        return {c["sha"] for c in commits if isinstance(c, dict) and isinstance(c.get("sha"), str)}
+    tip = tree.commit or _commit(repo, "HEAD")
+    p = git(repo, "rev-list", tip, "^" + base, check=False) if base and tip else None
+    return set(p.stdout.split()) if p is not None and p.returncode == 0 else set()
+
+
+def _own_assumptions(text, lines) -> list:
+    """The assumptions A-n on these line numbers of requirements.md (a split child's own)."""
+    kept = [x if n in lines or not T.ASSUMPTION_RE.match(x) else "" for n, x in enumerate(text.split("\n"), 1)]
+    return (_requirements("\n".join(kept)) or {}).get("assumptions", [])
 
 
 # ---------- git: what the MR changes ----------
@@ -663,23 +733,63 @@ def _default_ref(repo, cfg):
     return None
 
 
-def _changes(repo, cfg, key, tree, base, label=None):
-    """(changes, why not): the diff from the merge base with the default branch to the tip, by top-level folder."""
+MERGE_HOW = (("squash", "压缩合并"), ("rebase", "变基合并"), ("fast-forward", "快进合并"), ("merge commit", "合并提交"))
+
+
+def _landed(repo, cfg, rec, key, ref, into):
+    """The run as it merged into `into` (a ref; cfg["default_branch"] is its branch name): {"base", "tip", "commit",
+    "how"} of the diff that merge brought in, found as brain trace finds a merge (trace.landing: a merge commit,
+    fast-forward, rebase or squash), or None when it is not found there."""
+    branch = rec.get("branch") if plain(rec.get("branch")) else None
+    intent = rec.get("intent") if isinstance(rec.get("intent"), str) else None
+    try:
+        refs = T._refs(repo)
+        land = T.landing(repo, cfg, into, key, intent, branch, T.copies_of(repo, branch, ref, refs), refs)
+    except (BrainError, OSError, ValueError, KeyError, TypeError, IndexError):
+        return None
+    m = (land or {}).get("merge")
+    if not m or not m.get("commit"):
+        return None
+    own = m.get("own") if isinstance(m.get("own"), list) and m["own"] else None
+    if own:                                        # its commits on the line (fast-forward, rebase, squash)
+        b, t = (T._parents(repo, own[0]) or [None])[0], own[-1]
+    elif len(T._parents(repo, m["commit"])) >= 2:  # a merge commit: what it brought onto its first parent
+        b, t = T._parents(repo, m["commit"])[0], m["commit"]
+    else:
+        b, t = (land.get("exclude") or [None])[0], land.get("tip") or m["commit"]
+    if not b or not t:
+        return None
+    how = next((zh for en, zh in MERGE_HOW if en in str(m.get("how"))), "合并")
+    return {"base": b, "tip": t, "commit": m["commit"], "how": how, "into": into}
+
+
+def _changes(repo, cfg, key, tree, base, rec=None, into=None):
+    """(changes, why not): the diff from the merge base with the default branch (`into`: (its cfg, the ref), a split
+    child's parent's branch) to the tip, by top-level folder. A tip already on that branch is a run that merged: the
+    diff that merge brought in."""
     tip = tree.commit or _commit(repo, "HEAD")
     dref = _default_ref(repo, cfg)
+    merged = None
     if base:
         b = _commit(repo, base)
         if not b:
             raise BrainError("--base %s is not a commit here" % base)
-        label = label or "%s（%s）" % (_one(base, 60), b[:12])
+        label = "%s（%s）" % (_one(base, 60), b[:12])
     else:
-        if not dref:
+        icfg, iref = into or (cfg, dref)
+        if not iref:
             return None, "找不到 %s（也没有 origin/%s），没法算改了什么" % (cfg["default_branch"], cfg["default_branch"])
-        p = git(repo, "merge-base", tip, dref, check=False)
+        p = git(repo, "merge-base", tip, iref, check=False)
         b = p.stdout.strip()
         if p.returncode != 0 or not b:
-            return None, "和 %s 没有共同的提交，没法算改了什么" % dref
-        label = "%s 的分叉点 %s" % (dref, b[:12])
+            return None, "和 %s 没有共同的提交，没法算改了什么" % iref
+        label = "%s 的分叉点 %s" % (iref, b[:12])
+        if b == tip:            # the records are read from where the run merged (`--ref origin/main`)
+            merged = _landed(repo, icfg, rec or {}, key, tree.ref, iref)
+            if not merged:
+                return None, "%s 已经在 %s 上，找不到它是怎么合进去的，没法算改了什么" % (tree.label, iref)
+            b, tip = merged["base"], merged["tip"]
+            label = "合进 %s 之前的 %s（%s %s）" % (iref, b[:12], merged["how"], merged["commit"][:12])
     mr = "%s/%s/%s" % (cfg["runs_dir"], key, MR_FILE)
     p = subprocess.run(["git", "-C", repo, "diff", "--no-renames", "--no-ext-diff", "-z", "--numstat", b, tip, "--",
                         ".", ":(exclude)" + mr], capture_output=True)
@@ -722,7 +832,8 @@ def _changes(repo, cfg, key, tree, base, label=None):
     risk = _risk(repo, cfg, tree, dref, [f for f, _, _ in files])
     code = [{"path": _one(f, 120), "added": a, "deleted": x} for f, a, x in sorted(files)
             if kinds.get(f.split("/", 1)[0] if "/" in f else "") is None]
-    return {"base": b, "base_label": label, "tip": tip, "files": len(files), "code_files": len(code),
+    return {"base": b, "base_label": label, "tip": tip, "merged": {k: merged[k] for k in ("commit", "how", "into")}
+            if merged else None, "files": len(files), "code_files": len(code),
             "code": code[:50],
             "added": sum(a for _, a, _ in files if a), "deleted": sum(d for _, _, d in files if d),
             "groups": order, "uncommitted": uncommitted, "risk": risk, "brain_touched": cfg["brain_dir"] in groups,
@@ -792,6 +903,16 @@ def _design_cover(repo, cfg, rec, key, tree, ch, events, docs, approvals, vouche
                 "short": "没有能覆盖它的设计批准，CI 会拦"}
     st = _doc_state(events, tree, design)
     e = st["event"]
+    if st["state"] in ("approved", "stale") and not _claimed(_d(e)):
+        # approved in a local Lean chat: no bridge voucher comes of it, and CI's brain-run-check counts only those
+        h = str(_covered_sha(_d(e), design) or "")[:8]
+        later = "" if st["state"] == "approved" else "，之后设计又改了"
+        how = ("小需求在 MR 上拿不到桥签的 DESIGN 批准：要改这些路径就不拆，或者让大需求自己改" if rec.get("parent") else
+               "在 MR 上问：park.json 写 lean_request DESIGN …")
+        return {"state": "lean_local", "design": h,
+                "text": "Lean 记了 DESIGN %s 的批准，但只是在本地会话里批的%s；CI 的 brain-run-check 不认它，只认桥签过的 "
+                        "DESIGN 批准，没有就会拦（%s）" % (h, later, how),
+                "short": "DESIGN %s 只在本地批过%s，CI 不认（要桥签的批准）" % (h, later)}
     if st["state"] in ("approved", "stale"):
         return {"state": "lean_" + st["state"], "design": str(_covered_sha(_d(e), design) or "")[:8],
                 "text": "Lean 记了 DESIGN %s 的批准（%s）%s；签名本机没核对（CI 的 brain-run-check 会核对）" % (
@@ -841,14 +962,14 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
                   "target_branch": _one(rec.get("target_branch"), 100) if plain(rec.get("target_branch")) else None}
     clone = rec.get("lean_clone") if family and re.match(r"^[0-9a-f]{6}$", str(rec.get("lean_clone") or "")) else None
     own = _events(tree, intent, clone) if intent and clone else events     # the child's own clone: verify, stage
-    base_label = None
+    into, fork = None, None      # a child: diffed against its parent's branch (its MR's target), from the fork
     if family and base is None and family["target_branch"]:
         tip = tree.commit or _commit(repo, "HEAD")
         for r in ("origin/" + family["target_branch"], family["target_branch"]):
             tref = _commit(repo, r)
             mb = git(repo, "merge-base", tip, tref, check=False).stdout.strip() if tref and tip else ""
             if mb:
-                base, base_label = mb, "%s 的分叉点 %s" % (r, mb[:12])
+                into, fork = (dict(cfg, default_branch=family["target_branch"]), r), mb
                 break
 
     req = _requirements(tree.read("%s/%s" % (docs, REQ_DOC))) if docs else None
@@ -900,7 +1021,7 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
                                                  else ac["given"] or ac["then"], 60),
                     "tests": shown, "result": result})
 
-    ch, why_no_changes = _changes(repo, cfg, key, tree, base, base_label)
+    ch, why_no_changes = _changes(repo, cfg, key, tree, base, rec=rec, into=into)
     if why_no_changes:
         missing.append(why_no_changes)
     elif not ch["files"]:
@@ -915,16 +1036,6 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
                                              allowed_signers) if docs else {"state": "unknown",
                                                                             "text": "没有 Lean intent，查不了设计批准"}
 
-    dec_text = tree.read("%s/%s" % (docs, DECISIONS_DOC)) if docs else None
-    decisions = _decisions(dec_text, cfg.get("bot_users") or [], {a["id"] for a in acs})
-    proposals, pprobs = reflect.parse(dec_text or "")
-    gaps, gprobs = reflect.parse_gaps(dec_text or "")
-    release_text = tree.read("%s/%s" % (docs, RELEASE_DOC)) if docs else None
-    review = _review(tree.read("%s/%s" % (docs, REVIEW_DOC))) if docs else None
-    if docs and review is None and plans:
-        missing.append("还没有评审（review.md）")
-    park = _park(tree.raw("%s/%s/park.json" % (cfg["runs_dir"], key)))
-
     tr, tr_err = None, None
     try:
         tr = T.build(repo, cfg, key, ref=ref, credits=credits)
@@ -936,6 +1047,30 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
     cost = (tr or {}).get("cost") if isinstance((tr or {}).get("cost"), dict) else {}
     if tr_err:
         missing.append("run trace 没读出来（%s）：Brain 引用只按 Lean 记录算" % tr_err)
+
+    dec_path = "%s/%s" % (docs, DECISIONS_DOC) if docs else None
+    dec_text = tree.read(dec_path) if docs else None
+    req_path = "%s/%s" % (docs, REQ_DOC) if docs else None
+    # a split child: decisions.md and requirements.md are the intent's, shared with its parent and siblings; it
+    # keeps the lines its own commits wrote (git blame), as brain trace does
+    lines = {}
+    if family and docs:
+        mine = _own_commits(repo, tr, base or fork, tree)
+        for path in (dec_path, req_path):
+            if tree.raw(path) is not None:
+                lines[path] = T.owned_lines(repo, tree, path, mine, set(), branch, set())
+    dec_lines = lines.get(dec_path)
+    decisions = _decisions(dec_text, cfg.get("bot_users") or [], {a["id"] for a in acs}, dec_lines)
+    proposals, pprobs = reflect.parse(T._only(dec_text, dec_lines) or "")
+    gaps, gprobs = reflect.parse_gaps(T._only(dec_text, dec_lines) or "")
+    assumptions = (req or {}).get("assumptions", [])
+    if req is not None and lines.get(req_path) is not None:
+        assumptions = _own_assumptions(tree.read(req_path), lines[req_path])
+    release_text = tree.read("%s/%s" % (docs, RELEASE_DOC)) if docs else None
+    review = _review(tree.read("%s/%s" % (docs, REVIEW_DOC))) if docs else None
+    if docs and review is None and plans:
+        missing.append("还没有评审（review.md）")
+    park = _park(tree.raw("%s/%s/park.json" % (cfg["runs_dir"], key)))
 
     stage = _stage(own)
     waiting = None
@@ -951,7 +1086,7 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
         "title": _one((req or {}).get("title") or next((_d(e).get("title") for e in events
                                                          if e.get("event") == "INTENT_CREATED"), None) or intent,
                       80) or None,
-        "where": {"stage": stage, "handed_over": bool(handoff),
+        "where": {"stage": stage, "handed_over": bool(handoff), "merged": (ch or {}).get("merged"),
                   "handoff_at": handoff.get("requested_at") if handoff and plain(handoff.get("requested_at")) else None,
                   "waiting": waiting, "released": approvals["released"]},
         "size": (req or {}).get("size"),
@@ -963,13 +1098,14 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
         "verify": dict(v, current=current, why=why) if v else None,
         "changes": ch,
         "decisions": decisions,
-        "assumptions": [{"id": a["id"], "text": _one(a["text"], 160)} for a in (req or {}).get("assumptions", [])],
+        "assumptions": [{"id": a["id"], "text": _one(a["text"], 160)} for a in assumptions],
         "open_items": [_one(x, 160) for x in _open_items(release_text)],
         "release_written": release_text is not None,
         "park": park,
         "approvals": approvals,
         "review": review,
-        "brain": {"cited": _cites(tree, docs) if docs else [], "stale": list(tb.get("stale") or []),
+        "brain": {"cited": _cites(tree, docs, rec["unit"] if family else None) if docs else [],
+                  "stale": list(tb.get("stale") or []),
                   "unknown": list(tb.get("unknown") or []),
                   "proposals": [{"file": _one(p.fields.get("file"), 20), "type": _one(p.fields.get("type"), 20),
                                  "rel": _one(p.rel + (" " + p.target if p.target else ""), 40),
@@ -1021,10 +1157,11 @@ def _pointers(d) -> list:
     lost = [a["id"] for a in d["acceptance"] if any(t["file_exists"] is False for t in a["tests"])]
     if lost:
         out.append("%s 的测试文件不在仓库里：计划的 Tests 表和代码对不上" % _ids(lost))
-    rv = d["review"]
-    high = sum((rv or {}).get("by_severity", {}).get(k, 0) for k in ("严重", "高"))
-    if high:
-        out.append("评审还有 %d 条高严重度发现（review.md）" % high)
+    high = (d["review"] or {}).get("high") or {}
+    if high.get("open"):
+        out.append("评审还有 %d 条高严重度发现没修（review.md）" % high["open"])
+    elif high.get("unmarked"):
+        out.append("评审有 %d 条高严重度发现，review.md 没写修了没有：确认修了" % high["unmarked"])
     if d["brain"]["stale"] or d["brain"]["unknown"]:
         out.append("引用了%s的 Brain 条目 %s：确认不是过时或写错的号" % (
             "已归档" if d["brain"]["stale"] else "Brain 里没有", _ids(d["brain"]["stale"] or d["brain"]["unknown"])))
@@ -1047,8 +1184,14 @@ def render(d) -> str:
     w = d["where"]
     st = w["stage"]
     now = ["Lean 在%s%s%s" % ("「%s」" % st["name"], "（%s）" % st["unit"] if st["unit"] else "", st["state"])
-           if st else "Lean 还没开始阶段",
-           "已交给团队运行机" if w["handed_over"] else "在本地开发（还没交接）"]
+           if st else "Lean 还没开始阶段"]
+    if w["handed_over"]:
+        now.append("已交给团队运行机")
+    if w.get("merged"):
+        now.append("已合进 `%s`（%s %s）" % (_one(w["merged"]["into"], 100), w["merged"]["how"],
+                                         w["merged"]["commit"][:12]))
+    elif not w["handed_over"]:
+        now.append("在本地开发（还没交接）")
     if w["released"]:
         now.append("RELEASE 已批")
     elif w["waiting"]:
@@ -1187,7 +1330,7 @@ def render(d) -> str:
         if ap["missing"]:
             items = []
             for m in ap["missing"]:
-                t = {"draft": "写了，还没请求审批", "requested": "已请求 %s，等%s批" % (m["sha"] or "?", m["who"]),
+                t = {"draft": "写了，还没请求审批", "template": "还是模板，还没写", "requested": "已请求 %s，等%s批" % (m["sha"] or "?", m["who"]),
                      "stale": "批过，之后文件改了", "rejected": "被驳回了",
                      "missing": MISSING_DOC.get(m["kind"], "文件还没有")}[m["state"]]
                 items.append("%s%s（%s）" % (m["kind"], "·%s" % _one(m["unit"], 30) if m["unit"] else "", t))
@@ -1198,12 +1341,16 @@ def render(d) -> str:
     if rv:
         out += ["", "### 评审"]
         if rv["findings"]:
-            out.append("- review.md：%d 条发现（%s）" % (rv["findings"], "、".join(
+            bs = rv["by_state"]
+            done = "，都修了" if bs.get("fixed") == rv["findings"] else "".join(
+                x % bs[k] for k, x in (("fixed", "，修了 %d 条"), ("open", "，没修 %d 条")) if bs.get(k))
+            out.append("- review.md：%d 条发现（%s）%s" % (rv["findings"], "、".join(
                 "%s %d" % (k, rv["by_severity"][k]) for k in ("严重", "高", "中", "低", "其他")
-                if rv["by_severity"].get(k))))
+                if rv["by_severity"].get(k)), done))
         else:
             out.append("- review.md 里没有发现表")
-        out += ["- %s：%s" % (t["severity"], t["finding"]) for t in rv["top"]]
+        out += ["- %s：%s%s" % (t["severity"], t["finding"], {"fixed": "（修了）", "open": "（没修）"}.get(t["state"], ""))
+                for t in rv["top"]]
         out += ["- %s" % s for s in rv["summary"]]
 
     # Brain

@@ -46,7 +46,7 @@ brain golden summarize results.json --tasks tasks
 | 部分 | 内容 | 来源 |
 |---|---|---|
 | 基本 | key、intent、owner、branch、brain_commit、run_ids | `runs/<KEY>/run.json`；run 号来自 ledger 和凭证 |
-| stages | 每个阶段最后的状态（done / skipped / started）、时间、说明 | Lean 审计日志 `aidlc-docs/audit/*.jsonl`；每个文件的哈希链都核对，断了会写出来 |
+| stages | 每个阶段最后的状态（done / skipped / started）、时间、说明。Lean 0.3 整段跳过 Ideation 或 Operations 时只记一条 PHASE_SKIPPED（`lean new` 不带 `--ideation`、`lean stage skip ideation\|operations`），它列出的阶段都是 skipped，说明是跳过的原因，`phase_skipped` 写是哪一段（文字摘要里一段一行）。规则和 Lean 一样：阶段自己更晚的记录算数；Ideation 又用上以后（它的某个阶段在最后一次整段跳过之后开始或做完了），之前的整段跳过不算，之前单独跳过的必需阶段（intent-capture、scope-definition、approval-handoff）也不算 | Lean 审计日志 `aidlc-docs/audit/*.jsonl`；每个文件的哈希链都核对，断了会写出来 |
 | actions | 提交（人还是机器人、在交接前还是后）、被 Lean 拦下的调用、会话和回合数、交接、run 停下来问的问题 | git；Lean 日志；run.json；ledger；凭证；`park.json` 的每个版本 |
 | decisions | decisions.md 的每一行、需求页里的假设 A-n、桥上的问答 | `decisions.md`、`requirements.md`、ledger、凭证 |
 | checks | 每次 verify：时间、过没过、哪条命令失败 | Lean 日志的 VERIFY；`build-and-test-summary.md` |
@@ -59,7 +59,7 @@ brain golden summarize results.json --tasks tasks
 
 下面是 trace 读 git 的全部规则。每条都有测试（`tests/test_qa_r2_trace.py`、`tests/test_qa_r3_trace.py`、`tests/test_qa_r4_trace.py`，测试类名、测试名或说明里带规则号）。说法里：main = 默认分支（有 `origin/main` 用它，没有用本地的）；分支 = run.json 里的 `branch`；KEY = 需求号；运行机 = kit.json 的 `bot_emails`；**S** = main 的第一父链上第一个带进 `runs/<KEY>/run.json` 的提交。
 
-**读哪一份分支**：分支可能有几份：本地的 `refs/heads/<分支>`、origin 的 `refs/remotes/origin/<分支>`，或者 `--ref <分支>` 给的。没合并时取新的那份（包含另一份的那份）；两份分叉了，用 origin 的。合并了以后读"合并进去的那份"（下面的 M1–M6）。用不上的那几份写进 `src.git.tip_note`：旧了、合并后又有提交、分叉了。所以负责人自己机器上那份停在交接时的旧分支，不会把交接后的事丢掉，结果和没有这个分支的机器一样。
+**读哪一份分支**：分支可能有几份：本地的 `refs/heads/<分支>`、origin 的 `refs/remotes/origin/<分支>`，或者 `--ref <分支>` 给的。没合并时取新的那份（包含另一份的那份）；两份分叉了，用 origin 的。合并了以后读"合并进去的那份"（下面的 M1–M6）。用不上的那几份写进 `src.git.tip_note`：旧了、合并后又有提交、分叉了。所以负责人自己机器上那份停在交接时的旧分支，不会把交接后的事丢掉，结果和没有这个分支的机器一样。不给 `--ref` 时读工作区；工作区的 HEAD 比这个 run 要读的那份旧时（HEAD 是那份的祖先：负责人停在交接时的旧分支上，或者 fetch 了没 pull），run.json、Lean 记录、park.json、决策和小需求也都改从那份读（合并了的、main 上有它的 run.json 时从 main 读），和别的机器一样；`src.working_tree` 写明（`head`、`read`、`note`），工作区里没提交的改动这时不算。
 
 **怎么认合并**（不问 GitLab）。按顺序看，第一条对上的就是：
 
@@ -115,17 +115,18 @@ brain golden summarize results.json --tasks tasks
 
 ## 3. 指标
 
-**E1 哪些需求**：`brain eval` 读三处，一个需求只算一次：
+**E1 哪些需求**：`brain eval` 读四处，一个需求只算一次：
 
 1. 读的那棵树（工作区或 `--ref`）里的 `runs/<KEY>/run.json`：在 main 上读，就是已经合并的；
 2. 这里的 run 分支（本地的和 origin 的 `ai/<人>/<KEY>-<名字>`）里，上面没有的需求：没合并的 run，从它的分支读（几份里取新的那份，和第 2 节"读哪一份分支"一样；一个需求有几个分支时，取 tip 有 run.json、而且最后提交的那个；别的分支上的 run 按 H0 列在 `other_runs`）。报告开头写"没合并的 n 个从分支读"，JSON 的 `open_branches`。`brain trace KEY` 不给 `--ref`、或者 `--ref` 是默认分支（`--ref origin/main`），那里又没有它的 run.json 时，读的也是这个分支；
 3. 给了 `--ledger` 时，ledger 里有 run、这里却读不到 run.json 的需求（分支没 fetch、MR 关了分支也删了）：列在 `skipped`（带它在 ledger 里的状态，`ledger_only`），也进下面那张表，报告第一行写"另有 n 个只在桥上"。桥签交接凭证时先占的 run 号（ledger 的状态是 `signing`）还不是 run，哪里都不算。
+4. 读的那棵树的历史（`--ref`，或工作区的 HEAD）里有过、后来被它第一父链上的一个提交删掉的 `runs/<KEY>/run.json`，上面几处都没有的需求：从删掉它之前的那个提交读（最后一次删的那个提交的第一个父提交）。最常见的是 GitLab 上把整个 MR Revert 了，源分支合并时又删了：不这样，这个交付错了的 run 会从交付正确率的分母里消失。合并和 14 天里的回滚照常从 main 认。JSON 的 `removed`（`read_at`、`removed_in`、`revert`：删它的是不是回滚提交），报告开头写一行。`brain trace KEY` 不给 `--ref`、或者 `--ref` 是默认分支时，也从那里读。
 
 `--credits` 只给了一条没有键的记录、需求却不止一个时（只在桥上的也算），不知道是谁的，不算给任何一个。
 
 **期内**（`--since`）：最后一次有动静（阶段、人做的事、决策、提交、合并或验收的时间，和 `outcome.last_activity`：ledger 里 run 的行变了（MR 关了、运行机失败）、凭证）在期内的 run；没合并、没关的 run 不管 `--since` 都算（E3）。
 
-**E2 状态**（JSON 的 `states`）：`merged` 已合并；`merged_not_here` ledger 说合并了，这里的 main 没有；`closed` MR 关了、没合并；`failed` 运行机没能开始（ledger 是 failed：brain-runnerd 失败）；`unknown` ledger 的状态以 `_unknown` 结尾（`send_unknown`：桥不知道派单成没成）；`answered` 有了回答、run 没接着做：run 分支上的 park.json 现在还是 waiting，可桥上已经有了这个问题的回答（决策是 delivered 已送到 run，或 answered 正在签名、发送，或 delivery_unknown 送达不明），谁都不用再答，是运行机（或桥）没往下走（`outcome.answered`：`decision`、`state`、`choice`、`at`、`kind`、`ask`、`lean_request`、`since`、`src`；这时 `outcome.waiting_on` 是 null）；`waiting` 在等回答（park.json 现在是 waiting、这个问题还没有人答，或者桥上的问题还开着；`outcome.waiting_on` 的 `ask` 是 park.json 问的谁）；`accepted` 验收过了、还没合并；`open` 进行中。"这个问题"的回答 = 桥在这个 park.json（它最近一次被问起的那个提交）或它之后的 MR head 上问的决策；签名服务拒签（`refused`）的回答没送到 run，不算回答。没合并、没关、没失败的 run，最后一次有动静（提交、Lean 记录、park 问题、ledger 里这个 run 的行、凭证；`outcome.last_activity`）离 `--as-of` 超过 `--stuck-hours`（默认 24 小时）的，算停住了（`stuck`）。
+**E2 状态**（JSON 的 `states`）：`merged` 已合并；`merged_not_here` ledger 说合并了，这里的 main 没有；`closed` MR 关了、没合并，或者小需求的需求单关了（`brain intent close`，和 `brain intent list` 一样算关了：`closed_by` 是 `claim`，不算在做，也不算停住）；`failed` 运行机没能开始（ledger 是 failed：brain-runnerd 失败）；`unknown` ledger 的状态以 `_unknown` 结尾（`send_unknown`：桥不知道派单成没成）；`answered` 有了回答、run 没接着做：run 分支上的 park.json 现在还是 waiting，可桥上已经有了这个问题的回答（决策是 delivered 已送到 run，或 answered 正在签名、发送，或 delivery_unknown 送达不明），谁都不用再答，是运行机（或桥）没往下走（`outcome.answered`：`decision`、`state`、`choice`、`at`、`kind`、`ask`、`lean_request`、`since`、`src`；这时 `outcome.waiting_on` 是 null）；`waiting` 在等回答（park.json 现在是 waiting、这个问题还没有人答，或者桥上的问题还开着；`outcome.waiting_on` 的 `ask` 是 park.json 问的谁）；`accepted` 验收过了、还没合并；`open` 进行中。"这个问题"的回答 = 桥在这个 park.json（它最近一次被问起的那个提交）或它之后的 MR head 上问的决策；签名服务拒签（`refused`）的回答没送到 run，不算回答。没合并、没关、没失败的 run，最后一次有动静（提交、Lean 记录、park 问题、ledger 里这个 run 的行、凭证；`outcome.last_activity`）离 `--as-of` 超过 `--stuck-hours`（默认 24 小时）的，算停住了（`stuck`）。
 
 | 指标 | 怎么算 | 现在量不到的 |
 |---|---|---|
@@ -134,7 +135,7 @@ brain golden summarize results.json --tasks tasks
 | 介入落在判断点的比例 | 落在判断点上的人工介入 ÷ 全部人工介入。判断点 = Lean 的审批口令（批准、驳回、没被接受的口令）和桥上的 park 问题。别的都算判断点之外：交接后人往 ai/* 的提交、"允许改测试"、KiroCrew 上手动停止或重启 | 方案里"复盘也认定确实需要人判断"这一半要人看。git 不记推送，用"交接后人的提交"代替。手动停止和重启要 KiroCrew app 传进来才有 |
 | 重复纠正率 | correction 条目的 repeats 合计 ÷（correction 条目数 + repeats 合计），目标趋近 0 | 和 `brain usage` 一样 |
 | 知识有用率 | 被引用过的条目 ÷ 现有条目；另给每个 run 引用数之和 ÷ 装载数之和 | 只认 Lean 记录里写出的条目号 |
-| 过时与冲突 | 过时引用（开工时已归档的条目还被引用）+ lint 的"同一个术语定义了两次" + 本期被覆盖或撤回的条目 | 桥上"两个人回答不一样"只发了 MR 评论，没进 ledger，数不到 |
+| 过时与冲突 | 过时引用（开工时已归档的条目还被引用；给了 `--since` 时只算期内的 run 的）+ lint 的"同一个术语定义了两次" + 本期被覆盖或撤回的条目 | 桥上"两个人回答不一样"只发了 MR 评论，没进 ledger，数不到 |
 | credits | 完成的 run 花的 credits 合计 ÷ 正确交付数。只用来诊断，不设上限 | **token 数量不到**：经 Kiro 跑模型，KiroCrew 只给 credits，input、output、cache 的 token 数都是 0。credits 也读不到，要 KiroCrew app 传进来 |
 
 **决策漏斗**：期内的每一条决策，按"谁定的"归一类，每条只算一次，也按周（ISO 周）列：
@@ -167,8 +168,8 @@ Who 的写法是运行机提示词（`remote/prompts/brain-run.md` 第 5 节）�
 
 - 小需求和大需求共用一个 Lean intent。小需求的 trace 只读它自己 worktree 的 Lean 账本（run.json 的 `lean_clone`），提交按合进大需求的分支来认；`merged_at` 还是合进 main 的时间。另有 `family.merged_into_parent`：它 `brain handoff` 时在 run.json 记的 `mr` 和它分支上的提交都到了大需求的分支（`intents.child_merged`；只有 run.json 不算，从它分支开工的兄弟也带着它）。
 - 大需求的 trace 去掉小需求的账本和提交。`family` 里列每个小需求的数（做完的阶段、verify 次数和失败次数、机器人和人的提交、被拦次数、判断点内外的人工介入、决策、问题、credits），`rollup.total` 是大需求自己加所有小需求；哪个数谁都不知道，就是 null。decisions.md、requirements.md 的行按 `git blame` 分给写它的那个 run。
-- 状态多一个 `merged_into_parent`（已合进大需求，等大需求进 main）：不算停住。大需求的空闲时间按全家最后一次动静算。
-- `batch` 每个需求照旧一行，小需求多一个 `parent`。`families` 每个大需求一行：小需求、已合并 n/m、状态、判断点内外的人工介入合计、问题合计、credits 合计。报告里多一段"大需求"。没有拆分的仓库，`families` 是空列表，别的不变。
+- 状态多一个 `merged_into_parent`（已合进大需求，等大需求进 main）：不算停住。需求单关了的小需求是 `closed`（见 E2）。大需求的空闲时间按全家最后一次动静算。
+- `batch` 每个需求照旧一行，小需求多一个 `parent`。`families` 每个大需求一行：小需求、已合并 n/m、状态、判断点内外的人工介入合计、问题合计、credits 合计。n/m 和 `brain intent list` 一样数：m 是没关的小需求，`brain split` 记的需求单（`claim/<KEY>` 写着这个大需求）有、这里还没有 run 的也算（`not_started`）；需求单关了的不算（`closed`），n 是其中已合进大需求分支的。`children` 还是这里有 run 的小需求。都合并了（n = m）才是 `ready_to_release`（等大需求评审和发布）。需求单读这里已有的（origin 的那份，没有就用本地的），不 fetch。报告里多一段"大需求"。没有拆分的仓库，`families` 是空列表，别的不变。
 - `brain usage`：有小需求的 intent，每个 run 一行；单元自己的页面（`construction/<单元>/`、它的代码计划）算那个小需求的，别的页面（包括 decisions.md）算大需求的。
 
 **缺口**（`brain eval gaps`）：
@@ -215,9 +216,10 @@ Who 的写法是运行机提示词（`remote/prompts/brain-run.md` 第 5 节）�
   - 像真密钥的（其他的值，以及私钥、云访问密钥、令牌）：整个拒绝，快照不留，报错里只写路径和规则名。考题的 base_sha 是定死的，换不了 commit 时，确认这些是测试用的假值、或者本来就要轮换，可以加 `--mask-secrets`：密钥和密码都打码（同上），带私钥的文件整个去掉（列在 `removed`），清单写 `"override": "mask-secrets"`，命令在 stderr 打一行 WARN。这是要人明确选的，不会自动发生；
 - 消融变体：`full`、`no-PRODUCT`、`no-TECH`、`no-IMPROVEMENT`，从快照里删掉对应的 Brain 文件和它的 archive。PROJECT 没有消融变体；
 - 消融时，这块知识在别处的副本也删（清单的 `scrubbed` 里列出），只删去掉的那个文件（和它的 archive）里的条目号，按整个号比（`T-PAY-1-2` 不会碰到 `T-PAY-1-20`，也不会碰到别的文件或示例里的 `T-PAY-88-1`）：
+  - Brain 里留下的文件（`IMPROVEMENT.md`、`PRODUCT.md` 等和它们的 archive）：引用了它条目号的条目整条删（条目头的 `src`、`rel` 里写着它也算），条目外引用了它完整条目号的行也删；
   - run 的文档里（`aidlc-docs/**`、`runs/**`，即 `decisions.md`、`reflect-proposals.md` 等）：`file:` 是这个文件（或 `rel` 指向它的条目）的 `brain-proposal` 块、引用了它条目号的块，以及其他引用它条目号的行（决策表里的行）；
   - 别的 Markdown 文件里：只删引用了它完整条目号（`T-PAY-1-2`）的行，不删块；
-  - 老式的短号（`T-1`）也常是普通的词（"每天 T-1 日的交易"），只在 run 的文档里、写成引用的样子时才算：`` `T-1` ``、`(T-1)`、`[T-1]`、`（T-1，T-2）`、`per T-1`；
+  - 老式的短号（`T-1`）也常是普通的词（"每天 T-1 日的交易"），只在 run 的文档和 Brain 的条目里、写成引用的样子时才算：`` `T-1` ``、`(T-1)`、`[T-1]`、`（T-1，T-2）`、`per T-1`；
   - 指令文件一个字都不改，每个变体的 agent 拿到的说明都一样：`.kiro/**`（`brain install` 装的 steering、skill，Lean）、`.claude/**`、`.cursor/**`、`.github/**`、`AGENTS.md`、`CLAUDE.md`、`GEMINI.md`。
   - **还会漏的**：代码和测试本身（注释、常量就是这条规则的实现）、需求文档和 `runs/<KEY>/intent.md`、`requirements.md` 里原样写着这条规则但没带条目号的文字、Lean 审计记录（`aidlc-docs/audit/*.jsonl`）、`AGENTS.md` 和指令文件里的抄写和引用、别的文档里写成短号的引用、模型本来就知道的常识。所以"没掉分"只说明这些都不在时 agent 也能做对，不一定说明这条知识没用；
 - 快照的清单只返回给调用方，不写进快照，AI 看不到自己考的是哪个变体。

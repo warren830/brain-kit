@@ -27,7 +27,7 @@ DEFAULTS = {
     # what bot commits may not change (pre_receive.KIT_PATHS, the kit's own files, are refused whatever this says)
     "bot_forbidden_paths": ["gates/", "project-agent.yaml", ".brain/", "CODEOWNERS", ".gitlab/", ".gitlab/CODEOWNERS",
                             "docs/CODEOWNERS", ".gitlab-ci.yml", "ci/", ".kiro/brain/", ".kiro/agents/",
-                            ".kiro/hooks/", ".kiro/aidlc-lean/"],
+                            ".kiro/hooks/", ".kiro/aidlc-lean/", ".kiro/steering/", ".kiro/skills/"],
     "claim_statuses": ["In Progress", "进行中"],
     "model": "claude-opus-5.5",
     "review_model": "kimi-k3",

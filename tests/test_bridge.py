@@ -127,7 +127,7 @@ class BridgeTest(unittest.TestCase):
                          "committer_name": cn, "committer_email": ce}
 
         def graphql(m, qy, body):
-            # GitLab GraphQL: an MR's notes with lastEditedAt / lastEditedBy, shaped as measured on gitlab.aws.dev
+            # GitLab GraphQL: an MR's notes with lastEditedAt / lastEditedBy, shaped as measured on a self-managed GitLab
             # (2026-11-09): lastEditedAt follows updated_at (creation time when untouched, moved by an award emoji
             # too); lastEditedBy names the editor only for a text edit (here: the body is not what was posted,
             # unless a test says who edited it).

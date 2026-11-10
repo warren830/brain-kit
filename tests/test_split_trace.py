@@ -272,15 +272,15 @@ class Fixture(unittest.TestCase):
         self.assertEqual((rows["PAY-2"]["parent"], rows["PAY-3"]["parent"]), ("PAY-1", "PAY-1"))
         self.assertNotIn("parent", rows["PAY-1"])
         self.assertNotIn("parent", rows["PAY-5"])
-        self.assertEqual(d["families"], [{"key": "PAY-1", "children": ["PAY-2", "PAY-3"], "merged": 1, "total": 2,
-                                          "state": "in_progress", "judgment": [2, 1], "questions": 0,
-                                          "credits": 4.5}])
+        self.assertEqual(d["families"], [{"key": "PAY-1", "children": ["PAY-2", "PAY-3"], "not_started": [],
+                                          "closed": [], "merged": 1, "total": 2, "state": "in_progress",
+                                          "judgment": [2, 1], "questions": 0, "credits": 4.5}])
         # every trace is made once: the children's in the family are the ones eval lists
         by = {t["key"]: t for t in d["traces"]}
         self.assertEqual(by["PAY-1"]["family"]["children"][0]["numbers"], trace.numbers(by["PAY-2"]))
         text = EV.report(d)
         self.assertIn("已合进大需求（PAY-1 的小需求）", text)
-        self.assertIn("  PAY-1：小需求在做；小需求 2 个 run，已合进 1 个（PAY-2、PAY-3）；判断点内 / 外 2 / 1；提问 0；"
+        self.assertIn("  PAY-1：小需求在做；已合并 1/2（有 run 的 PAY-2、PAY-3）；判断点内 / 外 2 / 1；提问 0；"
                       "credits 4.5", text)
         # the funnel and the judgment metric count each act once
         self.assertEqual(d["judgment"]["value"], [2, 3])
@@ -574,8 +574,9 @@ class RealFamily(unittest.TestCase):
             self.assertEqual(set(d["open_branches"]), here)
             self.assertEqual({k: d["states"][k]["value"] for k in ("PAY-1", "PAY-2", "PAY-4")},
                              {"PAY-1": "open", "PAY-2": "merged_into_parent", "PAY-4": "open"})
-            self.assertEqual([(r["key"], r["children"], r["merged"], r["total"], r["judgment"])
-                              for r in d["families"]], [("PAY-1", ["PAY-2", "PAY-4"], 1, 2, [2, 0])])
+            # web (PAY-3) is filed by brain split, not started: one of the 3 (as brain intent list counts)
+            self.assertEqual([(r["key"], r["children"], r["not_started"], r["merged"], r["total"], r["judgment"])
+                              for r in d["families"]], [("PAY-1", ["PAY-2", "PAY-4"], ["PAY-3"], 1, 3, [2, 0])])
             self.assertEqual({r["key"]: r.get("parent") for r in d["batch"]},
                              {"PAY-1": None, "PAY-2": "PAY-1", "PAY-4": "PAY-1"})
         self.assertEqual(d["open_branches"]["PAY-2"], "refs/remotes/origin/ai/alice/PAY-1-big")

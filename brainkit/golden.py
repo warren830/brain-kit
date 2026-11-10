@@ -13,8 +13,9 @@ path lives under `hidden/` in the task dir and is copied to the same path withou
               remotes, no credential / env files or key stores, no keys or secret-looking password lines (dev
               defaults such as POSTGRES_PASSWORD: postgres are masked), no symlink that resolves outside; ablation
               variants drop one Brain file (and its archive) and the copies of its entries (their proposal blocks in
-              run documents, the lines citing their ids); instruction files stay the same in every variant. The
-              manifest is returned, never written into the snapshot, so the agent cannot learn its variant.
+              run documents, the entries of other Brain files and the lines citing their ids); instruction files
+              stay the same in every variant. The manifest is returned, never written into the snapshot, so the
+              agent cannot learn its variant.
   score()     apply the hidden tests, run the task's test command (scrubbed env), count passed / failed; a run in
               which no test ran is an error, not a 0.
   plan()      tasks x variants x repeats -> jobs.
@@ -347,14 +348,17 @@ def _instruction_file(rel) -> bool:
 
 def _scrub_ablated(root, brain_dir, fkey, ids, runs_dir="runs") -> list:
     """A Brain entry lives on outside its file: the run's brain-proposal block it came from and the decision rows
-    that cite its id stay in aidlc-docs/<intent>/decisions.md (and a reflector's runs/<KEY>/reflect-proposals.md).
-    In Markdown outside the Brain folder, drop the copies of the removed entries (`ids`, from the removed files):
+    that cite its id stay in aidlc-docs/<intent>/decisions.md (and a reflector's runs/<KEY>/reflect-proposals.md),
+    and an entry in another Brain file may restate it. Drop the copies of the removed entries (`ids`, from the
+    removed files) in Markdown:
+      - in the Brain files that stay (brain/IMPROVEMENT.md, ...): every entry that restates one, whole (_brain_copies);
       - in run documents (aidlc-docs/**, <runs_dir>/**): the brain-proposal blocks for `fkey` (file: <fkey>, a rel
         target in it, or citing one of `ids`) and every other line that cites one of `ids`;
       - elsewhere: only the lines that cite one of the full ids (T-PAY-1-2).
     An id counts as a whole token and only when it is one of `ids` (T-PAY-88-1 in an example is not). A legacy id
-    (T-1, also a trade date: T-1 日) counts only in run documents and only written as a citation: `T-1`, (T-1),
-    [T-1], per T-1. Instruction files (.kiro/**, AGENTS.md, ...) are never edited. Returns [{path, blocks, lines}]."""
+    (T-1, also a trade date: T-1 日) counts only in run documents and Brain entries, and only written as a citation:
+    `T-1`, (T-1), [T-1], per T-1 (or in an entry's src / rel). Instruction files (.kiro/**, AGENTS.md, ...) are never
+    edited. Returns [{path, blocks, lines}], with "entries" (the ids dropped) for a Brain file."""
     def alt(xs):
         return "|".join(re.escape(i) for i in sorted(xs))
     full = [i for i in ids if E.NEW_ID_RE.match(i)]
@@ -371,17 +375,25 @@ def _scrub_ablated(root, brain_dir, fkey, ids, runs_dir="runs") -> list:
     out = []
     for rel in _walk_files(root):
         p = os.path.join(root, *rel.split("/"))
-        if not rel.lower().endswith(".md") or rel.startswith(brain_dir + "/") or _instruction_file(rel) \
-                or os.path.islink(p) or os.path.getsize(p) > SCAN_MAX_BYTES:
+        if not rel.lower().endswith(".md") or _instruction_file(rel) or os.path.islink(p) \
+                or os.path.getsize(p) > SCAN_MAX_BYTES:
             continue
-        run_doc = rel.startswith(run_dirs)
-        if not run_doc and not full_re:
+        in_brain = rel.startswith(brain_dir + "/")
+        run_doc = not in_brain and rel.startswith(run_dirs)
+        if not run_doc and not in_brain and not full_re:
             continue
         with open(p, "rb") as fh:
             raw = fh.read()
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
+            continue
+        if in_brain:
+            drop, gone = _brain_copies(text, set(ids), cites)
+            if drop:
+                with open(p, "w", encoding="utf-8", newline="") as fh:
+                    fh.write("\n".join(_without(text.split("\n"), drop)))
+                out.append({"path": rel, "blocks": 0, "lines": len(drop), "entries": gone})
             continue
         if not cites(text, run_doc) and not (run_doc and "brain-proposal" in text):
             continue
@@ -413,6 +425,38 @@ def _entry_ids(path) -> set:
         return set()
     with open(path, encoding="utf-8", errors="replace") as fh:
         return {m.group(1) for m in (E.HEADER_RE.match(l) for l in fh.read().split("\n")) if m}
+
+
+def _brain_copies(text, ids, cites) -> tuple:
+    """In a Brain file that stays in the snapshot, what restates a removed entry: (line numbers, entry ids). An entry
+    goes whole (header and text: one line alone would leave half an entry) when it cites one of `ids`: a full id
+    anywhere in it, a legacy one written as a citation or named in its src / rel. So does a line outside entries
+    that cites a full id, as in any other Markdown file."""
+    lines = text.split("\n")
+    drop, gone, inside = set(), [], set()
+    for e in E.BrainFile("x.md", text).entries():
+        span = range(e.line - 1, e.line + len(e.body))
+        inside.update(span)
+        if set(e.src) & ids or set(e.rel[1].split()) & ids or any(cites(lines[n], True) for n in span):
+            drop.update(span)
+            gone.append(e.id)
+    drop.update(n for n, l in enumerate(lines) if n not in inside and cites(l, False))
+    return drop, gone
+
+
+def _without(lines, drop) -> list:
+    """`lines` without the numbers in `drop`; where lines were cut, a blank line right after another goes too, so
+    the file shows no gap."""
+    out, cut = [], False
+    for n, l in enumerate(lines):
+        if n in drop:
+            cut = True
+        elif cut and not l.strip() and (not out or not out[-1].strip()):
+            continue
+        else:
+            out.append(l)
+            cut = False
+    return out
 
 
 def _git_repo_above(path):
@@ -740,14 +784,15 @@ def oracle_answer(task, park):
                 break
     if hit is None:
         return None
+    # what the bridge takes (bridge/decisions.py check_answer): approve / reject (any letter case) for a Lean request
+    # or a question without options, else one of the options (the letter upper-cased)
     choice = answers[hit]
-    if lr:
-        allowed = {"approve", "reject"}
-    else:
-        allowed = {str(o.get("id")) for o in (park.get("options") or []) if isinstance(o, dict)}
+    choice = choice.lower() if choice.lower() in ("approve", "reject") else choice.upper()
+    options = {o.get("id") for o in ((park or {}).get("options") or []) if isinstance(o, dict)}
+    allowed = {"approve", "reject"} if lr or not options else options
     if choice not in allowed:
         raise BrainError("task %s: oracle answer %r (for %r) is not one of %s" % (
-            task.get("id"), choice, hit, ", ".join(sorted(allowed)) or "no options"))
+            task.get("id"), answers[hit], hit, ", ".join(sorted(str(x) for x in allowed))))
     return {"choice": choice, "matched": hit, "task": task.get("id"), "eval_oracle": True}
 
 
