@@ -489,7 +489,8 @@ def _approval_sha(tree, path):
 
 
 def _doc_state(events, tree, path) -> dict:
-    """missing | draft | requested | approved | stale | rejected, as Lean's approval_state and pending_request."""
+    """missing | draft | requested | approved | stale | rejected, as Lean's approval_state and pending_request
+    (_approvals() tells a requirements.md that is still the template from a draft)."""
     cur = _approval_sha(tree, path)
     if cur is None:
         return {"state": "missing", "event": None}
@@ -548,7 +549,10 @@ def _approvals(events, tree, docs, plans, lcfg, req) -> dict:
         st = _doc_state(events, tree, path) if path else {"state": "missing", "event": None}
         if st["state"] == "approved":
             continue
-        missing.append({"kind": kind, "unit": unit, "state": st["state"], "who": APPROVER[kind],
+        state = st["state"]
+        if kind == "REQUIREMENTS" and state == "draft" and req is not None and not req["written"]:
+            state = "template"          # Lean's template as `lean new` wrote it: there, but not written yet
+        missing.append({"kind": kind, "unit": unit, "state": state, "who": APPROVER[kind],
                         "sha": str(_covered_sha(_d(st["event"]), path) or "")[:8] or None if st["event"] else None})
     released = _doc_state(events, tree, "%s/%s" % (docs, RELEASE_DOC))
     return {"recorded": recorded, "missing": missing, "design_skipped": design_skipped,
@@ -1187,7 +1191,7 @@ def render(d) -> str:
         if ap["missing"]:
             items = []
             for m in ap["missing"]:
-                t = {"draft": "写了，还没请求审批", "requested": "已请求 %s，等%s批" % (m["sha"] or "?", m["who"]),
+                t = {"draft": "写了，还没请求审批", "template": "还是模板，还没写", "requested": "已请求 %s，等%s批" % (m["sha"] or "?", m["who"]),
                      "stale": "批过，之后文件改了", "rejected": "被驳回了",
                      "missing": MISSING_DOC.get(m["kind"], "文件还没有")}[m["state"]]
                 items.append("%s%s（%s）" % (m["kind"], "·%s" % _one(m["unit"], 30) if m["unit"] else "", t))
