@@ -510,10 +510,10 @@ class Brain:
         return eid
 
     def adds_to(self, eid, text, src, prop=None):
+        """The rel stays (like same and repeat): an entry new in this change stays rel:new, as lint wants."""
         f, e = self.get(eid)
         e.body = e.body + [""] + self._body(text)
         e.add_src(src)
-        e.attrs["rel"] = "adds-to"
         _add_prop(e, prop)
         self.dirty.add(f.name)
         return eid

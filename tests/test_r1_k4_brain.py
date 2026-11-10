@@ -69,6 +69,38 @@ class BrainRound1(unittest.TestCase):
         head = E.Brain({"TECH.md": b.files["TECH.md"].render(), E.PURGED_FILE: b.purged_text})
         self.assertEqual(errors(head, purge_approvers=["sec-lead"]), "")     # what the tool writes passes
 
+    def test_r1_72_entry_edits_of_an_unmerged_entry_agree_with_lint(self):
+        repo = git_repo(os.path.join(tmpdir(self), "r"))
+        commit_file(repo, ".brain/kit.json", json.dumps({"version": 1, "req_prefix": "OMS",
+                                                         "purge_approvers": ["sec-lead"]}))
+        commit_file(repo, "brain/TECH.md", TECH)
+        sh("git", "-C", repo, "switch", "-q", "-c", "brain/OMS-5-x")
+        rc, out = run_cli(repo, "entry", "add", "TECH", "pitfall", "--key", "OMS-5", "--src", "D-2", "--text", "new")
+        self.assertEqual(rc, 0, out)
+        rc, out = run_cli(repo, "entry", "adds-to", "T-OMS-5-1", "--src", "D-3", "--text", "and more")
+        self.assertEqual(rc, 0, out)
+        rc, out = run_cli(repo, "lint")
+        self.assertEqual(rc, 0, out)
+        tree = brain_files(repo)
+        for args in (("replace", "T-OMS-5-1", "--key", "OMS-5", "--src", "D-3", "--text", "better"),
+                     ("withdraw", "T-OMS-5-1", "--reason", "wrong", "--src", "D-3"),
+                     ("purge", "T-OMS-5-1", "--reason", "pii", "--approved-by", "sec-lead")):
+            rc, out = run_cli(repo, "entry", *args)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("not on main yet", out)
+            self.assertEqual(brain_files(repo), tree, args[0])              # nothing written
+        rc, out = run_cli(repo, "entry", "replace", "T-OMS-1-1", "--key", "OMS-5", "--src", "D-4", "--text", "two")
+        self.assertEqual(rc, 0, out)                                        # a merged entry: as before
+        rc, out = run_cli(repo, "lint")
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(repo, "brain", "TECH.md"), "a", encoding="utf-8") as f:
+            f.write("\n<!-- id:T-OMS-6-1 type:pitfall side:builder rel:adds-to src:D-5 -->\nhand-made\n")
+        tree = brain_files(repo)
+        rc, out = run_cli(repo, "entry", "same", "T-OMS-5-1", "--src", "D-6")
+        self.assertEqual(rc, 1, out)                                        # lint's base: no "written" lint refuses
+        self.assertIn("没有写入", out)
+        self.assertEqual(brain_files(repo), tree)
+
 
 if __name__ == "__main__":
     unittest.main()

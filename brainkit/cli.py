@@ -1284,6 +1284,15 @@ def cmd_entry(a):
         print("%s\n%s" % (hit[1].header(), "\n".join(hit[1].body)))
         return 0
     before = entries.Brain.load(bd)
+    base_ref = _default_base(repo, cfg)       # what brain lint and CI compare with
+    base = entries.Brain.from_git(repo, base_ref, cfg["brain_dir"]) if base_ref else before
+    if a.op in ("replace", "withdraw", "purge") and (a.id in before.main() or a.id in before.archived()) \
+            and a.id not in base.used_ids():
+        raise BrainError("%s was added in this change and is not on %s yet: %s only applies to merged entries (the "
+                         "archive and PURGED.md keep those). Append to it with adds-to, or delete it from the file "
+                         "by hand and add it again (it was never merged, so lint does not count that as a deletion)%s"
+                         % (a.id, cfg["default_branch"], a.op, ". If you committed it, its text is in this branch's "
+                            "history: drop or rewrite those commits" if a.op == "purge" else ""))
     brain = entries.Brain.load(bd)
     used = reflect.used_on_branches(repo, cfg["brain_dir"]) if a.op in ("add", "replace") else set()
     if a.op == "add":
@@ -1302,7 +1311,7 @@ def cmd_entry(a):
         res = "%s（第 %d 次重复%s）" % (a.id, n, "：该改成 gate 了" if n >= 2 else "")
     else:
         res = brain.purge(a.id, a.reason, a.approved_by)
-    errors, warnings = brainlint.check(brain, base=before, purge_approvers=cfg.get("purge_approvers") or [])
+    errors, warnings = brainlint.check(brain, base=base, purge_approvers=cfg.get("purge_approvers") or [])
     _print_lint(errors, warnings)
     if errors:
         print("brain entry: 没有写入（上面的错误要先改）")
