@@ -374,6 +374,18 @@ def _version_of(cmd) -> str:
     return text.splitlines()[0] if p.returncode == 0 and text else ""
 
 
+def lean_approvers(repo) -> list:
+    """The approval kinds aidlc-docs/lean.json restricts with Lean's `approvers` (a non-empty list of emails), sorted.
+    Lean refuses an approval line whose session git email is not on the kind's list: on the team runner that is the
+    bot's, so the bridge's approvals would never be recorded."""
+    try:
+        with open(os.path.join(repo, lean.CONFIG), encoding="utf-8") as f:
+            approvers = json.load(f).get("approvers")
+    except (OSError, ValueError, AttributeError):
+        return []
+    return sorted(str(k) for k, v in approvers.items() if v) if isinstance(approvers, dict) else []
+
+
 def doctor_checks(repo, cfg, fetch=True) -> list:
     out = []
     add = out.append
@@ -387,6 +399,13 @@ def doctor_checks(repo, cfg, fetch=True) -> list:
         why = mrdesc.write_problem(repo, cfg)
         add(("FAIL", "%s fingerprint_exclude: %s。%s" % (lean.CONFIG, why, mrdesc.exclude_fix(cfg))) if why else
             ("OK", "Lean does not count %s/ as code (%s fingerprint_exclude)" % (cfg["runs_dir"], lean.CONFIG)))
+        kinds = lean_approvers(repo)
+        if kinds:
+            add(("WARN", "%s sets Lean's approvers (%s): with the team runner and the bridge, Lean checks an approval "
+                         "the bridge sends back against the runner session's git email (a bot_emails address), "
+                         "refuses it (not in approvers) and records nothing. A repo that uses the bridge must not set "
+                         "approvers: who may answer is the bridge's identities.json (roles)" % (lean.CONFIG,
+                                                                                               ", ".join(kinds))))
         hook = os.path.join(repo, CREW_HOOK)
         if os.path.isfile(hook):
             with open(hook, encoding="utf-8", errors="replace") as f:

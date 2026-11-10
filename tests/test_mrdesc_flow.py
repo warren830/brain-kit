@@ -196,6 +196,26 @@ class InstallDoctorHandoff(unittest.TestCase):
         self.assertIn('"runs/**"', line[0])
         self.assertIn("brain install", line[0])
 
+    def test_doctor_warns_when_lean_approvers_are_set(self):
+        """R1-101: on the team runner Lean checks a bridge approval against the bot's git email; with `approvers`
+        set it refuses every one ("... is not in approvers"). A repo that uses the bridge must not set them."""
+        repo, _ = installed(self.d)
+        rc, out, err = tm.brain(repo, "doctor", "--offline")
+        self.assertNotIn("approvers", out)
+        for empty in ({}, {"DESIGN": []}):                 # Lean checks nothing for an empty list
+            put_lean_json(repo, dict(lean_json(repo), approvers=empty), commit=False)
+            rc, out, err = tm.brain(repo, "doctor", "--offline")
+            self.assertNotIn("approvers", out, empty)
+        put_lean_json(repo, dict(lean_json(repo), approvers={"RELEASE": ["pm@corp.example"],
+                                                              "DESIGN": ["dave@corp.example"]}), commit=False)
+        rc, out, err = tm.brain(repo, "doctor", "--offline")
+        line = [x for x in out.splitlines() if "approvers" in x]
+        self.assertEqual(len(line), 1, out)
+        self.assertTrue(line[0].startswith("WARN aidlc-docs/lean.json sets Lean's approvers (DESIGN, RELEASE)"), line)
+        self.assertIn("A repo that uses the bridge must not set approvers", line[0])
+        self.assertNotIn("FAIL", out)                     # a warning: doctor still passes
+        self.assertEqual(rc, 0, out)
+
     def test_handoff_refuses_with_the_fix(self):
         repo, _ = installed(self.d)
         cfg = lean_json(repo)
