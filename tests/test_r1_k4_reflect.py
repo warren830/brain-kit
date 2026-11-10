@@ -78,6 +78,17 @@ class Reflect(unittest.TestCase):
         self.assertEqual(sorted(main), ["T-OMS-1-1", "T-OMS-3-1"], out)
         self.assertIn("same proposal as proposal at line", out)
 
+    def test_r1_81_apply_after_no_commit_does_not_write_again(self):
+        repo = project(os.path.join(self.d, "r"), ONE)
+        wt = os.path.join(self.d, "wt")
+        rc, out = run_cli(repo, "reflect", "--apply", "--no-commit", "--worktree", wt)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("T-OMS-3-1", E.Brain.load(os.path.join(wt, "brain")).main())
+        rc, out = run_cli(repo, "reflect", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(brain_branches(repo), ["brain/OMS-3-reflect-1"], out)
+        self.assertIn(wt, out)
+
 
 if __name__ == "__main__":
     unittest.main()

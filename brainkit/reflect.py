@@ -401,17 +401,32 @@ def rejected_without_correction(vouchers_dir, key, proposals) -> list:
 # ---------- git side ----------
 
 def open_branches(repo, brain_dir) -> tuple:
-    """(ids, {proposal hash: branch}) on open Brain branches (local and origin): parallel reflects and
-    `brain entry` never pick an id that is already taken there, and a re-run never writes the same proposal twice."""
+    """(ids, {proposal hash: branch}) on open Brain branches (local and origin, and what a worktree of one holds
+    uncommitted, as `reflect --apply --no-commit` leaves it): parallel reflects and `brain entry` never pick an id
+    that is already taken there, and a re-run never writes the same proposal twice."""
     refs = git_out(repo, "for-each-ref", "--format=%(refname)", "refs/heads/brain/", "refs/remotes/origin/brain/")
+    views = [(ref.replace("refs/heads/", "").replace("refs/remotes/", ""), E.Brain.from_git(repo, ref, brain_dir))
+             for ref in refs.split()]
+    for path, branch in brain_worktrees(repo):
+        if os.path.isdir(os.path.join(path, brain_dir)):
+            views.append(("%s in %s, not committed" % (branch, path), E.Brain.load(os.path.join(path, brain_dir))))
     ids, props = set(), {}
-    for ref in refs.split():
-        b = E.Brain.from_git(repo, ref, brain_dir)
+    for where, b in views:
         ids |= b.used_ids()
-        short = ref.replace("refs/heads/", "").replace("refs/remotes/", "")
         for h in b.props():
-            props.setdefault(h, short)
+            props.setdefault(h, where)
     return ids, props
+
+
+def brain_worktrees(repo) -> list:
+    """[(path, branch)] of the worktrees that have a brain/* branch checked out."""
+    out, path = [], None
+    for line in git_out(repo, "worktree", "list", "--porcelain").split("\n"):
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line.startswith("branch refs/heads/brain/") and path:
+            out.append((path, line[len("branch refs/heads/"):]))
+    return out
 
 
 def used_on_branches(repo, brain_dir) -> set:
