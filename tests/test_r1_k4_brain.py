@@ -101,6 +101,16 @@ class BrainRound1(unittest.TestCase):
         self.assertIn("没有写入", out)
         self.assertEqual(brain_files(repo), tree)
 
+    def test_r1_74_java_annotations_are_not_people(self):
+        for text in ("在 service 方法上加 @Transactional，不要加在 controller 上。",
+                     "集成测试用 @SpringBootTest，外部服务用 @MockBean 替掉。",
+                     "@Transactional(readOnly = true) 只读事务；@Service 和 @Component 不用改。"):
+            self.assertEqual(added(text)[0], [], text)
+        for text in ("@Alice Wang 确认过", "问 @张伟", "联系 bob@Example.com", "Owner: @Alice Wang",
+                     "| 事项 | Owner |\n|---|---|\n| 退款 | @Alice |"):
+            self.assertTrue(any("personal data" in x for x in added(text)[0]), text)
+        self.assertTrue(any("may be personal data" in w for w in added("问 @Alice 再改")[1]))
+
 
 if __name__ == "__main__":
     unittest.main()

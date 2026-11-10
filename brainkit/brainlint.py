@@ -32,13 +32,33 @@ RELAX_RE = re.compile(
     r"[^\n]{0,16}?(测试|test|日志|log|鉴权|认证|授权|auth|校验|检查|check|依赖|dependenc|审批|评审|review|lint|"
     r"coverage|覆盖率|加密|encrypt|TLS|HTTPS|权限|permission)")
 TERM_RE = re.compile(r"^\s*(?:[-*]\s*)?\*\*([^*]{1,40})\*\*")
+EMAIL_CHAR_RE = re.compile(r"[A-Za-z0-9._%+-]")
+
+
+def _scan(text) -> list:
+    """checks.scan, except that one capitalised word after @ is a review hit, not personal data: in a TECH entry it is
+    as often a Java annotation (@Transactional, @MockBean) as a person (@Alice). Role words (@Service, @Test) are not
+    even that. The other rules still read the word (an Owner column, an e-mail address)."""
+    lone = [m for m in checks.MENTION_RE.finditer(text) if re.fullmatch(r"[A-Z][a-zA-Z]+", m.group(1))
+            and not (m.start() and EMAIL_CHAR_RE.match(text[m.start() - 1]))]
+    if not lone:
+        return checks.scan(text)
+    chars = list(text)
+    for m in lone:
+        chars[m.start()] = " "                       # same length: the offsets hold
+    hits = checks.scan("".join(chars))
+    for m in lone:
+        if checks.latin_person(m.group(1))[0] and not any(h.start < m.end() and m.start() < h.end for h in hits
+                                                           if h.cat not in ("link", "instruction")):
+            hits.append(checks.Hit("review", "person", m.start(), m.end(), m.group(0)))
+    return hits
 
 
 def content_problems(text, offset=0) -> tuple:
     """(errors, warnings) for text that is about to enter the Brain. With `offset`, the text before it is context
     only (for example the old part of an entry that grows): only findings that start at or after it count."""
     errs, warns = [], []
-    for h in checks.scan(text):
+    for h in _scan(text):
         if h.end <= offset:
             continue
         if h.cat == "secret":
