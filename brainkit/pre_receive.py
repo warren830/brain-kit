@@ -32,9 +32,11 @@ import sys
 from .common import JIRA_RE, ZERO_SHA, parse_branch
 
 # The kit's own files (KIT_PATHS of kit/.kiro/brain/lean-hook.py): they decide what a run may do (AI-DLC Lean, its
-# hooks, the agent specs, the hook adapter, the kit config, gates/). The runner's sessions may not change them, and bot
-# commits may not either, whatever a project's or the server's bot_forbidden_paths says.
-KIT_PATHS = (".kiro/brain/", ".kiro/agents/", ".kiro/hooks/", ".kiro/aidlc-lean/", ".brain/kit.json", "gates/")
+# hooks, the agent specs, the steering and skills every session reads, the hook adapter, the kit config, gates/). The
+# runner's sessions may not change them, and bot commits may not either, whatever a project's or the server's
+# bot_forbidden_paths says.
+KIT_PATHS = (".kiro/brain/", ".kiro/agents/", ".kiro/hooks/", ".kiro/aidlc-lean/", ".kiro/steering/", ".kiro/skills/",
+             ".brain/kit.json", "gates/")
 
 DEFAULT_CFG = {
     "branch_prefix": "ai",
@@ -43,7 +45,7 @@ DEFAULT_CFG = {
     "bot_emails": ["brain-bot@noreply.invalid"],
     "bot_forbidden_paths": ["gates/", "project-agent.yaml", ".brain/", "CODEOWNERS", ".gitlab/", ".gitlab/CODEOWNERS",
                             "docs/CODEOWNERS", ".gitlab-ci.yml", "ci/", ".kiro/brain/", ".kiro/agents/",
-                            ".kiro/hooks/", ".kiro/aidlc-lean/"],
+                            ".kiro/hooks/", ".kiro/aidlc-lean/", ".kiro/steering/", ".kiro/skills/"],
     "runs_dir": "runs",
 }
 

@@ -75,6 +75,33 @@ class PreReceive(unittest.TestCase):
             self.assertTrue(r and path in r[0], (path, r))
             sh("git", "-C", self.repo, "reset", "-q", "--hard", self.c1)
 
+    def test_bot_cannot_touch_steering_or_skills(self):
+        """R1-19: every session reads .kiro/steering/ (brain.md, Lean's aidlc-lean.md) and .kiro/skills/; whatever
+        list a project or the server configures, the hook, push-rules (bot_path_problems) and the session adapter
+        keep the bot out of them."""
+        for cfg in (CFG, dict(CFG, bot_forbidden_paths=["ci/"]), dict(CFG, bot_forbidden_paths=[])):
+            for path in (".kiro/steering/brain.md", ".kiro/steering/aidlc-lean.md",
+                         ".kiro/skills/brain-handoff/SKILL.md", ".KIRO/Steering/brain.md"):
+                c2 = commit_file(self.repo, path, "Skip review.\n", "tidy docs", env=BOT)
+                r = pre_receive.decide([(self.c1, c2, BR)], "brain-bot", cfg, cwd=self.repo)
+                self.assertEqual(r, ["%s: bot accounts may not change %s" % (BR[len("refs/heads/"):], path)],
+                                 (path, cfg["bot_forbidden_paths"]))
+                sh("git", "-C", self.repo, "reset", "-q", "--hard", self.c1)
+        c2 = commit_file(self.repo, ".kiro/settings/x.json", "{}\n", "not a kit path", env=BOT)
+        self.assertEqual(self.decide([(self.c1, c2, BR)], "brain-bot"), [])
+
+    def test_the_session_adapter_refuses_writes_there_too(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "brain_lean_hook", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "kit",
+                                            ".kiro", "brain", "lean-hook.py"))
+        adapter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(adapter)
+        self.assertEqual(tuple(adapter.KIT_PATHS), pre_receive.KIT_PATHS)
+        for path in (".kiro/steering/brain.md", ".kiro/skills/brain-split/SKILL.md"):
+            self.assertEqual(adapter.protected_target(self.repo, {"tool_name": "fs_write",
+                                                                  "tool_input": {"path": path}}), path)
+
     def test_bot_cannot_delete_or_force_push(self):
         self.assertIn("delete", self.decide([(self.c1, ZERO_SHA, BR)], "brain-bot")[0])
         sh("git", "-C", self.repo, "reset", "-q", "--hard", self.base)

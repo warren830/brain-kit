@@ -15,8 +15,9 @@ nearest folder at or above the hook's cwd that has one), its output and exit cod
 PreToolUse blocks the tool). Lean runs in this process from the bytes the kit check below just read and compared, not
 from a second read of the file. Without Lean nothing can be checked, so PreToolUse is refused.
 
-The kit's own files (KIT_PATHS: .kiro/brain/, .kiro/agents/, .kiro/hooks/, .kiro/aidlc-lean/, .brain/kit.json,
-gates/) decide what a session may do. On every call, before anything else, they must be in the working tree exactly
+The kit's own files (KIT_PATHS: .kiro/brain/, .kiro/agents/, .kiro/hooks/, .kiro/aidlc-lean/, .kiro/steering/,
+.kiro/skills/, .brain/kit.json, gates/) decide what a session may do. On every call, before anything else, they must
+be in the working tree exactly
 as in the reference commit: on the team runner the hand-over commit (the sha in the bridge-signed hand-over request
 runnerd prepared this workspace from, <spool_dir>/requests/<RUN-ID>.json, verified with allowed_signers), in a local
 session HEAD. A file there changed, added or deleted, a symlink or a hard link: PreToolUse is refused (exit 2), the
@@ -55,7 +56,8 @@ import sys
 ADAPTER_VERSION = 3
 
 # The kit's own files (brainkit.pre_receive.KIT_PATHS: bot commits may not change them either).
-KIT_PATHS = (".kiro/brain/", ".kiro/agents/", ".kiro/hooks/", ".kiro/aidlc-lean/", ".brain/kit.json", "gates/")
+KIT_PATHS = (".kiro/brain/", ".kiro/agents/", ".kiro/hooks/", ".kiro/aidlc-lean/", ".kiro/steering/", ".kiro/skills/",
+             ".brain/kit.json", "gates/")
 # Those of them Lean's own write guard refuses (KIT_PATHS in aidlc_lean.py): a write tool call there goes to Lean.
 LEAN_KIT_PATHS = (".kiro/hooks/", ".kiro/aidlc-lean/", ".kiro/agents/lean-")
 # Lean's tool classes (SHELL_TOOLS, READ_TOOL_RE in aidlc_lean.py): any other tool given a path writes a file.
