@@ -74,6 +74,12 @@ from .common import BRANCH_RE, JIRA_RE, USER_RE, ZERO_SHA, BrainError, git, iso,
 SCHEMA = 1
 WINDOW_DAYS = 14
 STAGE_STATE = {"STAGE_STARTED": "started", "STAGE_COMPLETED": "done", "STAGE_SKIPPED": "skipped"}
+# Lean 0.3's optional phases (aidlc_lean.py PHASES, IDEATION_STAGES, IDEATION_REQUIRED): a whole phase skipped is one
+# PHASE_SKIPPED {phase, stages, reason} record
+PHASE_NAMES = {"ideation": "Ideation", "operations": "Operations"}
+IDEATION_IDS = ("intent-capture", "market-research", "feasibility", "scope-definition", "team-formation",
+                "rough-mockups", "approval-handoff")
+IDEATION_REQUIRED = ("intent-capture", "scope-definition", "approval-handoff")
 LEAN_APPROVALS = ("IDEATION", "REQUIREMENTS", "DESIGN", "INCEPTION", "PLAN", "RELEASE")
 ACCEPT_WHAT = ("RELEASE", "acceptance")
 VOUCHER_RE = re.compile(r"(?<![0-9A-Za-z])V-[0-9a-f]{10}(?![0-9a-f])")
@@ -273,20 +279,57 @@ def _data(e) -> dict:
     return d if isinstance(d, dict) else {}
 
 
-def stages_of(events) -> list:
-    rows = {}
-    for e in events:
-        if e.get("event") not in STAGE_STATE:
-            continue
+def ideation_in_use(events) -> bool:
+    """Lean 0.3's rule (aidlc_lean.py Project.ideation_in_use): an Ideation stage has a start or done record newer
+    than the last phase skip of Ideation (with no phase skip: any start or done record)."""
+    used = skip = -1
+    for k, e in enumerate(events):
         d = _data(e)
-        sid = str(d.get("stage") or "?") + ("/" + str(d["unit"]) if d.get("unit") else "")
-        row = rows.setdefault(sid, {"id": sid, "first_at": e["_at"], "times": {}})
-        st = STAGE_STATE[e["event"]]
+        if e.get("event") == "PHASE_SKIPPED" and d.get("phase") == "ideation":
+            skip = k
+        elif e.get("event") in ("STAGE_STARTED", "STAGE_COMPLETED") and d.get("stage") in IDEATION_IDS:
+            used = k
+    return used > skip
+
+
+def stages_of(events) -> list:
+    """Each stage's last state (done / skipped / started), by Lean 0.3's rule (aidlc_lean.py stage_event): the
+    stage's own last STAGE_* record, or a later PHASE_SKIPPED {phase, stages, reason} that covered it (`lean new`
+    without --ideation, `lean stage skip ideation|operations`; the row's `phase_skipped` names the phase). Once
+    Ideation is in use again, its phase skips no longer count, and a stage Ideation needs (IDEATION_REQUIRED) that was
+    skipped on its own before has no record until it is started or done. Rows in the order of their first record;
+    the stages of one phase skip in Lean's order."""
+    in_use = ideation_in_use(events)
+    rows = {}
+
+    def put(sid, st, note, e, phase=None, pos=0):
+        row = rows.setdefault(sid, {"id": sid, "first_at": e["_at"], "times": {},
+                                    "_order": (0, pos, "") if phase else (1, 0, sid)})
         row["times"][st] = row["times"].get(st, 0) + 1
-        note = d.get("note") if e["event"] == "STAGE_COMPLETED" else d.get("reason") if e["event"] == "STAGE_SKIPPED" \
-            else None
         row.update(state=st, at=e["_at"], note=scrub(note) if isinstance(note, str) else None, src=e["_src"])
-    return sorted(rows.values(), key=lambda r: (r["first_at"] or "", r["id"]))
+        if phase:
+            row["phase_skipped"] = phase
+        else:
+            row.pop("phase_skipped", None)
+
+    for e in events:
+        ev, d = e.get("event"), _data(e)
+        if ev in STAGE_STATE:
+            sid = str(d.get("stage") or "?") + ("/" + str(d["unit"]) if d.get("unit") else "")
+            put(sid, STAGE_STATE[ev], d.get("note") if ev == "STAGE_COMPLETED" else d.get("reason")
+                if ev == "STAGE_SKIPPED" else None, e)
+        elif ev == "PHASE_SKIPPED" and d.get("phase") in PHASE_NAMES and isinstance(d.get("stages"), list) and \
+                not (d["phase"] == "ideation" and in_use):
+            for pos, sid in enumerate(s for s in d["stages"] if isinstance(s, str) and s):
+                put(sid, "skipped", d.get("reason"), e, d["phase"], pos)
+    if in_use:
+        for sid in IDEATION_REQUIRED:
+            if rows.get(sid, {}).get("state") == "skipped":
+                del rows[sid]
+    out = sorted(rows.values(), key=lambda r: (r["first_at"] or "",) + r["_order"])
+    for r in out:
+        del r["_order"]
+    return out
 
 
 def checks_of(events, tree, intent) -> dict:
@@ -2271,7 +2314,16 @@ def render(t) -> str:
         mark = {"done": "x", "skipped": "S", "started": "-"}
         out.append("")
         out.append("阶段：")
-        out += ["  [%s] %s · %s" % (mark[s["state"]], s["id"], s["at"] or "-") for s in t["stages"]]
+        said = set()
+        for s in t["stages"]:
+            ph = s.get("phase_skipped")
+            if not ph:
+                out.append("  [%s] %s · %s" % (mark[s["state"]], s["id"], s["at"] or "-"))
+            elif s["src"] not in said:          # a phase skipped whole: one line for the record, as Lean shows it
+                said.add(s["src"])
+                n = sum(1 for x in t["stages"] if x.get("phase_skipped") and x["src"] == s["src"])
+                out.append("  [S] %s（整段跳过 %d 个阶段：%s）· %s" % (PHASE_NAMES.get(ph, ph), n, s["note"] or "-",
+                                                             s["at"] or "-"))
     c = t["checks"]
     if c and c["verify"]:
         out.append("verify：%d 次，失败 %d 次；最后一次 %s" % (len(c["verify"]), c["verify_failed"],

@@ -46,7 +46,7 @@ brain golden summarize results.json --tasks tasks
 | 部分 | 内容 | 来源 |
 |---|---|---|
 | 基本 | key、intent、owner、branch、brain_commit、run_ids | `runs/<KEY>/run.json`；run 号来自 ledger 和凭证 |
-| stages | 每个阶段最后的状态（done / skipped / started）、时间、说明 | Lean 审计日志 `aidlc-docs/audit/*.jsonl`；每个文件的哈希链都核对，断了会写出来 |
+| stages | 每个阶段最后的状态（done / skipped / started）、时间、说明。Lean 0.3 整段跳过 Ideation 或 Operations 时只记一条 PHASE_SKIPPED（`lean new` 不带 `--ideation`、`lean stage skip ideation\|operations`），它列出的阶段都是 skipped，说明是跳过的原因，`phase_skipped` 写是哪一段（文字摘要里一段一行）。规则和 Lean 一样：阶段自己更晚的记录算数；Ideation 又用上以后（它的某个阶段在最后一次整段跳过之后开始或做完了），之前的整段跳过不算，之前单独跳过的必需阶段（intent-capture、scope-definition、approval-handoff）也不算 | Lean 审计日志 `aidlc-docs/audit/*.jsonl`；每个文件的哈希链都核对，断了会写出来 |
 | actions | 提交（人还是机器人、在交接前还是后）、被 Lean 拦下的调用、会话和回合数、交接、run 停下来问的问题 | git；Lean 日志；run.json；ledger；凭证；`park.json` 的每个版本 |
 | decisions | decisions.md 的每一行、需求页里的假设 A-n、桥上的问答 | `decisions.md`、`requirements.md`、ledger、凭证 |
 | checks | 每次 verify：时间、过没过、哪条命令失败 | Lean 日志的 VERIFY；`build-and-test-summary.md` |
