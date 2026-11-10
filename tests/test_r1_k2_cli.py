@@ -439,5 +439,37 @@ class R1_28_TemplateNext(Project):
                                                      % lean.TEMPLATE_NEXT[1]), [])
 
 
+class R1_29_HookIgnoresIgnoredLeftovers(Project):
+    def read(self):
+        import subprocess
+        hook = os.path.join(self.repo, ".kiro", "brain", "lean-hook.py")
+        payload = {"acp_session_id": "s1", "cwd": self.repo, "tool_name": "fs_read", "tool_input": {"path": "src/app.py"}}
+        return subprocess.run([sys.executable, hook, "PreToolUse"], input=json.dumps(payload), text=True,
+                              capture_output=True, cwd=self.repo)
+
+    def put(self, rel, data):
+        p = os.path.join(self.repo, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(data)
+
+    def test_r1_29_ds_store_and_swap_files_git_ignores_are_no_kit_change(self):
+        self.assertEqual(brain(self.repo, "start", "refund", "--key", "PAY-1")[0], 0)
+        self.assertEqual(self.read().returncode, 0)
+        self.put(".kiro/agents/.DS_Store", b"\0\0\0\1Bud1")
+        self.put("gates/.risk-paths.swp", b"b0VIM 9.0")
+        with open(os.path.join(self.repo, ".git", "info", "exclude"), "a") as f:
+            f.write(".DS_Store\n*.swp\n*.json\n")
+        self.assertEqual(sh("git", "-C", self.repo, "status", "--porcelain").stdout, "")
+        r = self.read()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # any other file still counts, git-ignored or not: Kiro reads an agent spec whatever git ignores
+        self.put(".kiro/agents/extra.json", b"{}")
+        r = self.read()
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(".kiro/agents/extra.json (added)", r.stdout + r.stderr)
+        self.assertNotIn(".DS_Store", r.stdout + r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
