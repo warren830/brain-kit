@@ -396,13 +396,10 @@ class Bridge(DecisionLoop):
         voucher and each package is its own folder, so the rebase meets no conflict), and pushed again: a voucher
         that could not be pushed goes out on a later round. A failed push is not a reason to refuse anything."""
         try:
-            p = git_net(d, "pull", "-q", "--rebase", timeout=self.git_timeout, check=False)
+            p = self._pull(d)
         except NetworkError as e:
             return str(e)
         if p.returncode != 0:
-            gdir = git(d, "rev-parse", "--absolute-git-dir", check=False).stdout.strip()
-            if gdir and any(os.path.isdir(os.path.join(gdir, x)) for x in ("rebase-merge", "rebase-apply")):
-                git(d, "rebase", "--abort", check=False)
             return (p.stderr or p.stdout).strip()[:300] or "git pull failed"
         ahead = git(d, "rev-list", "--count", "@{u}..HEAD", check=False)
         if ahead.returncode == 0 and ahead.stdout.strip() not in ("", "0"):
@@ -683,12 +680,41 @@ class Bridge(DecisionLoop):
         round whose push failed left its commit; the next round asks for that same voucher (sign_voucher), finds
         nothing new to commit, and pushes what is there. Each push and pull ends after publish_timeout seconds."""
         vd = self.cfg["vouchers_dir"]
+        self._undo_rebase(vd)
         git(vd, "add", "--", run_id)
         if git(vd, "diff", "--cached", "--quiet", check=False).returncode != 0:
             git(vd, "commit", "-q", "-m", "voucher %s %s" % (run_id, voucher_id))
         if self._git_remote(vd, "push", "-q").returncode != 0:
-            self._git_remote(vd, "pull", "-q", "--rebase", check=True)
+            p = self._pull(vd)
+            if p.returncode != 0:
+                raise NetworkError("command failed (%d): %s\n%s" % (p.returncode, " ".join(p.args),
+                                                                     (p.stderr or p.stdout).strip()))
             self._git_remote(vd, "push", "-q", check=True)
+
+    def _pull(self, d):
+        """`git pull --rebase` in a brain-intake clone. A pull that publish_timeout stopped half way (a loaded
+        machine), or one the bridge died in, leaves its rebase half done with HEAD detached, and every later pull then
+        fails ("You are not currently on a branch"): such a rebase is undone before the pull and after one that did
+        not finish, so the clone is back on its branch with its own commits. NetworkError when it timed out."""
+        self._undo_rebase(d)
+        try:
+            p = git_net(d, "pull", "-q", "--rebase", timeout=self.git_timeout, check=False)
+        except NetworkError:
+            self._undo_rebase(d, killed=True)
+            raise
+        if p.returncode != 0:
+            self._undo_rebase(d)
+        return p
+
+    @staticmethod
+    def _undo_rebase(d, killed=False):
+        gdir = git(d, "rev-parse", "--absolute-git-dir", check=False).stdout.strip()
+        if not gdir:
+            return
+        if killed and os.path.exists(os.path.join(gdir, "index.lock")):
+            os.remove(os.path.join(gdir, "index.lock"))      # git_net killed the pull with everything it started
+        if any(os.path.isdir(os.path.join(gdir, x)) for x in ("rebase-merge", "rebase-apply")):
+            git(d, "rebase", "--abort", check=False)
 
     def _git_remote(self, repo, *args, check=False):
         """A git command that talks to the vouchers repo's remote (common.git_net): never waits for a password

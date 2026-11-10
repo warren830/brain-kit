@@ -404,7 +404,7 @@ class IntakeCloneAfterAFailedPush(unittest.TestCase):
         for k, v in (("user.name", "brain-bridge"), ("user.email", "bridge@example.com"), ("commit.gpgsign", "false")):
             sh("git", "-C", clone, "config", k, v)
         t.cfg.update(intake_dir=clone, vouchers_dir=os.path.join(clone, "vouchers"), publish_vouchers=True,
-                     publish_timeout=5)
+                     publish_timeout=60)
         # 1. PAY-1's voucher cannot be pushed (brain-intake unreachable): its commit stays in the clone
         sh("git", "-C", clone, "remote", "set-url", "origin", os.path.join(t.d, "unreachable.git"))
         t.bridge = t.new_bridge()
@@ -453,7 +453,7 @@ class IntakeCloneAfterAFailedPush(unittest.TestCase):
         sh("git", "clone", "-q", origin, clone)
         for k, v in (("user.name", "brain-bridge"), ("user.email", "bridge@example.com"), ("commit.gpgsign", "false")):
             sh("git", "-C", clone, "config", k, v)
-        t.cfg.update(vouchers_dir=os.path.join(clone, "vouchers"), publish_vouchers=True, publish_timeout=5)
+        t.cfg.update(vouchers_dir=os.path.join(clone, "vouchers"), publish_vouchers=True, publish_timeout=60)
         sh("git", "-C", clone, "remote", "set-url", "origin", os.path.join(t.d, "unreachable.git"))
         t.bridge = t.new_bridge()
         with self.assertRaises(Exception):
@@ -463,6 +463,76 @@ class IntakeCloneAfterAFailedPush(unittest.TestCase):
         t.bridge.poll()                                              # no hand-over publishes: the round pushes it
         pushed = sh("git", "--git-dir", origin, "ls-tree", "-r", "--name-only", "main").stdout.split()
         self.assertTrue(any(f.startswith("vouchers/RUN-PAY-1-") for f in pushed), pushed)
+
+
+class PullStoppedMidRebase(unittest.TestCase):
+    """R1-07 (follow-up): a `pull --rebase` of the bridge's brain-intake clone stopped by publish_timeout half way
+    (a loaded machine) left the rebase half done, HEAD detached: every later pull said "You are not currently on a
+    branch" and no voucher or package went out again. A post-checkout hook that sleeps holds the rebase right after
+    it detached HEAD, so the timeout stops it there, as it did on the loaded machine."""
+
+    def clone(self):
+        from tests.helpers import commit_file, git_repo
+        t = bridge_fixture(self)
+        origin = os.path.join(t.d, "intake.git")
+        sh("git", "init", "-q", "--bare", "-b", "main", origin)
+        seed = git_repo(os.path.join(t.d, "seed"))
+        commit_file(seed, "vouchers/README", "vouchers\n")
+        sh("git", "-C", seed, "push", "-q", origin, "main")
+        clone = os.path.join(t.d, "intake")
+        sh("git", "clone", "-q", origin, clone)
+        for k, v in (("user.name", "brain-bridge"), ("user.email", "bridge@example.com"), ("commit.gpgsign", "false")):
+            sh("git", "-C", clone, "config", k, v)
+        commit_file(clone, "vouchers/RUN-PAY-1-1/voucher.json", "{}\n")     # a voucher whose push failed
+        commit_file(seed, "packages/PKG-PAY-2-1/toc.md", "# toc\n")           # someone published a package
+        sh("git", "-C", seed, "push", "-q", origin, "main")
+        t.cfg.update(intake_dir=clone, vouchers_dir=os.path.join(clone, "vouchers"), publish_vouchers=True,
+                     publish_timeout=2)
+        t.bridge = t.new_bridge()
+        return t, origin, clone
+
+    def hold_the_rebase(self, clone):
+        hook = os.path.join(clone, ".git", "hooks", "post-checkout")
+        with open(hook, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\nsleep 30\n")
+        os.chmod(hook, 0o755)
+        return hook
+
+    def assert_on_main(self, clone):
+        self.assertEqual(sh("git", "-C", clone, "symbolic-ref", "--short", "HEAD").stdout.strip(), "main")
+        gdir = os.path.join(clone, ".git")
+        self.assertFalse([x for x in ("rebase-merge", "rebase-apply", "index.lock") if os.path.exists(os.path.join(gdir, x))])
+
+    def test_a_pull_stopped_half_way_leaves_the_clone_on_its_branch(self):
+        t, origin, clone = self.clone()
+        hook = self.hold_the_rebase(clone)
+        self.assertIn("did not finish", t.bridge.sync_intake(clone))
+        self.assert_on_main(clone)
+        self.assertIn("RUN-PAY-1-1", sh("git", "-C", clone, "log", "--stat", "-1").stdout)
+        os.remove(hook)
+        t.bridge.cfg["publish_timeout"] = 60                         # only the held pull is meant to time out
+        self.assertEqual(t.bridge.sync_intake(clone), "")
+        pushed = sh("git", "--git-dir", origin, "ls-tree", "-r", "--name-only", "main").stdout.split()
+        self.assertIn("vouchers/RUN-PAY-1-1/voucher.json", pushed)
+        self.assertIn("packages/PKG-PAY-2-1/toc.md", pushed)
+
+    def test_publish_after_a_round_that_left_the_rebase_half_done(self):
+        from brainkit.common import NetworkError, git_net
+        t, origin, clone = self.clone()
+        hook = self.hold_the_rebase(clone)
+        with self.assertRaises(NetworkError):                    # an earlier round, stopped there (the bridge died)
+            git_net(clone, "pull", "-q", "--rebase", timeout=2, check=False)
+        os.remove(hook)
+        t.bridge.cfg["publish_timeout"] = 60
+        self.assertNotEqual(sh("git", "-C", clone, "symbolic-ref", "-q", "HEAD", check=False).returncode, 0)
+        os.makedirs(os.path.join(clone, "vouchers", "RUN-PAY-3-1"))
+        with open(os.path.join(clone, "vouchers", "RUN-PAY-3-1", "voucher.json"), "w", encoding="utf-8") as f:
+            f.write("{}\n")
+        t.bridge.publish("RUN-PAY-3-1", "V-3")
+        self.assert_on_main(clone)
+        pushed = sh("git", "--git-dir", origin, "ls-tree", "-r", "--name-only", "main").stdout.split()
+        for f in ("vouchers/RUN-PAY-1-1/voucher.json", "vouchers/RUN-PAY-3-1/voucher.json", "packages/PKG-PAY-2-1/toc.md"):
+            self.assertIn(f, pushed)
 
 
 if __name__ == "__main__":
