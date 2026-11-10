@@ -491,23 +491,33 @@ def _dedupe(hits):
     return sorted((k for k in kept if k is not None), key=lambda h: h.start)
 
 
-# Values a detector finds by their own form (check digits, phone, card and address formats, key formats, amounts,
-# company suffixes) are masked wherever they occur in the package. Names and passwords found next to a label are
-# masked only where they were found: a guess from the words around it must not spread (one 提出人：顾客 would turn
-# every 顾客 in the package into a placeholder).
+# A value judged sensitive once is masked wherever it occurs in the package: other rows, other files, the hidden area
+# and file names. That holds for values found by their own form (check digits, phone, card and address formats, key
+# formats, amounts, company suffixes) and for names and passwords found next to a label (R1-48, the user's decision of
+# 2026-11-10). Only a confident find spreads: a name the name check rejects (提出人：顾客) or files under review never
+# becomes a value. A password that is a plain short word (password: admin) is masked where it was found but does not
+# spread, so the word admin elsewhere (a role, /api/admin) stays readable.
 PROPAGATE_KINDS = {"hkid", "cnid", "phone", "email", "card", "private_key", "cloud_key", "bearer", "token",
-                   "amount", "company", "contract"}
+                   "amount", "company", "contract", "person", "kv_secret"}
+
+
+def _spreads(kind, v) -> bool:
+    if len(v) < 2:
+        return False
+    if kind == "kv_secret":
+        return len(v) >= 8 or bool(re.search(r"[^A-Za-z]", v))
+    return True
 
 
 def propagate(text, hits, values) -> list:
-    """Add a hit for every occurrence of a value already judged sensitive anywhere in the submission (only the kinds
-    in PROPAGATE_KINDS, and what gitleaks found: a key by its form)."""
+    """Add a hit for every occurrence of a value already judged sensitive anywhere in the submission (the kinds in
+    PROPAGATE_KINDS, see _spreads, and what gitleaks found: a key by its form)."""
     extra = []
     for (cat, kind), vals in values.items():
         if kind not in PROPAGATE_KINDS and not kind.startswith("gitleaks:"):
             continue
         for v in vals:
-            if len(v) < 2:
+            if not _spreads(kind, v):
                 continue
             start = text.find(v)
             while start >= 0:

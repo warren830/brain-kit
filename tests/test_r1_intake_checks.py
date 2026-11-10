@@ -413,6 +413,35 @@ class R1_64SecretMessage(Base):
 
 
 
+class R1_48NamesAndPasswordsSpread(Base):
+    """A name or a password found next to a label was masked only there: the same value in another file, another
+    row or a file name stayed in clear text. The user's decision (2026-11-10): once found, it is masked everywhere."""
+
+    def test_name_spreads_to_other_files_and_file_names(self):
+        self.file("a.md", "# a\n\n负责人：张伟\n")
+        self.file("张伟的需求.md", "# b\n\n张伟 下周上线，Owner: Alice Wang\n")
+        self.file("c.md", "# c\n\n有事找 Alice Wang 或张伟。\n")
+        text = self.package_text(self.build())
+        self.assertNotIn("张伟", text)
+        self.assertNotIn("Alice Wang", text)
+        self.assertIn("[人名-", text)
+
+    def test_password_spreads_but_a_plain_short_word_does_not(self):
+        pw = "Hunter" + str(2000 + 24) + "!"
+        self.file("a.md", "# a\n\npassword: %s\n\npassword: admin\n" % pw)
+        self.file("b.md", "# b\n\n测试环境登录用 %s，管理后台是 /api/admin，admin 角色能退款。\n" % pw)
+        text = self.segments(self.build())
+        self.assertNotIn(pw, text)
+        self.assertIn("/api/admin", text)
+        self.assertIn("admin 角色能退款", text)
+        self.assertNotIn("password: admin", text)              # still masked where it was found
+
+    def test_a_word_the_name_check_rejects_does_not_spread(self):
+        self.file("a.md", "# a\n\n提出人：顾客\n")
+        self.file("b.md", "# b\n\n顾客下单后可以退款。\n")
+        self.assertIn("顾客下单后可以退款", self.segments(self.build()))
+
+
 class R1_65FindingsListWhatWasMasked(Base):
     """findings.md counted only what each file's own scan found: a value masked because another file had it, or one
     masked in the hidden area, was not listed, and the file read 无."""

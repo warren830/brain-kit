@@ -311,8 +311,8 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
         block("门 3：找到商业敏感内容 %s，请选 --business keep（原样）或 --business mask（换占位符）；"
                          "不想交的文件请从输入里去掉" % summary.get("business"))
     mask_business = business == "mask"
-    # a value found by its form (an ID, a phone, an email, a key ...) is masked everywhere (other files, other rows,
-    # the hidden area); a name or password found next to a label only where it was found (checks.propagate)
+    # a value judged sensitive once (an ID, a phone, an email, a key, a name or a password next to its label ...) is
+    # masked everywhere: other files, other rows, the hidden area, file names (checks.propagate)
     values = {}
     for hs in all_hits.values():
         for h in hs:
