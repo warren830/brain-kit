@@ -244,6 +244,7 @@ def plan(brain, proposals, key, pending=None, used_extra=(), stuck=None) -> tupl
     main = brain.main()
     texts = {e.text(): eid for eid, (f, e) in main.items()}
     seen = {}
+    fresh = {}       # (file, type, text) of a new entry this run writes: the same text from other sources joins it
     for p in proposals:
         where = p.label()
         f = p.fields
@@ -313,12 +314,18 @@ def plan(brain, proposals, key, pending=None, used_extra=(), stuck=None) -> tupl
                 probs.append("%s: section: up to 40 characters, no #, <, >, `, [, ], |" % where)
             else:
                 probs += ["%s: section: %s" % (where, x) for x in brainlint.content_problems(sec)[0]]
+        if p.rel == "new" and (fk, etype, body) in fresh:
+            first = fresh[(fk, etype, body)]
+            first.kw["also"].append(p)
+            notes.append("%s: same text as %s: one entry with the sources of both" % (where, first.p.label()))
+            continue
         if p.rel == "new" and body in texts:
             notes.append("%s: same text as %s: recorded as same (sources added)" % (where, texts[body]))
             ops.append(Op("same", p, eid=texts[body], type=main[texts[body]][1].type))
             continue
         if p.rel == "new":
-            ops.append(Op("new", p, file=fk, type=etype, section=f.get("section") or None))
+            ops.append(Op("new", p, file=fk, type=etype, section=f.get("section") or None, also=[]))
+            fresh[(fk, etype, body)] = ops[-1]
         elif p.rel == "replaces":
             ops.append(Op("replaces", p, eid=p.target, type=etype))
         else:
@@ -351,6 +358,8 @@ def apply(brain, ops, key, used_extra=()):
         if op.kind == "new":
             op.result = brain.new(kw["file"], kw["type"], body, key, p.src, section=kw["section"], prop=p.hash,
                                   used_extra=used_extra)
+            for q in kw.get("also", ()):
+                brain.same(op.result, q.src, prop=q.hash)
         elif op.kind == "replaces":
             op.result = brain.replace(kw["eid"], body, key, p.src, etype=kw["type"], prop=p.hash,
                                       used_extra=used_extra)
@@ -473,8 +482,9 @@ def mr_description(key, ops, warnings, source, gaps=None) -> str:
     rows = []
     for op in ops:
         p = op.p
+        src = list(dict.fromkeys(p.src + [s for q in op.kw.get("also", ()) for s in q.src]))
         how = []
-        if any(brainlint.DOC_SRC_RE.match(s) for s in p.src):
+        if any(brainlint.DOC_SRC_RE.match(s) for s in src):
             how.append("来自文档：单条审")
         if brainlint.RELAX_RE.search(E.norm(p.body)):
             how.append("放宽类：Builder + 安全两人批")
@@ -485,7 +495,7 @@ def mr_description(key, ops, warnings, source, gaps=None) -> str:
         rows.append("| %s | %s | %s | %s | %s | %s |" % (
             op.result, fk, op.kw.get("type", ""), op.kind + (" " + op.kw["eid"] if op.kind != "new" and
                                                                 op.kw.get("eid") != op.result else ""),
-            ", ".join(p.src), "；".join(how) or "按文件负责人批"))
+            ", ".join(src), "；".join(how) or "按文件负责人批"))
     out = ["Brain 回写：%s（来源：%s）" % (key, source), "",
            "| 条目 | 文件 | 类型 | 关系 | 出处 | 怎么审 |", "|---|---|---|---|---|---|"] + rows
     out += ["", "- 谁批：PRODUCT 归产品；TECH、IMPROVEMENT 归 Builder；PROJECT 两边各一人（CODEOWNERS）。",

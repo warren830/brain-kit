@@ -94,6 +94,31 @@ class Reflect(unittest.TestCase):
         self.assertEqual(sorted(main), ["T-OMS-1-1", "T-OMS-3-1"], out)
         self.assertIn("same proposal as proposal at line", out)
 
+    def test_r1_78_followup_same_text_other_source_is_one_entry_with_both(self):
+        """The user's call: the same text proposed twice with other sources is one entry that keeps every source and
+        both proposal hashes; not a repeated correction; lint takes it, and a rerun writes nothing."""
+        other = ONE.replace("src: D-1, RUN-OMS-3-1", "src: D-7")
+        repo = project(os.path.join(self.d, "r"), ONE + "\n" + other)
+        wt = os.path.join(self.d, "wt")
+        rc, out = run_cli(repo, "reflect", "--apply", "--worktree", wt)
+        self.assertEqual(rc, 0, out)
+        main = E.Brain.load(os.path.join(wt, "brain")).main()
+        self.assertEqual(sorted(main), ["T-OMS-1-1", "T-OMS-3-1"], out)
+        e = main["T-OMS-3-1"][1]
+        self.assertEqual(e.src, ["D-1", "RUN-OMS-3-1", "D-7"])
+        self.assertEqual(len(e.attrs["prop"].split(",")), 2, e.attrs)
+        self.assertNotIn("repeats", e.attrs)
+        self.assertEqual(e.attrs["rel"], "new")
+        with open(wt + ".mr.md", encoding="utf-8") as f:
+            self.assertIn("| D-1, RUN-OMS-3-1, D-7 |", f.read())
+        branch = "brain/OMS-3-reflect-1"
+        mb = sh("git", "-C", repo, "merge-base", "main", branch).stdout.strip()
+        self.assertEqual(brainlint.check(E.Brain.from_git(repo, branch), base=E.Brain.from_git(repo, mb),
+                                         target=E.Brain.from_git(repo, "main"))[0], [])
+        rc, out = run_cli(repo, "reflect", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(brain_branches(repo), [branch], out)
+
     def test_r1_81_apply_after_no_commit_does_not_write_again(self):
         repo = project(os.path.join(self.d, "r"), ONE)
         wt = os.path.join(self.d, "wt")
