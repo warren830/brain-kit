@@ -23,19 +23,24 @@ import os
 import re
 import subprocess
 
-from . import entries as E
+from . import entries as E, reflect
 from .common import git
 
 CITE_RE = re.compile(r"(?<![A-Za-z0-9-])([PTIJ]-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3})(?![0-9-])")
 LEGACY_CITE_RE = re.compile(r"(?<![A-Za-z0-9-])([PTIJ]-[0-9]{1,5})(?![0-9-])")
-PROPOSAL_BLOCK_RE = re.compile(r"^\s*```+\s*brain-(?:proposal|gap)\s*$.*?^\s*```+\s*$", re.M | re.S)
 # Lean's unit pages (aidlc_lean.py STAGES, PLAN_FILE_RE): construction/<unit>/<stage>/..., the code-generation plan
 UNIT_PAGE_RE = re.compile(r"^construction/(?:plans/(?P<plan>[^/]+)-code-generation-plan\.md|(?P<dir>[^/]+)/.+)$")
 NOT_UNITS = ("plans", "build-and-test")          # Lean's RESERVED_UNITS: folders under construction/ that are not units
 
 
 def strip_proposals(text) -> str:
-    return PROPOSAL_BLOCK_RE.sub("", text)
+    """The text without its brain-proposal and brain-gap blocks, cut where reflect cuts them: a code block inside
+    one does not end it."""
+    drop = set()
+    for open_re in (reflect.FENCE_OPEN_RE, reflect.GAP_OPEN_RE):
+        for start, end, _ in reflect.block_spans(text, open_re):
+            drop.update(range(start, end))
+    return "\n".join(line for i, line in enumerate(text.split("\n")) if i not in drop)
 
 
 def _tree_files(repo, ref, prefix):

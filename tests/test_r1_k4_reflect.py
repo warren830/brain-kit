@@ -189,5 +189,38 @@ class Reflect(unittest.TestCase):
         self.assertIn("T-OMS-3-1", E.Brain.load(os.path.join(wt, "brain")).main())
 
 
+
+TECH2 = TECH + "\n<!-- id:T-OMS-1-2 type:pitfall side:builder rel:new src:D01#S022 -->\n对账按自然日切。\n"
+
+
+def usage_repo(path, pages):
+    """A Brain with T-OMS-1-1 and T-OMS-1-2, one run (OMS-3, intent 261108-oms-3-x) and `pages` committed."""
+    repo = git_repo(path)
+    commit_file(repo, ".brain/kit.json", json.dumps({"version": 1, "req_prefix": "OMS"}))
+    commit_file(repo, "brain/TECH.md", TECH2)
+    bc = sh("git", "-C", repo, "rev-parse", "HEAD").stdout.strip()
+    commit_file(repo, "runs/OMS-3/run.json", json.dumps({"key": "OMS-3", "intent": "261108-oms-3-x",
+                                                         "brain_commit": bc}))
+    for rel, text in pages.items():
+        commit_file(repo, rel, text)
+    return repo
+
+
+def usage_json(repo):
+    rc, out = run_cli(repo, "usage", "--json")
+    assert rc == 0, out
+    return json.loads(out)
+
+
+class Usage(unittest.TestCase):
+    def test_r1_79_ids_after_a_code_block_inside_a_proposal_are_not_citations(self):
+        repo = usage_repo(os.path.join(tmpdir(self), "r"), {"aidlc-docs/261108-oms-3-x/decisions.md": (
+            "按 T-OMS-1-1 做。\n\n```brain-proposal\nrel: adds-to T-OMS-1-1\nsrc: D-1\n---\n补一条：\n"
+            "```python\nx = 1\n```\n另见 T-OMS-1-2。\n```\n")})
+        data = usage_json(repo)
+        self.assertEqual([(r["intent"], r["cited"]) for r in data["runs"]], [("261108-oms-3-x", ["T-OMS-1-1"])])
+        self.assertEqual(data["useful"], [1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()
