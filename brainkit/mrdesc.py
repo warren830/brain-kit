@@ -516,6 +516,18 @@ def _channel(d) -> str:
     return "经 %s" % _one(c, 80) if isinstance(c, str) and c.strip() else "本地会话"
 
 
+def ideation_in_use(events) -> bool:
+    """Lean's Project.ideation_in_use: a start or done record of an Ideation stage newer than the last phase skip of
+    Ideation (`lean new` without --ideation, `lean stage skip ideation`); `events`: the intent's, oldest first."""
+    used = skip = -1
+    for k, e in enumerate(events):
+        if e.get("event") == "PHASE_SKIPPED" and _d(e).get("phase") == "ideation":
+            skip = k
+        elif e.get("event") in ("STAGE_STARTED", "STAGE_COMPLETED") and _d(e).get("stage") in IDEATION_IDS:
+            used = k
+    return used > skip
+
+
 def _approvals(events, tree, docs, plans, lcfg, req) -> dict:
     """Approvals Lean recorded, and those still missing for a release."""
     recorded = []
@@ -532,8 +544,8 @@ def _approvals(events, tree, docs, plans, lcfg, req) -> dict:
     stage = lambda sid: next((e for e in reversed(events) if e.get("event") in STAGE_STATE  # noqa: E731
                               and _d(e).get("stage") == sid), None)
     need = [("REQUIREMENTS", None, "%s/%s" % (docs, REQ_DOC))]
-    if any(e.get("event") in STAGE_STATE and _d(e).get("stage") in IDEATION_IDS for e in events):
-        need.insert(0, ("IDEATION", None, "%s/%s" % (docs, IDEATION_DOC)))     # Ideation used (not PHASE_SKIPPED)
+    if ideation_in_use(events):
+        need.insert(0, ("IDEATION", None, "%s/%s" % (docs, IDEATION_DOC)))
     skipped = stage("application-design")
     if skipped and skipped["event"] == "STAGE_SKIPPED" and (req or {}).get("size") == "small":
         design_skipped = True

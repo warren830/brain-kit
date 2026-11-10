@@ -128,5 +128,51 @@ class JustStarted(unittest.TestCase):
         self.assertNotIn("需求还没写", text)
 
 
+
+def lean_project(repo):
+    """The pinned Lean's Project on repo (its own rules, read-only here)."""
+    sys.path.insert(0, os.path.join(LEAN_SRC, "kit", ".kiro", "aidlc-lean"))
+    try:
+        import aidlc_lean
+    finally:
+        sys.path.pop(0)
+    return aidlc_lean.Project(repo)
+
+
+@unittest.skipUnless(os.path.isfile(TEMPLATE), "AI-DLC Lean checkout not found")
+class IdeationSkipped(unittest.TestCase):
+    """R1-103: Ideation skipped with `lean stage skip ideation` (also after re-opening it) still showed 「还缺：IDEATION」;
+    Lean's rule (Project.ideation_in_use): a start or done record newer than the last phase skip."""
+
+    def at(self, n):
+        return "2026-11-01T00:%02d:00.000Z" % n
+
+    def missing(self, events):
+        repo, cfg = run_world(self, {REQ: "# Requirements: refund\n\n## Goal\n退款。\n"}, events=events)
+        kinds = [m["kind"] for m in mrdesc.build(repo, cfg, "PAY-1")["approvals"]["missing"]]
+        self.assertEqual("IDEATION" in kinds, lean_project(repo).ideation_in_use(INTENT))   # as Lean says
+        return kinds
+
+    def test_skipped_reopened_skipped_again(self):
+        isolated(self)
+        new = [(self.at(0), "INTENT_CREATED", {"title": "refund"}),
+               (self.at(1), "PHASE_SKIPPED", {"phase": "ideation", "stages": [], "reason": "not used"})]
+        reopen = [(self.at(2), "STAGE_STARTED", {"stage": "intent-capture", "unit": None})]
+        skip = [(self.at(3), "PHASE_SKIPPED", {"phase": "ideation", "stages": ["intent-capture"], "reason": "no"})]
+        self.assertNotIn("IDEATION", self.missing(new))
+        self.assertEqual(self.missing(new + reopen)[0], "IDEATION")          # re-opened: in use
+        self.assertNotIn("IDEATION", self.missing(new + reopen + skip))      # skipped again: not
+
+    def test_new_with_ideation_then_skipped(self):
+        isolated(self)
+        events = [(self.at(0), "INTENT_CREATED", {"title": "refund"}),
+                  (self.at(1), "STAGE_STARTED", {"stage": "intent-capture", "unit": None}),
+                  (self.at(2), "STAGE_COMPLETED", {"stage": "intent-capture", "unit": None, "note": "x"})]
+        self.assertEqual(self.missing(events)[0], "IDEATION")
+        events.append((self.at(3), "PHASE_SKIPPED", {"phase": "ideation", "stages": ["market-research"],
+                                                    "reason": "no ideation after all"}))
+        self.assertNotIn("IDEATION", self.missing(events))
+
+
 if __name__ == "__main__":
     unittest.main()
