@@ -501,8 +501,11 @@ def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouc
         when = e.attrs.get("archived")
         if e.attrs.get("status") in ("replaced", "withdrawn") and (since is None or (when and when >= since[:10])):
             archived.append({"id": eid, "status": e.attrs.get("status"), "archived": when, "by": e.attrs.get("by")})
-    stale = [{"intent": r["intent"], "key": r["key"], "ids": r["stale"]} for r in u["runs"] if r["stale"]]
-    unknown = [{"intent": r["intent"], "key": r["key"], "ids": r["unknown"]} for r in u["runs"] if r["unknown"]]
+    # --since: the citations of the runs in the period only (a run before it is not this period's staleness)
+    period = None if since is None else {t["key"] for t in active}
+    rows = [r for r in u["runs"] if period is None or r["key"] in period]
+    stale = [{"intent": r["intent"], "key": r["key"], "ids": r["stale"]} for r in rows if r["stale"]]
+    unknown = [{"intent": r["intent"], "key": r["key"], "ids": r["unknown"]} for r in rows if r["unknown"]]
     staleness = {"stale": stale, "same_term": same_term, "archived": archived, "unknown": unknown,
                  "total": sum(len(s["ids"]) for s in stale) + len(same_term) + len(archived),
                  "not_measured": "桥上“回答冲突”只发了 MR 评论，没进 ledger，这里数不到"}

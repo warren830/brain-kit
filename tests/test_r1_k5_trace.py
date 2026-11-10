@@ -15,7 +15,7 @@ from brainkit import cli, config, trace  # noqa: E402
 from brainkit import evaluate as EV  # noqa: E402
 from brainkit.common import BrainError  # noqa: E402
 from tests.helpers import tmpdir  # noqa: E402
-from tests.test_trace import commit, git_repo  # noqa: E402
+from tests.test_trace import AS_OF, commit, git_repo, world  # noqa: E402
 
 KIT = {"version": 1, "req_prefix": "PAY", "bot_users": ["brain-bot"], "bot_emails": ["brain-bot@noreply.invalid"]}
 
@@ -184,6 +184,38 @@ class R1_104_PhaseSkipped(unittest.TestCase):
         self.assertIn("  [S] Operations（整段跳过 6 个阶段：不上线）· 2026-11-01T00:00:04Z", text)
         self.assertNotIn("intent-capture", text)
         self.assertEqual(trace.numbers(t)["stages_done"], 0)
+
+
+class R1_94_SinceStaleCitations(unittest.TestCase):
+    """brain eval --since (只看这一期) still counted the stale citations of runs outside the period (C-06: tests/
+    test_trace.py's world, PAY-2 and PAY-4 both merged early November, PAY-4 cites the archived T-PAY-9-1)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import shutil
+        import tempfile
+        d = os.path.realpath(tempfile.mkdtemp(prefix="brainkit-"))
+        cls.addClassCleanup(shutil.rmtree, d, True)
+        cls.w = world(cls, runs=("bad", "good"), d=d)
+
+    def collect(self, **kw):
+        w = self.w
+        return EV.collect(w.repo, w.cfg, ledger_path=w.ledger_path, vouchers_dir=w.vouchers, as_of=AS_OF, **kw)
+
+    def test_only_the_runs_of_the_period(self):
+        every = self.collect()
+        self.assertEqual([(x["key"], x["ids"]) for x in every["staleness"]["stale"]], [("PAY-4", ["T-PAY-9-1"])])
+        inside = self.collect(since="2026-11-03")             # PAY-4 merged in the period: still counted
+        self.assertEqual([x["key"] for x in inside["staleness"]["stale"]], ["PAY-4"])
+        later = self.collect(since="2026-11-20")              # both runs are before it
+        self.assertEqual(later["completed"], [])
+        self.assertEqual((later["staleness"]["stale"], later["staleness"]["unknown"]), ([], []))
+        self.assertEqual(later["staleness"]["total"], len(later["staleness"]["same_term"]) +
+                         len(later["staleness"]["archived"]))
+        text = EV.report(later)
+        self.assertIn("过时与冲突：%d（过时引用 0，" % later["staleness"]["total"], text)
+        self.assertNotIn("引用了已归档", text)
+        self.assertNotIn("stale|", "".join(g["subject"] for g in EV.gaps(later)))
 
 
 def audit(recs, email="alice@example.com"):
