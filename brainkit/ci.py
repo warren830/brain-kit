@@ -542,7 +542,13 @@ def bot_commit_rules(repo, branch, env, tgt, cfg, hook_cfg, head) -> list:
     them a person's next push, or a re-run, would turn the bot's red pipeline green."""
     from . import pre_receive
     bots = {e.lower() for e in hook_cfg.get("bot_emails") or []}
-    commits = pre_receive.new_commits(tgt.base, head, hook_cfg["default_branch"], cwd=repo)
+    default = hook_cfg["default_branch"]
+    commits = pre_receive.new_commits(tgt.base, head, default, cwd=repo)
+    # a promotion MR (main -> production): the bot's commits already on the default branch came through their run MRs
+    if env.get("CI_MERGE_REQUEST_TARGET_BRANCH_NAME") != default and git(
+            repo, "fetch", "-q", "origin", "+refs/heads/%s:refs/brain-ci/default" % default, check=False).returncode == 0:
+        fresh = set(git_out(repo, "rev-list", head, "^" + tgt.base, "^refs/brain-ci/default").split())
+        commits = [c for c in commits if c in fresh]
     who = _who(repo, commits)
     mine = _bots_commits(commits, who, bots)
     if not mine:
