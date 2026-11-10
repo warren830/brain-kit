@@ -2,6 +2,7 @@
 named after its id (R1-nn); each failed before its fix."""
 import json
 import os
+import re
 import sys
 import unittest
 from unittest import mock
@@ -577,6 +578,20 @@ class R1_35_ChildMrIntoItsParentsBranch(SplitChild):
         self.assertIn("MR !1 goes into ai/alice/PAY-1-big for PAY-1's owner to review and merge", out)
         self.assertEqual(writes, [("PUT", "/api/v4/projects/acme/shop/merge_requests/1")])
         self.assertEqual(self.tip(self.p.origin, "ai/bob/PAY-4-jobs"), self.tip(self.jobs, "HEAD"))
+
+
+class R1_46_ChildCommitAsDocumented(SplitChild):
+    def test_r1_46_the_child_hand_over_commit_is_the_one_the_docs_show(self):
+        from tests.helpers import ROOT
+        out = self.ok("bob", self.jobs, "handoff")
+        self.assertIn("open its MR into ai/alice/PAY-1-big by hand", out)
+        with open(os.path.join(ROOT, "docs", "安装和使用.md"), encoding="utf-8") as f:
+            said = re.findall(r"`(PAY-3: [^`]*\(unit web of PAY-1\))`", f.read())
+        self.assertEqual(len(said), 1, said)              # 4.7 step 6, for PAY-3 (unit web)
+        subject = sh("git", "-C", self.jobs, "log", "-1", "--format=%s").stdout.strip()
+        self.assertEqual(subject, said[0].replace("PAY-3", "PAY-4").replace("unit web", "unit jobs"))
+        self.assertEqual(sorted(sh("git", "-C", self.jobs, "show", "--name-only", "--format=", "HEAD").stdout.split()),
+                         ["runs/PAY-4/MR.md", "runs/PAY-4/run.json"])
 
 
 if __name__ == "__main__":
