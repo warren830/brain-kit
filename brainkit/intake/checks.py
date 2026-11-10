@@ -307,9 +307,15 @@ CONTRACT_RE = re.compile(r"(?:合同|合約|合约|協議|协议|Contract)\s*(?:
 # ---------- links and instructions ----------
 
 URL_RE = re.compile(r"https?://([A-Za-z0-9.-]+)(?::\d+)?[^\s)\]>\"']*")
+# A line that reads as an approval, a rejection or "allow test change": every form Lean takes as one (its APPROVE_RE,
+# REJECT_RE, ALLOW_PROTECTED_RE: 批准DESIGN, 驳回PLAN, approveDESIGN, 同意：PLAN), and more (approve all ..., 批准所有 ...).
+# A Chinese word needs no space after it, but must not run on into another one (拒绝服务, 批准人, 同意书 are words).
+APPROVAL_KIND = r"IDEATION|REQUIREMENTS|DESIGN|INCEPTION|PLAN|RELEASE|CR-[A-Za-z0-9_]+-[0-9]+"
 APPROVAL_LINE_RE = re.compile(r"(?im)^[ \t]*(?:[-*+][ \t]+|[0-9]{1,3}[.)、][ \t]*)?"
-                              r"(?:approve|approved|批准|同意|reject|驳回|拒绝|allow test change|允许改测试"
-                              r"|允许修改测试|允许修改验收测试)\b.*$")
+                              r"(?:(?:approve|approved|批准|同意|reject|驳回|拒绝)[ \t]*[:：]?[ \t]*(?:%s)"
+                              r"|(?:approve|approved|reject|allow test change)\b"
+                              r"|(?:批准|同意|驳回|拒绝|允许改测试|允许修改测试|允许修改验收测试)(?![一-鿿])"
+                              r"|(?:批准|同意)(?:所有|全部)).*$" % APPROVAL_KIND)
 INJECTION_RE = re.compile(r"(?i)(ignore|disregard|forget)\s+(all\s+|the\s+)?(previous|prior|above|earlier)\s+"
                           r"(instructions|rules|prompts?)|忽略(以上|之前|前面|上面)(的)?(所有)?(指令|指示|规则|規則|要求)"
                           r"|you are now\b|你现在是|你現在是|system prompt|系統提示|系统提示|developer mode")

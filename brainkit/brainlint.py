@@ -11,8 +11,8 @@ Against a base:
   an approver listed in purge_approvers (.brain/kit.json on the target branch)
   archives and PURGED.md only grow
   a new entry is rel:new, or rel:replaces X with X archived in the same change
-  every new piece of text (new entries, appended text, withdraw notes, text outside entries, AGENTS.md) carries no
-  secrets, personal data, amounts, contract numbers, masked placeholders or instruction lines
+  every new piece of text (new entries, appended text, withdraw notes, text outside entries, PURGED.md's notes,
+  AGENTS.md) carries no secrets, personal data, amounts, contract numbers, masked placeholders or instruction lines
 Against the target branch's current Brain (CI): new ids must not already be taken there (parallel MRs).
 Warnings: entries from documents (review alone), entries that relax tests/logging/auth/dependencies
 (Builder + security), text outside entries, repeats >= 2 (make it a gate), one term defined twice, legacy ids.
@@ -26,25 +26,48 @@ from . import entries as E
 from .intake import checks
 
 PLACEHOLDER_RE = re.compile(r"\[(?:%s)-[0-9]+\]" % "|".join(sorted(set(checks.Masker.LABEL.values()))))
-DOC_SRC_RE = re.compile(r"^(?:PKG-|D[0-9]{2}#S[0-9]{3})")
+DOC_SRC_RE = re.compile(r"^(?:PKG-|%s)" % E.SEGMENT_REF)
 RELAX_RE = re.compile(
     r"(?i)(跳过|不用|不需要|无需|免|关闭|关掉|去掉|放宽|降低|绕过|skip|disable|bypass|turn off|no longer|without|relax)"
     r"[^\n]{0,16}?(测试|test|日志|log|鉴权|认证|授权|auth|校验|检查|check|依赖|dependenc|审批|评审|review|lint|"
     r"coverage|覆盖率|加密|encrypt|TLS|HTTPS|权限|permission)")
 TERM_RE = re.compile(r"^\s*(?:[-*]\s*)?\*\*([^*]{1,40})\*\*")
+EMAIL_CHAR_RE = re.compile(r"[A-Za-z0-9._%+-]")
+PARAM_RE = re.compile(r"^\$[0-9]{1,2}$")          # $1, $2 in SQL, shell, awk: a parameter, not dollars
+
+
+def _scan(text) -> list:
+    """checks.scan, except that one capitalised word after @ is a review hit, not personal data: in a TECH entry it is
+    as often a Java annotation (@Transactional, @MockBean) as a person (@Alice). Role words (@Service, @Test) are not
+    even that. The other rules still read the word (an Owner column, an e-mail address)."""
+    lone = [m for m in checks.MENTION_RE.finditer(text) if re.fullmatch(r"[A-Z][a-zA-Z]+", m.group(1))
+            and not (m.start() and EMAIL_CHAR_RE.match(text[m.start() - 1]))]
+    if not lone:
+        return checks.scan(text)
+    chars = list(text)
+    for m in lone:
+        chars[m.start()] = " "                       # same length: the offsets hold
+    hits = checks.scan("".join(chars))
+    for m in lone:
+        if checks.latin_person(m.group(1))[0] and not any(h.start < m.end() and m.start() < h.end for h in hits
+                                                           if h.cat not in ("link", "instruction")):
+            hits.append(checks.Hit("review", "person", m.start(), m.end(), m.group(0)))
+    return hits
 
 
 def content_problems(text, offset=0) -> tuple:
     """(errors, warnings) for text that is about to enter the Brain. With `offset`, the text before it is context
     only (for example the old part of an entry that grows): only findings that start at or after it count."""
     errs, warns = [], []
-    for h in checks.scan(text):
+    for h in _scan(text):
         if h.end <= offset:
             continue
         if h.cat == "secret":
             errs.append("looks like a secret (%s)" % h.kind)
         elif h.cat == "pii":
             errs.append("personal data (%s)" % h.kind)
+        elif h.cat == "business" and h.kind == "amount" and PARAM_RE.match(h.value):
+            continue
         elif h.cat == "business" and h.kind in ("amount", "contract"):
             errs.append("%s %r: write the rule, not the number" % ("amount" if h.kind == "amount" else
                                                                     "contract number", h.value))
@@ -189,16 +212,27 @@ def _boilerplate():
 BOILERPLATE = _boilerplate()
 
 
+def _added(lines, old_lines) -> list:
+    """The non-blank lines of `lines` that `old_lines` does not have (as many times)."""
+    old = Counter(old_lines)
+    added = []
+    for line in lines:
+        if old[line]:
+            old[line] -= 1
+        elif line.strip():
+            added.append(line)
+    return added
+
+
 def _free_text(b, base, errors, warnings):
-    """Lines outside entries reach every run as well: new ones get the same content checks."""
+    """Lines outside entries reach every run as well: new ones get the same content checks. So do PURGED.md's
+    headings and notes (its purge lines have a fixed form)."""
+    added = _added(b.purged_text.split("\n"), base.purged_text.split("\n"))
+    errs, warns = content_problems("\n".join(added))
+    errors += ["%s: %s" % (E.PURGED_FILE, x) for x in errs]
+    warnings += ["%s: %s" % (E.PURGED_FILE, x) for x in warns]
     for name, f in sorted(b.files.items()):
-        old = Counter(base.files[name].free_lines()) if name in base.files else Counter()
-        added = []
-        for line in f.free_lines():
-            if old[line]:
-                old[line] -= 1
-            elif line.strip():
-                added.append(line)
+        added = _added(f.free_lines(), base.files[name].free_lines() if name in base.files else [])
         if not added:
             continue
         text = "\n".join(added)
@@ -209,6 +243,16 @@ def _free_text(b, base, errors, warnings):
         if prose:
             warnings.append("%s: %d line(s) of text outside entries (not tracked as knowledge; read them): %s"
                             % (name, len(prose), prose[0][:60]))
+
+
+def _only_grows(where, be, he, errors):
+    """Sources and proposal hashes only grow, repeats never go down: in the file and on the way into the archive."""
+    if he.repeats < be.repeats:
+        errors.append("%s: repeats went down (%d -> %d)" % (where, be.repeats, he.repeats))
+    lost = [s for s in be.src if s not in he.src] + \
+        [h for h in E.split_src(be.attrs.get("prop")) if h not in E.split_src(he.attrs.get("prop"))]
+    if lost:
+        errors.append("%s: sources or proposal hashes removed (%s); they only grow" % (where, ", ".join(lost)))
 
 
 def _diff(b, base, errors, warnings, purge_approvers):
@@ -243,21 +287,21 @@ def _diff(b, base, errors, warnings, purge_approvers):
                 else:
                     errors.append("%s: text edited in place; only same, adds-to (old text first), replaces, "
                                   "withdraws are allowed" % where)
-            if he.repeats < be.repeats:
-                errors.append("%s: repeats went down (%d -> %d)" % (where, be.repeats, he.repeats))
-            lost = [s for s in be.src if s not in he.src] + \
-                [h for h in E.split_src(be.attrs.get("prop")) if h not in E.split_src(he.attrs.get("prop"))]
-            if lost:
-                errors.append("%s: sources or proposal hashes removed (%s); they only grow" % (where, ", ".join(lost)))
+            _only_grows(where, be, he, errors)
         elif eid in ha:
             af, ae = ha[eid]
+            where = "%s (%s)" % (eid, af.name)
             if af.key != bf.key:
                 errors.append("%s: archived into %s, but it was in %s" % (eid, af.name, bf.name))
+            if ae.type != be.type or ae.attrs.get("side") != be.attrs.get("side"):
+                errors.append("%s: type or side changed on the way into the archive; archive the entry as it was"
+                              % where)
             old, new = be.text(), ae.text()
             if new != old and not new.startswith(old + "\n"):
                 errors.append("%s: archived with different text; archive the entry as it was" % eid)
             elif new != old:
-                _new_text("%s (%s)" % (eid, af.name), new, errors, warnings, [], offset=len(old))
+                _new_text(where, new, errors, warnings, [], offset=len(old))
+            _only_grows(where, be, ae, errors)
             if ae.attrs.get("status") == "replaced" and ae.attrs.get("by") not in hm and ae.attrs.get("by") not in ha:
                 errors.append("%s: archived as replaced by %s, which does not exist" % (eid, ae.attrs.get("by")))
         elif eid in hp:
@@ -299,20 +343,14 @@ def _target(b, base, target, errors):
     mine = base.used_ids()
     for eid, (f, e) in list(b.main().items()) + list(b.archived().items()):
         if eid not in mine and eid in taken:
-            errors.append("%s: this id was taken on the target branch meanwhile (another MR merged first): rebase "
-                          "on it and run brain reflect again" % eid)
+            errors.append("%s: this id was taken on the target branch meanwhile (another MR merged first): close "
+                          "this MR and run brain reflect again (it writes the proposals again on a new branch, with "
+                          "free ids)" % eid)
 
 
 def check_agents(head_text, base_text):
     """AGENTS.md is read by every run too: new lines get the content checks."""
-    old = Counter((base_text or "").split("\n"))
-    added = []
-    for line in (head_text or "").split("\n"):
-        if old[line]:
-            old[line] -= 1
-        elif line.strip():
-            added.append(line)
-    errs, warns = content_problems("\n".join(added))
+    errs, warns = content_problems("\n".join(_added((head_text or "").split("\n"), (base_text or "").split("\n"))))
     return ["AGENTS.md: " + x for x in errs], ["AGENTS.md: " + x for x in warns]
 
 

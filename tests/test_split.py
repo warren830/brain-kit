@@ -288,7 +288,7 @@ class Family(unittest.TestCase):
         return {d["key"]: d for d in json.loads(out)}
 
     def wt(self, owner, key):
-        return os.path.join(self.home, ".brain", "worktrees", owner, key)
+        return split.worktree_path(getattr(self, owner), key)
 
     # ---------- the whole way ----------
 

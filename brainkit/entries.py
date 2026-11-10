@@ -51,8 +51,10 @@ PURGED_RE = re.compile(r"^- ([A-Z]-[A-Z0-9-]+) · ")
 PURGED_LINE_RE = re.compile(r"^- ([A-Z]-[A-Z0-9-]+) · ([0-9]{4}-[0-9]{2}-[0-9]{2}) · (%s) · approved by "
                             r"([a-z0-9][a-z0-9._-]{0,63})(?: · props ([0-9a-f]{8}(?:,[0-9a-f]{8})*))?$"
                             % "|".join(PURGE_REASONS))
+# A segment of a material package: intake numbers documents D01 ... D99, D100 ... and segments S001 ... S999, S1000 ...
+SEGMENT_REF = r"D[0-9]{2,4}#S[0-9]{3,5}"
 # Sources are references, never free text: segments, packages, decisions, vouchers, runs, entries, intents, keys.
-SRC_ITEM_RE = re.compile(r"^(?:D[0-9]{2}#S[0-9]{3}|PKG-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3}"
+SRC_ITEM_RE = re.compile(r"^(?:" + SEGMENT_REF + r"|PKG-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3}"
                          r"|D-[1-9][0-9]{0,4}|V-[0-9a-f]{10}|RUN-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,5}"
                          r"|[A-Z]-[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6}-[1-9][0-9]{0,3}|[A-Z]-[0-9]{1,5}"
                          r"|[0-9]{6}-[a-z0-9][a-z0-9-]{0,80}|[A-Z][A-Z0-9]{0,9}-[1-9][0-9]{0,6})$")
@@ -260,14 +262,16 @@ class BrainFile:
         if at is not None:
             self.blocks[at:at] = [e]
             return
-        pos = len(self.blocks)
         if section:
             pos = self._section_end(section)
+        else:                                # no section: after the entries without one, before the first section
+            pos = next((i for i, b in enumerate(self.blocks) if isinstance(b, str) and re.match(r"^#{2,6}\s", b)),
+                       len(self.blocks))
         while pos > 0 and isinstance(self.blocks[pos - 1], str) and not self.blocks[pos - 1].strip():
             pos -= 1
         new = ["", e]
-        if pos < len(self.blocks):
-            new.append("")
+        if pos < len(self.blocks) and not (isinstance(self.blocks[pos], str) and not self.blocks[pos].strip()):
+            new.append("")                   # one blank line before what follows, not two
         self.blocks[pos:pos] = new
 
     def _section_end(self, section):
@@ -456,9 +460,13 @@ class Brain:
         if not body:
             raise BrainError("entry text is empty")
         lines = body.split("\n")
-        if any(LOOSE_HEADER_RE.search(l) or HEADING_RE.match(l) for l in lines):
-            raise BrainError("entry text may not contain headings or entry headers")
-        if sum(1 for l in lines if FENCE_RE.match(l)) % 2:
+        fence = False                        # read as BrainFile._parse does: in a code block "# x" is a comment
+        for line in lines:
+            if FENCE_RE.match(line):
+                fence = not fence
+            elif not fence and (LOOSE_HEADER_RE.search(line) or HEADING_RE.match(line)):
+                raise BrainError("entry text may not contain headings or entry headers (outside code blocks)")
+        if fence:
             raise BrainError("entry text has an unclosed code fence")
         return lines
 
@@ -510,10 +518,10 @@ class Brain:
         return eid
 
     def adds_to(self, eid, text, src, prop=None):
+        """The rel stays (like same and repeat): an entry new in this change stays rel:new, as lint wants."""
         f, e = self.get(eid)
         e.body = e.body + [""] + self._body(text)
         e.add_src(src)
-        e.attrs["rel"] = "adds-to"
         _add_prop(e, prop)
         self.dirty.add(f.name)
         return eid

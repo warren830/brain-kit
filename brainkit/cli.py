@@ -1532,6 +1532,15 @@ def cmd_entry(a):
         print("%s\n%s" % (hit[1].header(), "\n".join(hit[1].body)))
         return 0
     before = entries.Brain.load(bd)
+    base_ref = _default_base(repo, cfg)       # what brain lint and CI compare with
+    base = entries.Brain.from_git(repo, base_ref, cfg["brain_dir"]) if base_ref else before
+    if a.op in ("replace", "withdraw", "purge") and (a.id in before.main() or a.id in before.archived()) \
+            and a.id not in base.used_ids():
+        raise BrainError("%s was added in this change and is not on %s yet: %s only applies to merged entries (the "
+                         "archive and PURGED.md keep those). Append to it with adds-to, or delete it from the file "
+                         "by hand and add it again (it was never merged, so lint does not count that as a deletion)%s"
+                         % (a.id, cfg["default_branch"], a.op, ". If you committed it, its text is in this branch's "
+                            "history: drop or rewrite those commits" if a.op == "purge" else ""))
     brain = entries.Brain.load(bd)
     used = reflect.used_on_branches(repo, cfg["brain_dir"]) if a.op in ("add", "replace") else set()
     if a.op == "add":
@@ -1550,7 +1559,7 @@ def cmd_entry(a):
         res = "%s（第 %d 次重复%s）" % (a.id, n, "：该改成 gate 了" if n >= 2 else "")
     else:
         res = brain.purge(a.id, a.reason, a.approved_by)
-    errors, warnings = brainlint.check(brain, base=before, purge_approvers=cfg.get("purge_approvers") or [])
+    errors, warnings = brainlint.check(brain, base=base, purge_approvers=cfg.get("purge_approvers") or [])
     _print_lint(errors, warnings)
     if errors:
         print("brain entry: 没有写入（上面的错误要先改）")
@@ -1607,8 +1616,8 @@ def cmd_reflect(a):
         print("%s 里没有 brain-proposal 块：这个 run 没有提出 Brain 条目。" % label)
         return 0
     brain = entries.Brain.from_git(repo, base, mcfg["brain_dir"])
-    used, pending = reflect.open_branches(repo, mcfg["brain_dir"])
-    ops, more, notes = reflect.plan(brain, proposals, key, pending=pending, used_extra=used)
+    used, pending, stuck = reflect.open_branches(repo, mcfg["brain_dir"], base)
+    ops, more, notes = reflect.plan(brain, proposals, key, pending=pending, used_extra=used, stuck=stuck)
     probs += more
     rows, more = reflect.plan_gaps(repo, cfg, gaps, key)
     probs += more
@@ -1646,8 +1655,6 @@ def cmd_reflect(a):
         print("这是预览。加 --apply 在 main 上开新分支写入（不动你当前的工作区）%s。"
               % ("，并登记 %d 个缺口" % len(fresh) if fresh else ""))
         return 0
-    if fresh:
-        file_gaps()
     br = reflect.branch_name(repo, key)
     wt = os.path.abspath(a.worktree) if a.worktree else os.path.join(reflect.worktree_root(repo),
                                                                      br.replace("/", "-"))
@@ -1655,6 +1662,7 @@ def cmd_reflect(a):
         raise BrainError("%s already exists" % wt)
     os.makedirs(os.path.dirname(wt), exist_ok=True)
     git(repo, "worktree", "add", "-q", "--no-track", "-b", br, wt, base)
+    title = "Brain: %s reflect（%d 条）" % (key, sum(1 for op in ops if op.kind != "same"))
     try:
         bd = os.path.join(wt, mcfg["brain_dir"])
         b2 = entries.Brain.load(bd)
@@ -1664,19 +1672,21 @@ def cmd_reflect(a):
                                            purge_approvers=mcfg.get("purge_approvers") or [])
         if errors:
             raise BrainError("brain lint refused the result:\n  " + "\n  ".join(errors))
-        desc = reflect.mr_description(key, ops, warnings + lost, label, gaps=rows)
-        title = "Brain: %s reflect（%d 条）" % (key, sum(1 for op in ops if op.kind != "same"))
-        with open(wt + ".mr.md", "w", encoding="utf-8") as f:
-            f.write("%s\n\n%s" % (title, desc))
         if not a.no_commit:
             git(wt, "add", "-A", "--", mcfg["brain_dir"])
-            git(wt, "commit", "-q", "-m", "%s\n\n%s" % (title, desc))
+            git(wt, "commit", "-q", "-m", "%s\n\n%s" % (title, reflect.mr_description(
+                key, ops, warnings + lost, label, gaps=None if fresh else rows)))
+        if fresh:            # their claims go to origin: only once every step that can fail here has passed
+            file_gaps()
     except BaseException:
         git(repo, "worktree", "remove", "--force", wt, check=False)
         git(repo, "branch", "-D", br, check=False)
-        if os.path.exists(wt + ".mr.md"):
-            os.remove(wt + ".mr.md")
         raise
+    desc = reflect.mr_description(key, ops, warnings + lost, label, gaps=rows)
+    with open(wt + ".mr.md", "w", encoding="utf-8") as f:
+        f.write("%s\n\n%s" % (title, desc))
+    if fresh and not a.no_commit:
+        git(wt, "commit", "-q", "--amend", "-m", "%s\n\n%s" % (title, desc))
     for op in ops:
         print("  %s %s%s" % (op.kind, op.result, "（%s）" % op.note if op.note else ""))
     if a.no_commit:
