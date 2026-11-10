@@ -197,11 +197,13 @@ def _login_name() -> str:
     return name if USER_RE.match(name) else ""
 
 
-def _store(repo, override=None) -> str:
-    """Where material packages live on this machine (a clone of brain-intake when shared)."""
+def _store(repo, override=None, create=True) -> str:
+    """Where material packages live on this machine (a clone of brain-intake when shared). A dry run does not
+    create it (create=False)."""
     s = override or os.environ.get("BRAIN_INTAKE_DIR") or git(repo, "config", "brain.intake", check=False).stdout.strip()
     s = os.path.abspath(os.path.expanduser(s or "~/.brain/intake"))
-    os.makedirs(os.path.join(s, "packages"), exist_ok=True)
+    if create:
+        os.makedirs(os.path.join(s, "packages"), exist_ok=True)
     return s
 
 
@@ -303,6 +305,8 @@ def _print_report(rep):
                                                rep["classification"], "（预览，未写入）" if rep.get("dry") else ""))
     for line in rep["findings"]:
         print("  " + line)
+    for w in rep.get("warnings", []):
+        print("  注意：" + w)
     for b in rep.get("blocking", []):
         print("  不能提交：" + b)
 
@@ -773,10 +777,11 @@ def _release(repo, cfg, me, key):
 
 
 def _intake(repo, cfg, a, key, me):
-    rep = intake.build(a.doc, key, _store(repo, a.store), submitter=me, consent=a.consent,
+    dry = getattr(a, "dry_run", False)
+    rep = intake.build(a.doc, key, _store(repo, a.store, create=not dry), submitter=me, consent=a.consent,
                        classification=a.classification, business=a.business, kit_intake=cfg["intake"],
-                       dry_run=getattr(a, "dry_run", False), exclude=a.exclude or ())
-    rep["dry"] = getattr(a, "dry_run", False)
+                       dry_run=dry, exclude=a.exclude or ())
+    rep["dry"] = dry
     _print_report(rep)
     return rep
 
@@ -1723,7 +1728,8 @@ def _intake_args(s, required_key):
     s.add_argument("--consent", action="store_true", help="gate 1: I am the author or have the author's consent")
     s.add_argument("--business", choices=("keep", "mask"), help="gate 3: amounts/companies/contract numbers")
     s.add_argument("--store", help="intake store (default $BRAIN_INTAKE_DIR, git config brain.intake, ~/.brain/intake)")
-    s.add_argument("--exclude", action="append", help="leave out files matching this glob (repeatable)")
+    s.add_argument("--exclude", action="append", help="leave out a file or a folder: its path, its name or a glob "
+                                                     "(repeatable)")
 
 
 def main(argv=None):

@@ -205,12 +205,14 @@ class R7CjkLabels(unittest.TestCase):
         self.assertIn("顾客可以在 App 里查看退款进度。顾客取消订单后，退款原路返回。", text)
         self.assertNotIn("[人名-", text)
 
-    def test_only_values_found_by_their_form_spread(self):
+    def test_label_names_spread_like_values_found_by_their_form(self):
+        # R1-48 (the user's decision of 2026-11-10): a name found next to a label is masked wherever it occurs, as a
+        # phone is; this test used to pin the opposite (the name stayed where it was not labelled)
         _, text, _ = build(self, {"a.md": "# 值班\n\n负责人：张伟。電話：9123 4567\n",
                                   "b.md": "# 记录\n\n张伟说修好了，回拨 9123 4567。\n"})
         self.assertIn("负责人：[人名-1]", text)
-        self.assertIn("张伟说修好了", text)                                  # a label-based name stays where it was found
-        self.assertNotIn("9123 4567", text)                                 # a phone is masked wherever it occurs
+        self.assertIn("[人名-1]说修好了", text)
+        self.assertNotIn("9123 4567", text)
 
 
 # ---------- 8: formats, algorithms and rules after 密码为 / password is ----------

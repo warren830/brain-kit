@@ -345,6 +345,7 @@ class ReviewFindings(unittest.TestCase):
         d = tmpdir(self)
         src = os.path.join(d, "src")
         write(os.path.join(src, "a.md"), "# x\n<!-- %s -->\n" % " ".join("u%d@corp.example.com" % i for i in range(40)))
+        write(os.path.join(src, "b.md"), "# y\n")      # a package with no file taken in is not written (R1-66)
         rep = package.build([src], "OMS-1", os.path.join(d, "s"), submitter="x", consent=True,
                             classification="internal", business="mask", kit_intake=KIT)
         self.assertEqual(len(rep["refused"]), 1)
