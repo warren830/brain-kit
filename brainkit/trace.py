@@ -138,11 +138,16 @@ def audit_labels(paths) -> dict:
 
 
 def _utc(s):
-    """Any ISO time (Lean ms + Z, git +08:00) -> YYYY-MM-DDTHH:MM:SSZ; a bare date stays a date; junk -> None."""
+    """Any ISO time (Lean ms + Z, git +08:00) -> YYYY-MM-DDTHH:MM:SSZ; a bare date stays a date; junk, and a day that
+    does not exist (2026-02-30, 2026-13-01), -> None."""
     if not isinstance(s, str) or not s.strip():
         return None
     s = s.strip()
     if DATE_RE.match(s):
+        try:
+            datetime.strptime(s, "%Y-%m-%d")
+        except ValueError:
+            return None
         return s
     try:
         dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
