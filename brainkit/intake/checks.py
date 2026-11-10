@@ -61,7 +61,7 @@ ROLE_SUFFIXES_1 = tuple("方员員长長会會岗崗师師")       # one-charact
 NOT_NAMES = set(("产品 產品 运维 運維 运营 運營 开发 開發 测试 測試 客服 财务 財務 法务 法務 设计 設計 前端 后端 後端 研发 研發 "
                  "业务 業務 用户 用戶 客户 客戶 系统 系統 平台 待定 暂无 暫無 本人 自己 全员 全員 大家 双方 雙方 甲方 乙方 "
                  "我方 对方 對方 各方 管理员 管理員 机器人 機器人 值班 未定 未知 不限 任意 所有人 任何人 安全 安排 文本 文字 "
-                 "文档 文檔 文件 金额 金額 金融 高级 高級 高层 高層 高管 高优 方案 方式 方法 方面 周期 週期 周末 週末 周报 "
+                 "文档 文檔 文件 金额 金額 金融 高级 高級 高层 高層 高管 高优 高峰 方案 方式 方法 方面 周期 週期 周末 週末 周报 "
                  "週報 周会 常规 常規 常量 程序 余额 餘額 万一 萬一 严重 嚴重 温度 溫度 白天 周一 周二 周三 周四 周五 周六 "
                  "周日 周天 週一 週二 週三 週四 週五 週六 週日 董事 董事会 董事會 董事长 董事長 理事会 理事會 股东 股東 "
                  "顾客 顧客 顾问 顧問 任务 任務 任何 白班 常务 常務 常驻 常駐 常用 文员 文員 文案 钱包 錢包 钱款 錢款 关键 關鍵 "
@@ -124,7 +124,7 @@ LATIN_SURNAMES = set((
     "shao wan qian dai mo kong kang yi qiao lai wen chang pang lan ou mai guan cen gan geng ni nie zhan "
     "chan wong leung cheung lau lee ho ng lam tsang chow yip tam kwok lo mak choi fung tse yeung hui siu kwan law chu "
     "poon yuen au chung ip ko so lai tong tsui chiu shum sze mok hung chau chui kwong fong kam chiang tsoi yau lui "
-    "wai lok chik tsoi chui leong lim tan ong teo goh koh kho "
+    "wai lok chik tsoi chui leong lim tan ong teo goh koh kho to or an on "     # to / or / an / on: stop words but in a name cell
     "smith johnson williams brown jones garcia miller davis rodriguez martinez hernandez lopez gonzalez wilson "
     "anderson thomas taylor moore jackson martin perez thompson white harris sanchez clark ramirez lewis robinson "
     "walker young allen king wright scott torres nguyen hill flores green adams nelson baker hall rivera campbell "
@@ -186,16 +186,20 @@ def latin_person(v, cell=False) -> tuple:
 CELL_SPLIT_RE = re.compile(r"<br\s*/?>|[,，、/;；&()（）\[\]【】]|(?<=[一-鿿]{2})[和及与與](?=[一-鿿]{2})")
 
 
-def _cell_person(x) -> bool:
-    """One part of a name-column cell is a person (张伟, 王工程师, Alice Wang, Peter To), not a role or team."""
+def _cell_person(x):
+    """'name', 'maybe' or None for one part of a name-column cell. The column says a person may stand here, but only
+    what the name check is sure of is a name (张伟, 王工程师, Alice Wang, Peter To); a value without a surname (风控,
+    商家, Billing) is 'maybe', listed for the person to check."""
     if not NAME_VALUE_RE.match(x):
-        return False
+        return None
     core = x.lstrip("@")
     if re.match(r"^[一-鿿]+$", core):
-        return cjk_person(core, need_surname=False) is not None    # the column says it is a person
+        if cjk_person(core, need_surname=False) is None:
+            return None
+        return cjk_person(core) or "maybe"
     flat = re.sub(r"[.-]+", " ", core)
     verdict, n = latin_person(flat, cell=True)
-    return verdict is not None and n == len(flat.split())
+    return verdict if n == len(flat.split()) else None
 
 
 # Markdown emphasis on a label or a name (**负责人**：李娜, - **联系人：** 王芳, **Owner:** Alice Wang, Reported by **Bob
@@ -285,8 +289,9 @@ def _kv_secrets(text) -> list:
     for m in KV_SECRET_RE.finditer(text):
         cut = _NOT_ASCII_RE.search(m.group(2))
         v = m.group(2)[:cut.start()] if cut else m.group(2)          # 密码：abc123（测试环境）
-        if len(v) < 4 or _blanked(v) or v.startswith(("$", "%(", "{{")) or describes_a_secret(v):
-            continue
+        if len(v) < 4 or _blanked(v) or v.startswith(("$", "%(", "{{")) or describes_a_secret(v) or \
+                SAID_SECRET_UNIT_RE.match(text, m.start(2) + len(v)):
+            continue                                 # 密码：8-16位 is a rule
         hits.append(Hit("secret", "kv_secret", m.start(2), m.start(2) + len(v), v))
     for m in SAID_SECRET_RE.finditer(text):
         v = m.group(2).rstrip(".")
@@ -303,9 +308,9 @@ def _kv_secrets(text) -> list:
 
 # ---------- business-sensitive ----------
 
-# An amount carries a currency (a code, a sign or a name, before or after the number) or 元 / 萬 (README, gate 3):
-# HKD 50,000, EUR 300, 300 EUR, €300, 港幣 50,000, 人民币 5,000, 100萬港元, 5千元, 3,000 元, 500萬. A number with
-# 萬 / 亿 alone is an amount unless a word follows that says what is counted (500萬用户, 1亿 次请求).
+# An amount carries a currency (a code, a sign or a name, before or after the number) or 元 (README, gate 3):
+# HKD 50,000, EUR 300, 300 EUR, €300, 港幣 50,000, 人民币 5,000, 人民币 300 万, 100萬港元, 5 万元, 3,000 元. A number
+# with 万 / 亿 alone is a count (峰值 QPS 10万, 日活 100万), the user's decision of 2026-11-10.
 CUR_CODE = r"(?:HKD|USD|CNY|RMB|CNH|EUR|GBP|SGD|JPY|AUD)"
 CUR_NAME = r"(?:港元|港幣|港币|美元|美金|人民幣|人民币|歐元|欧元|英鎊|英镑|日元)"
 CUR = r"(?:%s|HK\$|US\$|S\$|¥|￥|\$|€|£|%s)" % (CUR_CODE, CUR_NAME)     # before the number (元 alone only after it)
@@ -314,13 +319,10 @@ CJK_SCALE = r"(?:[百千]?[億亿萬万]|[百千])"
 SCALE = r"(?:%s|k|K|m|M|bn|million|billion)" % CJK_SCALE                    # only after a currency: 3M alone is a tenor
 _NUM = r"[0-9][0-9,]*(?:\.[0-9]+)?"
 _SP = r"[ \t\u00a0]?"
-_COUNTED = r"(?![ \t\u00a0]*(?!左右|以上|以内|以內|以下|起|封顶|封頂|上下)\w)"   # 500萬，/ 500萬左右, not 500萬用户
 AMOUNT_RE = re.compile(r"(?<![A-Za-z0-9])(?:{cur}{sp}{num}(?:{sp}{scale})?(?:{sp}{word})?"
                        r"|{num}{sp}(?:{cjk}{sp})?{word}"
-                       r"|{num}{sp}(?:{scale}{sp})?{code}"
-                       r"|{num}{sp}[百千]?[億亿萬万]{counted})(?![A-Za-z0-9])".format(
-                           cur=CUR, sp=_SP, num=_NUM, scale=SCALE, word=MONEY_WORD, cjk=CJK_SCALE, code=CUR_CODE,
-                           counted=_COUNTED))
+                       r"|{num}{sp}(?:{scale}{sp})?{code})(?![A-Za-z0-9])".format(
+                           cur=CUR, sp=_SP, num=_NUM, scale=SCALE, word=MONEY_WORD, cjk=CJK_SCALE, code=CUR_CODE))
 # A company name ends with its suffix. The suffixes are also the head of common words (银行卡, 银行账户, 证券账户, 证券代码,
 # 资产管理计划): followed by one of these characters it is such a word, not a name. A Latin name stays on one line
 # (a heading "Payment Methods" over "Bank cards ..." is no company).
@@ -414,14 +416,27 @@ def _table_name_cells(text):
                             cuts = [0] + [x for m in CELL_SPLIT_RE.finditer(cell) for x in m.span()] + [len(cell)]
                             for p0, p1 in zip(cuts[::2], cuts[1::2]):
                                 part = cell[p0:p1].strip().strip("*").strip()
-                                if part and _cell_person(part):
+                                verdict = _cell_person(part) if part else None
+                                if verdict:
                                     s = offsets[j] + a + cell.index(part, p0)
-                                    hits.append(Hit("pii", "person", s, s + len(part), part))
+                                    hits.append(Hit("pii" if verdict == "name" else "review", "person", s,
+                                                    s + len(part), part))
                 j += 1
             i = j
         else:
             i += 1
     return hits
+
+
+FENCE_RE = re.compile(r"(?m)^[ \t]*(?:`{3,}|~{3,})")
+INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+
+
+def _code_spans(text) -> list:
+    """[(start, end)] of fenced code blocks and inline code."""
+    fences = [m.start() for m in FENCE_RE.finditer(text)] + [len(text)]
+    spans = list(zip(fences[0:-1:2], fences[1::2]))
+    return spans + [m.span() for m in INLINE_CODE_RE.finditer(text)]
 
 
 def scan(text) -> list:
@@ -453,8 +468,19 @@ def scan(text) -> list:
         digits = re.sub(r"[ -]", "", m.group(0))
         if 15 <= len(digits) <= 19 and luhn_ok(digits):
             add(Hit("pii", "card", m.start(), m.end(), m.group(0)))
+    code = _code_spans(text)
     for m in MENTION_RE.finditer(text):
-        add(Hit("pii", "person", m.start(), m.end(), m.group(0)))
+        v = m.group(1)
+        if re.match(r"[一-鿿]", v):
+            if cjk_person(v) is not None:            # not @所有人, @大家
+                add(Hit("pii", "person", m.start(), m.end(), m.group(0)))
+            continue
+        if any(a <= m.start() < b for a, b in code):
+            continue                                 # an annotation (@Service, @Autowired)
+        verdict, n = latin_person(v)
+        if verdict:                                  # not @Data, @Service
+            end = m.start(1) + [w.end() for w in re.finditer(r"\S+", v)][n - 1]
+            add(Hit("pii", "person", m.start(), end, text[m.start():end]))
     hits += _table_name_cells(text)
     hits += _labelled_names(text)
     for m in AMOUNT_RE.finditer(text):
@@ -490,29 +516,51 @@ def _dedupe(hits):
         if clash is None:
             last = len(kept)
             kept.append(h)
-        elif rank[h.cat] < rank[clash.cat]:
+        elif _replaces(h, clash, rank):
             kept[last] = None                        # dropped; h goes to the end, as before
             last = len(kept)
             kept.append(h)
     return sorted((k for k in kept if k is not None), key=lambda h: h.start)
 
 
-# A value judged sensitive once is masked wherever it occurs in the package: other rows, other files, the hidden area
-# and file names. That holds for values found by their own form (check digits, phone, card and address formats, key
-# formats, amounts, company suffixes) and for names and passwords found next to a label (R1-48, the user's decision of
-# 2026-11-10). Only a confident find spreads: a name the name check rejects (提出人：顾客) or files under review never
-# becomes a value. A password that is a plain short word (password: admin) is masked where it was found but does not
-# spread, so the word admin elsewhere (a role, /api/admin) stays readable.
+def _replaces(h, k, rank) -> bool:
+    """h takes the place of k, which it overlaps: the stronger hit wins, but personal data that holds a secret stays
+    whole (a phone 139 8888 1234 holding the PIN 8888), so no part of it shows around the secret's placeholder."""
+    if {h.cat, k.cat} == {"pii", "secret"}:
+        pii, secret = (h, k) if h.cat == "pii" else (k, h)
+        if pii.start <= secret.start and secret.end <= pii.end and pii.end - pii.start > secret.end - secret.start:
+            return h is pii
+    return rank[h.cat] < rank[k.cat]
+
+
+# A value judged sensitive once is masked wherever it occurs in the package as a whole word: other rows, other files,
+# the hidden area and file names. That holds for values found by their own form (check digits, phone, card and
+# address formats, key formats, amounts, company suffixes) and for names and passwords found next to a label (R1-48,
+# the user's decision of 2026-11-10). Only a sure find spreads: a name the name check is not sure of (提出人：顾客,
+# 负责人列的 风控) is never a value. A password that is a common word of requirements (password: admin) or names its own
+# field (token=refresh_token, api_key: X-Api-Key) is masked where it was found but does not spread, so the word
+# elsewhere (a role, /api/admin, the refresh_token field) stays readable.
 PROPAGATE_KINDS = {"hkid", "cnid", "phone", "email", "card", "private_key", "cloud_key", "bearer", "token",
                    "amount", "company", "contract", "person", "kv_secret"}
+WORD_PASSWORDS = set("admin administrator root test demo guest user default monkey".split())
+SECRET_FIELD_WORDS = set("password passwd pwd secret token key api apikey".split())
+_WORD_CHAR = re.compile(r"[A-Za-z0-9_]")
 
 
 def _spreads(kind, v) -> bool:
     if len(v) < 2:
         return False
     if kind == "kv_secret":
-        return len(v) >= 8 or bool(re.search(r"[^A-Za-z]", v))
+        return v.lower() not in WORD_PASSWORDS and not set(re.split(r"[^a-z0-9]+", v.lower())) & SECRET_FIELD_WORDS
     return True
+
+
+def _whole_word(text, start, end) -> bool:
+    """A Latin or digit edge of the value is no part of a longer word or number (Service in RefundService, 5万 in 15万,
+    8888 in 13988881234). Chinese has no spaces between words, so a Chinese edge always counts."""
+    def glued(a, b):
+        return 0 <= a and b < len(text) and _WORD_CHAR.match(text[a]) and _WORD_CHAR.match(text[b])
+    return not glued(start - 1, start) and not glued(end - 1, end)
 
 
 def propagate(text, hits, values) -> list:
@@ -529,8 +577,12 @@ def propagate(text, hits, values) -> list:
                 continue
             start = text.find(v)
             while start >= 0:
-                extra.append(Hit(cat, kind, start, start + len(v), v))
-                start = text.find(v, start + len(v))
+                if _whole_word(text, start, start + len(v)):
+                    extra.append(Hit(cat, kind, start, start + len(v), v))
+                    start += len(v)
+                else:
+                    start += 1
+                start = text.find(v, start)
     return _dedupe(list(hits) + extra) if extra else hits
 
 

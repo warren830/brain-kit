@@ -118,7 +118,8 @@ class R1_70HongKongPhone(Base):
 
 
 class R1_52AmountForms(Base):
-    """Gate 3 missed amounts with a currency code or name before the number, 千元 and 萬 alone."""
+    """Gate 3 missed amounts with a currency code or name before the number and 千元. 萬 alone was an amount until
+    the user's decision of 2026-11-10 (R2-08): without a currency or 元 it is a count."""
 
     def amounts(self, text):
         return [h.value for h in checks.scan(text) if h.kind == "amount"]
@@ -126,10 +127,10 @@ class R1_52AmountForms(Base):
     def test_forms(self):
         for text, value in (("欧洲站：EUR 300 / 单", "EUR 300"), ("英国站：GBP 1,000 / 月", "GBP 1,000"),
                             ("新加坡站：SGD 2,000 / 月", "SGD 2,000"), ("单笔上限 5千元", "5千元"),
-                            ("年度预算 500萬", "500萬"), ("最低認購金額：港幣 50,000", "港幣 50,000"),
+                            ("年度预算 500萬元", "500萬元"), ("最低認購金額：港幣 50,000", "港幣 50,000"),
                             ("单笔上限：人民币 5,000", "人民币 5,000"), ("单笔上限：美元 1,000", "美元 1,000"),
                             ("手续费：港币 100 元", "港币 100 元"), ("对照：300 EUR", "300 EUR"),
-                            ("HKD 5千万", "HKD 5千万"), ("预算 500万左右", "500万")):
+                            ("HKD 5千万", "HKD 5千万"), ("预算 500万元左右", "500万元")):
             self.assertEqual(self.amounts(text), [value], text)
 
     def test_not_amounts(self):
@@ -138,7 +139,7 @@ class R1_52AmountForms(Base):
 
     def test_masked_in_the_package(self):
         self.file("报价.md", "# 报价\n\n- 欧洲站：EUR 300 / 单\n- 英国站：GBP 1,000 / 月\n- 新加坡站：SGD 2,000 / 月\n"
-                  "- 国内：单笔上限 5千元，年度预算 500萬\n- 最低認購金額：港幣 50,000\n- 内地：人民币 5,000\n"
+                  "- 国内：单笔上限 5千元，年度预算 500萬元\n- 最低認購金額：港幣 50,000\n- 内地：人民币 5,000\n"
                   "- 美国：美元 1,000\n")
         text = self.segments(self.build())
         for raw in ("300", "1,000", "2,000", "5千元", "500萬", "50,000", "5,000"):
@@ -282,7 +283,7 @@ class R1_55ClassificationMarks(Base):
 
 
 def _dedupe_reference(hits):
-    """The old quadratic _dedupe, to compare against."""
+    """The old quadratic _dedupe, to compare against (which hit replaces which: checks._replaces, R2-11)."""
     rank = {"secret": 0, "pii": 1, "business": 2, "review": 3, "link": 4, "instruction": 5}
     hits.sort(key=lambda h: (h.start, rank[h.cat], -(h.end - h.start)))
     kept = []
@@ -294,7 +295,7 @@ def _dedupe_reference(hits):
                      None)
         if clash is None:
             kept.append(h)
-        elif rank[h.cat] < rank[clash.cat]:
+        elif checks._replaces(h, clash, rank):
             kept.remove(clash)
             kept.append(h)
     return sorted(kept, key=lambda h: h.start)
