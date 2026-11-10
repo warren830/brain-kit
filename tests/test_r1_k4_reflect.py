@@ -72,6 +72,14 @@ def brain_branches(repo):
     return sh("git", "-C", repo, "for-each-ref", "--format=%(refname:short)", "refs/heads/brain/").stdout.split()
 
 
+def worktree_of(repo, branch):
+    for block in sh("git", "-C", repo, "worktree", "list", "--porcelain").stdout.split("\n\n"):
+        lines = block.split("\n")
+        if "branch refs/heads/" + branch in lines:
+            return lines[0][len("worktree "):]
+    return None
+
+
 class Reflect(unittest.TestCase):
     def setUp(self):
         self.home = isolate_home(self)
@@ -161,6 +169,24 @@ class Reflect(unittest.TestCase):
         self.assertIn("OMS-4 · test · 退款对账没有自动测试", msg)
         with open(wt + ".mr.md", encoding="utf-8") as f:
             self.assertIn("OMS-4 · test · 退款对账没有自动测试", f.read())
+
+    def test_r1_84_two_projects_with_the_same_folder_name(self):
+        a = project(os.path.join(self.d, "a", "shop"), ONE)
+        b = project(os.path.join(self.d, "b", "shop"), ONE)
+        # a's reflect from before: uncommitted, where 0d52e97 put worktrees (~/.brain/worktrees/<folder name>/...)
+        old = os.path.join(self.home, ".brain", "worktrees", "shop", "brain-OMS-3-reflect-1")
+        rc, out = run_cli(a, "reflect", "--apply", "--no-commit", "--worktree", old)
+        self.assertEqual(rc, 0, out)
+        rc, out = run_cli(a, "reflect", "--apply")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(old, out)
+        self.assertEqual(brain_branches(a), ["brain/OMS-3-reflect-1"], out)
+        rc, out = run_cli(b, "reflect", "--apply")
+        self.assertEqual(rc, 0, out)
+        wt = worktree_of(b, "brain/OMS-3-reflect-1")
+        self.assertEqual(os.path.dirname(os.path.dirname(wt)), os.path.join(self.home, ".brain", "worktrees"))
+        self.assertNotEqual(os.path.dirname(wt), os.path.dirname(old))
+        self.assertIn("T-OMS-3-1", E.Brain.load(os.path.join(wt, "brain")).main())
 
 
 if __name__ == "__main__":

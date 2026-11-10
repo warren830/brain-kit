@@ -34,6 +34,7 @@ skipping gaps filed before (same title and text), and lists them in the Brain MR
 from __future__ import annotations
 
 import glob
+import hashlib
 import os
 import re
 
@@ -541,11 +542,14 @@ def _intent(raw, where) -> str:
 
 
 def worktree_root(repo) -> str:
-    """~/.brain/worktrees/<repo name>: the main repository's name, also when reflect runs inside a run's worktree
-    (a worktree's own folder is named after the requirement, not the repo)."""
+    """~/.brain/worktrees/<repo name>-<8 hex of its path>: one folder per main repository, also when reflect runs
+    inside a run's worktree (a worktree's own folder is named after the requirement, not the repo), and two projects
+    whose clones have the same folder name do not share one. Worktrees made under ~/.brain/worktrees/<repo name>
+    before stay there: git still lists them, and the kit finds worktrees by their branch, not by this path."""
     common = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False).stdout.strip()
-    main = os.path.dirname(common) if common.endswith(os.sep + ".git") else (common or repo)
-    return os.path.join(os.path.expanduser("~"), ".brain", "worktrees", os.path.basename(os.path.realpath(main)))
+    main = os.path.realpath(os.path.dirname(common) if common.endswith(os.sep + ".git") else (common or repo))
+    tag = hashlib.sha256(main.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(os.path.expanduser("~"), ".brain", "worktrees", "%s-%s" % (os.path.basename(main), tag))
 
 
 def main_cfg(repo, base):

@@ -137,8 +137,8 @@ class ReflectWorktreeNamedAfterTheRepo(unittest.TestCase):
         commit_file(repo, "a.txt", "a\n")
         wt = os.path.join(d, "subtract")
         sh("git", "-C", repo, "worktree", "add", "-q", "--detach", wt)
-        self.assertEqual(os.path.basename(reflect.worktree_root(wt)), "demo")
-        self.assertEqual(os.path.basename(reflect.worktree_root(repo)), "demo")
+        self.assertEqual(reflect.worktree_root(wt), reflect.worktree_root(repo))
+        self.assertTrue(os.path.basename(reflect.worktree_root(repo)).startswith("demo-"))
 
 
 class GitLabEditSignalAsMeasured(unittest.TestCase):
