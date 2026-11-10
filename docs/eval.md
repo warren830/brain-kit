@@ -125,7 +125,7 @@ brain golden summarize results.json --tasks tasks
 
 **期内**（`--since`）：最后一次有动静（阶段、人做的事、决策、提交、合并或验收的时间，和 `outcome.last_activity`：ledger 里 run 的行变了（MR 关了、运行机失败）、凭证）在期内的 run；没合并、没关的 run 不管 `--since` 都算（E3）。
 
-**E2 状态**（JSON 的 `states`）：`merged` 已合并；`merged_not_here` ledger 说合并了，这里的 main 没有；`closed` MR 关了、没合并；`failed` 运行机没能开始（ledger 是 failed：brain-runnerd 失败）；`unknown` ledger 的状态以 `_unknown` 结尾（`send_unknown`：桥不知道派单成没成）；`answered` 有了回答、run 没接着做：run 分支上的 park.json 现在还是 waiting，可桥上已经有了这个问题的回答（决策是 delivered 已送到 run，或 answered 正在签名、发送，或 delivery_unknown 送达不明），谁都不用再答，是运行机（或桥）没往下走（`outcome.answered`：`decision`、`state`、`choice`、`at`、`kind`、`ask`、`lean_request`、`since`、`src`；这时 `outcome.waiting_on` 是 null）；`waiting` 在等回答（park.json 现在是 waiting、这个问题还没有人答，或者桥上的问题还开着；`outcome.waiting_on` 的 `ask` 是 park.json 问的谁）；`accepted` 验收过了、还没合并；`open` 进行中。"这个问题"的回答 = 桥在这个 park.json（它最近一次被问起的那个提交）或它之后的 MR head 上问的决策；签名服务拒签（`refused`）的回答没送到 run，不算回答。没合并、没关、没失败的 run，最后一次有动静（提交、Lean 记录、park 问题、ledger 里这个 run 的行、凭证；`outcome.last_activity`）离 `--as-of` 超过 `--stuck-hours`（默认 24 小时）的，算停住了（`stuck`）。
+**E2 状态**（JSON 的 `states`）：`merged` 已合并；`merged_not_here` ledger 说合并了，这里的 main 没有；`closed` MR 关了、没合并，或者小需求的需求单关了（`brain intent close`，和 `brain intent list` 一样算关了：`closed_by` 是 `claim`，不算在做，也不算停住）；`failed` 运行机没能开始（ledger 是 failed：brain-runnerd 失败）；`unknown` ledger 的状态以 `_unknown` 结尾（`send_unknown`：桥不知道派单成没成）；`answered` 有了回答、run 没接着做：run 分支上的 park.json 现在还是 waiting，可桥上已经有了这个问题的回答（决策是 delivered 已送到 run，或 answered 正在签名、发送，或 delivery_unknown 送达不明），谁都不用再答，是运行机（或桥）没往下走（`outcome.answered`：`decision`、`state`、`choice`、`at`、`kind`、`ask`、`lean_request`、`since`、`src`；这时 `outcome.waiting_on` 是 null）；`waiting` 在等回答（park.json 现在是 waiting、这个问题还没有人答，或者桥上的问题还开着；`outcome.waiting_on` 的 `ask` 是 park.json 问的谁）；`accepted` 验收过了、还没合并；`open` 进行中。"这个问题"的回答 = 桥在这个 park.json（它最近一次被问起的那个提交）或它之后的 MR head 上问的决策；签名服务拒签（`refused`）的回答没送到 run，不算回答。没合并、没关、没失败的 run，最后一次有动静（提交、Lean 记录、park 问题、ledger 里这个 run 的行、凭证；`outcome.last_activity`）离 `--as-of` 超过 `--stuck-hours`（默认 24 小时）的，算停住了（`stuck`）。
 
 | 指标 | 怎么算 | 现在量不到的 |
 |---|---|---|
@@ -167,8 +167,8 @@ Who 的写法是运行机提示词（`remote/prompts/brain-run.md` 第 5 节）�
 
 - 小需求和大需求共用一个 Lean intent。小需求的 trace 只读它自己 worktree 的 Lean 账本（run.json 的 `lean_clone`），提交按合进大需求的分支来认；`merged_at` 还是合进 main 的时间。另有 `family.merged_into_parent`：它 `brain handoff` 时在 run.json 记的 `mr` 和它分支上的提交都到了大需求的分支（`intents.child_merged`；只有 run.json 不算，从它分支开工的兄弟也带着它）。
 - 大需求的 trace 去掉小需求的账本和提交。`family` 里列每个小需求的数（做完的阶段、verify 次数和失败次数、机器人和人的提交、被拦次数、判断点内外的人工介入、决策、问题、credits），`rollup.total` 是大需求自己加所有小需求；哪个数谁都不知道，就是 null。decisions.md、requirements.md 的行按 `git blame` 分给写它的那个 run。
-- 状态多一个 `merged_into_parent`（已合进大需求，等大需求进 main）：不算停住。大需求的空闲时间按全家最后一次动静算。
-- `batch` 每个需求照旧一行，小需求多一个 `parent`。`families` 每个大需求一行：小需求、已合并 n/m、状态、判断点内外的人工介入合计、问题合计、credits 合计。报告里多一段"大需求"。没有拆分的仓库，`families` 是空列表，别的不变。
+- 状态多一个 `merged_into_parent`（已合进大需求，等大需求进 main）：不算停住。需求单关了的小需求是 `closed`（见 E2）。大需求的空闲时间按全家最后一次动静算。
+- `batch` 每个需求照旧一行，小需求多一个 `parent`。`families` 每个大需求一行：小需求、已合并 n/m、状态、判断点内外的人工介入合计、问题合计、credits 合计。n/m 和 `brain intent list` 一样数：m 是没关的小需求，`brain split` 记的需求单（`claim/<KEY>` 写着这个大需求）有、这里还没有 run 的也算（`not_started`）；需求单关了的不算（`closed`），n 是其中已合进大需求分支的。`children` 还是这里有 run 的小需求。都合并了（n = m）才是 `ready_to_release`（等大需求评审和发布）。需求单读这里已有的（origin 的那份，没有就用本地的），不 fetch。报告里多一段"大需求"。没有拆分的仓库，`families` 是空列表，别的不变。
 - `brain usage`：有小需求的 intent，每个 run 一行；单元自己的页面（`construction/<单元>/`、它的代码计划）算那个小需求的，别的页面（包括 decisions.md）算大需求的。
 
 **缺口**（`brain eval gaps`）：

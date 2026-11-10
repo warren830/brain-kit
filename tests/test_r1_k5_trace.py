@@ -11,10 +11,11 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from brainkit import cli, config, trace  # noqa: E402
+from brainkit import claims, cli, config, intents, split, trace  # noqa: E402
 from brainkit import evaluate as EV  # noqa: E402
 from brainkit.common import BrainError  # noqa: E402
 from tests.helpers import tmpdir  # noqa: E402
+from tests import test_split_trace as SP  # noqa: E402
 from tests.test_trace import AS_OF, commit, git_repo, world  # noqa: E402
 
 KIT = {"version": 1, "req_prefix": "PAY", "bot_users": ["brain-bot"], "bot_emails": ["brain-bot@noreply.invalid"]}
@@ -216,6 +217,67 @@ class R1_94_SinceStaleCitations(unittest.TestCase):
         self.assertIn("过时与冲突：%d（过时引用 0，" % later["staleness"]["total"], text)
         self.assertNotIn("引用了已归档", text)
         self.assertNotIn("stale|", "".join(g["subject"] for g in EV.gaps(later)))
+
+
+class R1_89_FamilyLikeIntentList(unittest.TestCase):
+    """brain eval's 大需求 row counted only the children with a run.json: with one of three units merged and two not
+    started it said 小需求都合进了，等发布; a closed child (brain intent close) stayed an open, stuck run. Now it says
+    已合并 n/m as `brain intent list` does (m: the children that are not closed, started or not)."""
+
+    def setUp(self):
+        self.w = SP.family_world(self)
+        repo = self.w.repo
+        split = {"intent": SP.INTENT, "branch": SP.PB}
+        claims.claim(repo, "PAY", "alice", "big", key="PAY-1")
+        for key, owner, unit in (("PAY-2", "alice", "api"), ("PAY-3", "bob", "web"), ("PAY-4", None, "jobs")):
+            claims.claim(repo, "PAY", owner, unit, key=key, extra={"source": "split", "parent": "PAY-1", "unit": unit,
+                                                                   "split": split, "filed_by": "alice"})
+
+    def intent_list(self):
+        docs, _ = intents.listing(self.w.repo, self.w.cfg)
+        f = split.families(self.w.repo, self.w.cfg, docs)["PAY-1"]
+        return f["progress"]["merged"], f["progress"]["total"], f["state"]
+
+    def collect(self):
+        return EV.collect(self.w.repo, self.w.cfg, as_of=SP.AS_OF, stuck_hours=40)
+
+    def test_a_child_not_started_counts(self):
+        d = self.collect()
+        f = d["families"][0]
+        self.assertEqual((f["merged"], f["total"], f["state"]), self.intent_list()[:2] + ("in_progress",))
+        self.assertEqual((f["merged"], f["total"]), (1, 3))
+        self.assertEqual((f["children"], f["not_started"], f["closed"]), (["PAY-2", "PAY-3"], ["PAY-4"], []))
+        self.assertIn("  PAY-1：小需求在做；已合并 1/3（有 run 的 PAY-2、PAY-3；没开工的 PAY-4）；判断点内 / 外 2 / 1；",
+                      EV.report(d))
+
+    def test_closed_children_are_not_counted_and_not_stuck(self):
+        intents.close(self.w.repo, "PAY-3", "不做网页了", by="bob")
+        intents.close(self.w.repo, "PAY-4", "不做对账了", by="alice")
+        self.assertEqual(self.intent_list(), (1, 1, "ready_to_release"))
+        d = EV.collect(self.w.repo, self.w.cfg, as_of="2026-11-20T00:00:00Z")      # days after PAY-3's last commit
+        f = d["families"][0]
+        self.assertEqual((f["merged"], f["total"], f["state"], f["not_started"], f["closed"]),
+                         (1, 1, "ready_to_release", [], ["PAY-3", "PAY-4"]))
+        st = d["states"]["PAY-3"]
+        self.assertEqual((st["value"], st["closed_by"], st["stuck"]), ("closed", "claim", False))
+        row = next(r for r in d["batch"] if r["key"] == "PAY-3")
+        self.assertEqual((row["state"], row["closed_by"], row["delivery"]), ("closed", "claim", "closed"))
+        reasons = {r["rule"]: r for r in next(q["reasons"] for q in d["review_queue"] if q["key"] == "PAY-3")}
+        self.assertNotIn("stuck", reasons)
+        self.assertEqual((reasons["closed_unmerged"]["text"], reasons["closed_unmerged"]["evidence"]),
+                         ("需求关了（brain intent close），没有合并", "claim/PAY-3"))
+        text = EV.report(d)
+        self.assertIn("| PAY-3 | 需求关了，没合并（PAY-1 的小需求） |", text)
+        self.assertIn("  PAY-1：小需求都合并了，等大需求评审和发布；已合并 1/1（有 run 的 PAY-2；已关闭的 PAY-3、PAY-4）；",
+                      text)
+        self.assertNotIn("PAY-3：", "\n".join(x for x in text.splitlines() if "没有进展" in x))
+
+    def test_without_claims_as_before(self):
+        # the synthetic family of tests/test_split_trace.py has no claims: the runs are the children
+        w = SP.family_world(self)
+        f = EV.collect(w.repo, w.cfg, as_of=SP.AS_OF, stuck_hours=40)["families"][0]
+        self.assertEqual((f["children"], f["merged"], f["total"], f["not_started"], f["closed"]),
+                         (["PAY-2", "PAY-3"], 1, 2, [], []))
 
 
 def audit(recs, email="alice@example.com"):
