@@ -660,11 +660,12 @@ def _review(text):
             "summary": [_one(x, 160) for x in notes[:2]]}
 
 
-def _decisions(text, bot_users, acs) -> list:
+def _decisions(text, bot_users, acs, lines=None) -> list:
+    """decisions.md rows; `lines` (a split child): only the rows on these line numbers (its own)."""
     out = []
     for n, row in T.decision_rows(text or ""):
         did, dec = row.get("id", "").strip("`* "), row.get("decision", "")
-        if not re.match(r"^D-[1-9][0-9]*$", did) or not dec.strip():
+        if not re.match(r"^D-[1-9][0-9]*$", did) or not dec.strip() or (lines is not None and n not in lines):
             continue
         by, who = T.classify_who(row.get("who"), bot_users)
         whole = " ".join(v for k, v in row.items() if k != "id")
@@ -694,12 +695,31 @@ def _who_text(d) -> str:
     return "没按约定写（第 %d 行）" % d["line"]
 
 
-def _cites(tree, docs) -> list:
+def _cites(tree, docs, unit=None) -> list:
+    """Brain ids cited in the intent's pages (outside proposal blocks); `unit` (a split child): only its unit's
+    pages, as brainkit.usage gives them to it (the other pages are the parent's)."""
     found = set()
     for path in tree.files(docs):
-        if path.endswith(".md"):
+        if path.endswith(".md") and (unit is None or usage.page_unit(path[len(docs) + 1:]) == unit):
             found.update(usage.CITE_RE.findall(usage.strip_proposals(tree.read(path) or "")))
     return sorted(found)
+
+
+def _own_commits(repo, tr, base, tree) -> set:
+    """A split child's own commits: the ones its trace found; without a trace, those since the fork point with the
+    parent's branch (`base`); none when neither is known."""
+    commits = ((tr or {}).get("actions") or {}).get("commits") if isinstance(tr, dict) else None
+    if isinstance(commits, list):
+        return {c["sha"] for c in commits if isinstance(c, dict) and isinstance(c.get("sha"), str)}
+    tip = tree.commit or _commit(repo, "HEAD")
+    p = git(repo, "rev-list", tip, "^" + base, check=False) if base and tip else None
+    return set(p.stdout.split()) if p is not None and p.returncode == 0 else set()
+
+
+def _own_assumptions(text, lines) -> list:
+    """The assumptions A-n on these line numbers of requirements.md (a split child's own)."""
+    kept = [x if n in lines or not T.ASSUMPTION_RE.match(x) else "" for n, x in enumerate(text.split("\n"), 1)]
+    return (_requirements("\n".join(kept)) or {}).get("assumptions", [])
 
 
 # ---------- git: what the MR changes ----------
@@ -973,16 +993,6 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
                                              allowed_signers) if docs else {"state": "unknown",
                                                                             "text": "没有 Lean intent，查不了设计批准"}
 
-    dec_text = tree.read("%s/%s" % (docs, DECISIONS_DOC)) if docs else None
-    decisions = _decisions(dec_text, cfg.get("bot_users") or [], {a["id"] for a in acs})
-    proposals, pprobs = reflect.parse(dec_text or "")
-    gaps, gprobs = reflect.parse_gaps(dec_text or "")
-    release_text = tree.read("%s/%s" % (docs, RELEASE_DOC)) if docs else None
-    review = _review(tree.read("%s/%s" % (docs, REVIEW_DOC))) if docs else None
-    if docs and review is None and plans:
-        missing.append("还没有评审（review.md）")
-    park = _park(tree.raw("%s/%s/park.json" % (cfg["runs_dir"], key)))
-
     tr, tr_err = None, None
     try:
         tr = T.build(repo, cfg, key, ref=ref, credits=credits)
@@ -994,6 +1004,30 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
     cost = (tr or {}).get("cost") if isinstance((tr or {}).get("cost"), dict) else {}
     if tr_err:
         missing.append("run trace 没读出来（%s）：Brain 引用只按 Lean 记录算" % tr_err)
+
+    dec_path = "%s/%s" % (docs, DECISIONS_DOC) if docs else None
+    dec_text = tree.read(dec_path) if docs else None
+    req_path = "%s/%s" % (docs, REQ_DOC) if docs else None
+    # a split child: decisions.md and requirements.md are the intent's, shared with its parent and siblings; it
+    # keeps the lines its own commits wrote (git blame), as brain trace does
+    lines = {}
+    if family and docs:
+        mine = _own_commits(repo, tr, base, tree)
+        for path in (dec_path, req_path):
+            if tree.raw(path) is not None:
+                lines[path] = T.owned_lines(repo, tree, path, mine, set(), branch, set())
+    dec_lines = lines.get(dec_path)
+    decisions = _decisions(dec_text, cfg.get("bot_users") or [], {a["id"] for a in acs}, dec_lines)
+    proposals, pprobs = reflect.parse(T._only(dec_text, dec_lines) or "")
+    gaps, gprobs = reflect.parse_gaps(T._only(dec_text, dec_lines) or "")
+    assumptions = (req or {}).get("assumptions", [])
+    if req is not None and lines.get(req_path) is not None:
+        assumptions = _own_assumptions(tree.read(req_path), lines[req_path])
+    release_text = tree.read("%s/%s" % (docs, RELEASE_DOC)) if docs else None
+    review = _review(tree.read("%s/%s" % (docs, REVIEW_DOC))) if docs else None
+    if docs and review is None and plans:
+        missing.append("还没有评审（review.md）")
+    park = _park(tree.raw("%s/%s/park.json" % (cfg["runs_dir"], key)))
 
     stage = _stage(own)
     waiting = None
@@ -1021,13 +1055,14 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
         "verify": dict(v, current=current, why=why) if v else None,
         "changes": ch,
         "decisions": decisions,
-        "assumptions": [{"id": a["id"], "text": _one(a["text"], 160)} for a in (req or {}).get("assumptions", [])],
+        "assumptions": [{"id": a["id"], "text": _one(a["text"], 160)} for a in assumptions],
         "open_items": [_one(x, 160) for x in _open_items(release_text)],
         "release_written": release_text is not None,
         "park": park,
         "approvals": approvals,
         "review": review,
-        "brain": {"cited": _cites(tree, docs) if docs else [], "stale": list(tb.get("stale") or []),
+        "brain": {"cited": _cites(tree, docs, rec["unit"] if family else None) if docs else [],
+                  "stale": list(tb.get("stale") or []),
                   "unknown": list(tb.get("unknown") or []),
                   "proposals": [{"file": _one(p.fields.get("file"), 20), "type": _one(p.fields.get("type"), 20),
                                  "rel": _one(p.rel + (" " + p.target if p.target else ""), 40),

@@ -249,5 +249,78 @@ class DesignApprovedOnlyLocally(unittest.TestCase):
         self.assertIn("改到了 risk path src/pay/refund.py：Lean 记了 DESIGN %s 的批准，签名由 CI 核对" % h, d["pointers"])
 
 
+
+PROPOSAL = "\n```brain-proposal\nfile: TECH\ntype: pitfall\nrel: new\nsrc: {src}\n---\n{text}\n```\n"
+GAP = "\n```brain-gap\ntitle: 对账没有自动测试\nkind: test\nrefs: AC-4\n---\n对账报表没有测试。\n```\n"
+PARENT_ROW = "| D-1 | 2026-11-01 | application-design | 拆成 api、web 两个单元 | 依赖最少 | agent |\n"
+CHILD_ROW = "| D-2 | 2026-11-03 | code-generation | web 只显示状态，按 T-PAY-1-2 | 简单 | agent |\n"
+TABLE = "# Decisions\n\n| ID | Date | Stage | Decision | Why | Who |\n|---|---|---|---|---|---|\n"
+PARENT_REQ = "# Requirements: big\n\n## Goal\n退款。\n\n## Assumptions\n- A-1: 只退原支付方式\n"
+WEB = "ai/bob/PAY-3-web"
+
+
+class ChildKeepsItsOwnRecords(unittest.TestCase):
+    """R1-88: a split child's description counted its parent's (and siblings') decisions, assumptions and proposals as
+    its own; brain trace keeps only the lines its commits wrote (git blame)."""
+
+    def setUp(self):
+        isolated(self)
+        repo = self.repo = git_repo(os.path.join(tmpdir(self), "proj"))
+        base = commit(repo, {".brain/kit.json": json.dumps(ST.KIT), "brain/TECH.md": ST.TECH}, "init",
+                      "2026-10-30T00:00:00Z", "lead@example.com")
+        sh("git", "-C", repo, "switch", "-q", "-c", ST.PB)
+        split_at = commit(repo, {
+            "runs/PAY-1/run.json": ST.run_json("PAY-1", "alice", ST.PB, base, "2026-11-01T00:00:00Z"),
+            DOCS + "decisions.md": TABLE + PARENT_ROW + "\n## Brain proposals\n" + PROPOSAL.format(
+                src="D-1", text="拆单元时契约目录要写进所属单元的 Paths。") + GAP,
+            REQ: PARENT_REQ, DOCS + "inception/application-design/application-design.md": "# Design\n\n按 T-PAY-1-1\n",
+            "aidlc-docs/audit/hostp-aaaaaa.jsonl": ST.audit(ST.PARENT_EVENTS, "alice@example.com")},
+            "PAY-1: inception", "2026-11-01T01:00:00Z", "alice@example.com")
+        sh("git", "-C", repo, "switch", "-q", "-c", WEB, split_at)
+        commit(repo, {"runs/PAY-3/run.json": ST.run_json("PAY-3", "bob", WEB, base, "2026-11-03T00:00:00Z",
+                                                          **ST.child_rec("web", "cccccc")),
+                      "aidlc-docs/audit/hostb-cccccc.jsonl": ST.audit(ST.WEB_EVENTS, "bob@example.com", "web"),
+                      DOCS + "decisions.md": TABLE + PARENT_ROW + CHILD_ROW + "\n## Brain proposals\n" +
+                      PROPOSAL.format(src="D-1", text="拆单元时契约目录要写进所属单元的 Paths。") + GAP +
+                      PROPOSAL.format(src="D-2", text="web 只读退款状态，不改。"),
+                      REQ: PARENT_REQ + "- A-2: 状态每 30 秒刷新一次\n",
+                      DOCS + "construction/web/functional-design/functional-design.md": "# FD\n\n按 T-PAY-1-3\n",
+                      "web/x.js": "x\n"}, "PAY-3: unit web", "2026-11-04T12:10:00Z", "bob@example.com")
+        self.cfg = config.load(repo)
+
+    def check(self, d, decisions=("D-2",)):
+        self.assertEqual([x["id"] for x in d["decisions"]], list(decisions))
+        self.assertEqual([a["id"] for a in d["assumptions"]], ["A-2"])
+        self.assertEqual([p["text"] for p in d["brain"]["proposals"]], ["web 只读退款状态，不改。"])
+        self.assertEqual(d["brain"]["gaps"], [])
+        self.assertEqual(d["brain"]["cited"], ["T-PAY-1-3"])          # its unit's page, as brain usage counts it
+        text = mrdesc.render(d)
+        for parents in ("D-1", "A-1", "拆单元", "对账没有自动测试", "T-PAY-1-1"):
+            self.assertNotIn(parents, text)
+        return text
+
+    def test_read_from_its_branch(self):
+        d = mrdesc.build(self.repo, self.cfg, "PAY-3", ref=WEB)
+        text = self.check(d)
+        self.assertIn("agent 自己定的", text)
+        self.assertIn("确认假设 A-2：需求里没写，agent 先这么假设", d["pointers"])
+
+    def test_in_its_working_tree_a_line_not_committed_yet_is_its_own(self):
+        sh("git", "-C", self.repo, "switch", "-q", WEB)
+        with open(os.path.join(self.repo, DOCS, "decisions.md"), encoding="utf-8") as f:
+            text = f.read()
+        write(self.repo, DOCS + "decisions.md", text.replace(CHILD_ROW, CHILD_ROW + CHILD_ROW.replace(
+            "D-2", "D-3").replace("web 只显示状态", "刷新间隔 30 秒")))
+        self.check(mrdesc.build(self.repo, self.cfg, "PAY-3"), decisions=("D-2", "D-3"))
+
+    def test_the_parent_keeps_every_line(self):
+        sh("git", "-C", self.repo, "switch", "-q", ST.PB)
+        d = mrdesc.build(self.repo, self.cfg, "PAY-1")
+        self.assertEqual([x["id"] for x in d["decisions"]], ["D-1"])
+        self.assertEqual([a["id"] for a in d["assumptions"]], ["A-1"])
+        self.assertEqual(len(d["brain"]["proposals"]), 1)
+        self.assertEqual(len(d["brain"]["gaps"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

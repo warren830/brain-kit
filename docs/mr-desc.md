@@ -36,6 +36,7 @@ brain mr-desc KEY --json       # 结构化数据（给 KiroCrew app 用）
 - 记录里的文字压成一行，`@`、`<`、图片都失效：不会 @ 人，不会用 HTML 注释藏内容，不会触发 GitLab 快捷命令；像审批或回答的行（`approve …`、`answer D-n …`）前面加 `> `，Lean 和桥都不会当真。
 - 不超过约 120 行，长表折叠成"另有 N 条，见 …"。
 - MR.md 不算在它自己描述的改动里，所以写入、提交、再生成，内容不变。
+- 拆出来的小需求（`brain split`）：decisions.md 和 requirements.md 是整个 intent 共用的。小需求的说明只列它自己的提交写的那些行（git blame，和 `brain trace` 一样）：决定、假设、提案和缺口；「用到的条目」只算它这个单元的页面（和 `brain usage` 一样）。大需求和兄弟需求写的不算它的。
 
 ## 前提：`runs/` 不能算进 Lean 的代码指纹
 
