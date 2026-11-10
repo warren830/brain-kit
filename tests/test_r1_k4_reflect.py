@@ -21,6 +21,14 @@ src: D-1, RUN-OMS-3-1
 金额一律用十进制计算，不用浮点。
 ```
 """
+GAP = """```brain-gap
+title: 退款对账没有自动测试
+kind: test
+refs: AC-2, D-4
+---
+对账只在验收时手工核对过（D-4）。要一个每天跑的测试：两边金额和笔数一致。
+```
+"""
 
 
 def run_cli(repo, *args):
@@ -117,6 +125,42 @@ class Reflect(unittest.TestCase):
         rc, out = run_cli(repo, "reflect", "--apply", "--worktree", os.path.join(self.d, "wt3"))
         self.assertEqual(rc, 0, out)
         self.assertEqual(len(brain_branches(repo)), 2, out)
+
+    def test_r1_83_a_failed_apply_leaves_no_gap_claim_on_origin(self):
+        os.environ["BRAIN_USER"] = "alice"
+        self.addCleanup(os.environ.pop, "BRAIN_USER", None)
+        repo = project(os.path.join(self.d, "r"), ONE + GAP)
+        origin = os.path.join(self.d, "origin.git")
+        sh("git", "init", "-q", "--bare", origin)
+        sh("git", "-C", repo, "remote", "add", "origin", origin)
+        sh("git", "-C", repo, "push", "-q", "origin", "main")
+
+        def claims_on_origin():
+            return sh("git", "-C", repo, "ls-remote", "origin", "refs/heads/claim/*").stdout.split()[1::2]
+        taken = os.path.join(self.d, "taken")
+        os.makedirs(taken)
+        rc, out = run_cli(repo, "reflect", "--apply", "--worktree", taken)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("already exists", out)
+        self.assertEqual(claims_on_origin(), [], out)
+        hooks = os.path.join(self.d, "hooks")
+        os.makedirs(hooks)
+        with open(os.path.join(hooks, "pre-commit"), "w") as f:
+            f.write("#!/bin/sh\nexit 1\n")
+        os.chmod(os.path.join(hooks, "pre-commit"), 0o755)
+        sh("git", "-C", repo, "config", "core.hooksPath", hooks)
+        wt = os.path.join(self.d, "wt")
+        rc, out = run_cli(repo, "reflect", "--apply", "--worktree", wt)
+        self.assertNotEqual(rc, 0, out)
+        self.assertEqual((claims_on_origin(), brain_branches(repo), os.path.exists(wt)), ([], [], False), out)
+        os.remove(os.path.join(hooks, "pre-commit"))
+        rc, out = run_cli(repo, "reflect", "--apply", "--worktree", wt)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(claims_on_origin(), ["refs/heads/claim/OMS-4"], out)
+        msg = sh("git", "-C", wt, "log", "-1", "--format=%B").stdout
+        self.assertIn("OMS-4 · test · 退款对账没有自动测试", msg)
+        with open(wt + ".mr.md", encoding="utf-8") as f:
+            self.assertIn("OMS-4 · test · 退款对账没有自动测试", f.read())
 
 
 if __name__ == "__main__":

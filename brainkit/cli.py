@@ -1398,8 +1398,6 @@ def cmd_reflect(a):
         print("这是预览。加 --apply 在 main 上开新分支写入（不动你当前的工作区）%s。"
               % ("，并登记 %d 个缺口" % len(fresh) if fresh else ""))
         return 0
-    if fresh:
-        file_gaps()
     br = reflect.branch_name(repo, key)
     wt = os.path.abspath(a.worktree) if a.worktree else os.path.join(reflect.worktree_root(repo),
                                                                      br.replace("/", "-"))
@@ -1407,6 +1405,7 @@ def cmd_reflect(a):
         raise BrainError("%s already exists" % wt)
     os.makedirs(os.path.dirname(wt), exist_ok=True)
     git(repo, "worktree", "add", "-q", "--no-track", "-b", br, wt, base)
+    title = "Brain: %s reflect（%d 条）" % (key, sum(1 for op in ops if op.kind != "same"))
     try:
         bd = os.path.join(wt, mcfg["brain_dir"])
         b2 = entries.Brain.load(bd)
@@ -1416,19 +1415,21 @@ def cmd_reflect(a):
                                            purge_approvers=mcfg.get("purge_approvers") or [])
         if errors:
             raise BrainError("brain lint refused the result:\n  " + "\n  ".join(errors))
-        desc = reflect.mr_description(key, ops, warnings + lost, label, gaps=rows)
-        title = "Brain: %s reflect（%d 条）" % (key, sum(1 for op in ops if op.kind != "same"))
-        with open(wt + ".mr.md", "w", encoding="utf-8") as f:
-            f.write("%s\n\n%s" % (title, desc))
         if not a.no_commit:
             git(wt, "add", "-A", "--", mcfg["brain_dir"])
-            git(wt, "commit", "-q", "-m", "%s\n\n%s" % (title, desc))
+            git(wt, "commit", "-q", "-m", "%s\n\n%s" % (title, reflect.mr_description(
+                key, ops, warnings + lost, label, gaps=None if fresh else rows)))
+        if fresh:            # their claims go to origin: only once every step that can fail here has passed
+            file_gaps()
     except BaseException:
         git(repo, "worktree", "remove", "--force", wt, check=False)
         git(repo, "branch", "-D", br, check=False)
-        if os.path.exists(wt + ".mr.md"):
-            os.remove(wt + ".mr.md")
         raise
+    desc = reflect.mr_description(key, ops, warnings + lost, label, gaps=rows)
+    with open(wt + ".mr.md", "w", encoding="utf-8") as f:
+        f.write("%s\n\n%s" % (title, desc))
+    if fresh and not a.no_commit:
+        git(wt, "commit", "-q", "--amend", "-m", "%s\n\n%s" % (title, desc))
     for op in ops:
         print("  %s %s%s" % (op.kind, op.result, "（%s）" % op.note if op.note else ""))
     if a.no_commit:
