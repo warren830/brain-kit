@@ -39,7 +39,8 @@ PARAM_RE = re.compile(r"^\$[0-9]{1,2}$")          # $1, $2 in SQL, shell, awk: a
 def _scan(text) -> list:
     """checks.scan, except that one capitalised word after @ is a review hit, not personal data: in a TECH entry it is
     as often a Java annotation (@Transactional, @MockBean) as a person (@Alice). Role words (@Service, @Test) are not
-    even that. The other rules still read the word (an Owner column, an e-mail address)."""
+    even that. The other rules still read the word (an Owner column, an e-mail address); where one of them reads it as
+    a possible person (| Owner | @Alice |), the @ settles it: personal data."""
     lone = [m for m in checks.MENTION_RE.finditer(text) if re.fullmatch(r"[A-Z][a-zA-Z]+", m.group(1))
             and not (m.start() and EMAIL_CHAR_RE.match(text[m.start() - 1]))]
     if not lone:
@@ -49,8 +50,10 @@ def _scan(text) -> list:
         chars[m.start()] = " "                       # same length: the offsets hold
     hits = checks.scan("".join(chars))
     for m in lone:
-        if checks.latin_person(m.group(1))[0] and not any(h.start < m.end() and m.start() < h.end for h in hits
-                                                           if h.cat not in ("link", "instruction")):
+        near = [h for h in hits if h.cat not in ("link", "instruction") and h.start < m.end() and m.start() < h.end]
+        if any(h.cat == "review" and h.kind == "person" for h in near):
+            hits = [h for h in hits if h not in near] + [checks.Hit("pii", "person", m.start(), m.end(), m.group(0))]
+        elif checks.latin_person(m.group(1))[0] and not near:
             hits.append(checks.Hit("review", "person", m.start(), m.end(), m.group(0)))
     return hits
 
