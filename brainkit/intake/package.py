@@ -427,8 +427,9 @@ def manifest_digest(pkg_dir) -> str:
 def verify_package(pkg_dir) -> list:
     """Problems with a package: every file in it is the manifest, a segment or a file the manifest lists, with the
     hash recorded there; no file is missing, nothing is extra, and nothing is a symbolic link (a copy would take in
-    whatever it points to). A package whose manifest records no file hashes (built before brain-kit recorded them)
-    cannot be checked and is refused too."""
+    whatever it points to). What Finder or Explorer leaves in a folder (SKIP_NAMES) is no part of a package. A package
+    whose manifest records no file hashes (built before brain-kit recorded them) cannot be checked and is refused
+    too."""
     if os.path.islink(pkg_dir):
         return ["the package folder is a symbolic link"]
     m = load_json(os.path.join(pkg_dir, "manifest.json"))
@@ -452,7 +453,7 @@ def verify_package(pkg_dir) -> list:
                 probs.append("symbolic link %s" % rel)
             elif n in names and not os.path.isfile(p):
                 probs.append("not a regular file: %s" % rel)
-            elif n in names:
+            elif n in names and n not in SKIP_NAMES:
                 found.add(rel)
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
     for rel, sha in sorted(expected.items()):

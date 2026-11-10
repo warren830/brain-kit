@@ -251,7 +251,7 @@ def _readonly_copy(src, dst):
     if os.path.exists(dst):
         _make_writable(dst)
         shutil.rmtree(dst)
-    shutil.copytree(src, dst, symlinks=True)
+    shutil.copytree(src, dst, symlinks=True, ignore=shutil.ignore_patterns(*intake.SKIP_NAMES))
     for root, dirs, files in os.walk(dst):
         for f in files:
             os.chmod(os.path.join(root, f), stat.S_IRUSR | stat.S_IRGRP)
@@ -1080,7 +1080,8 @@ def publish_materials(store, rec) -> list:
         # a commit and push would publish the masked materials to that repo's remote
         return ["intake store %s is not a git clone of brain-intake: the team runner cannot get the materials" % store]
     for m in rec["materials"]:
-        git(store, "add", "--", os.path.join("packages", m["package"]))
+        pkg = "packages/" + m["package"]
+        git(store, "add", "--", pkg, *[":(exclude,glob)%s/**/%s" % (pkg, n) for n in sorted(intake.SKIP_NAMES)])
     if git(store, "diff", "--cached", "--quiet", check=False).returncode != 0:
         git(store, "commit", "-q", "-m", "materials for %s" % rec["key"])
     if git(store, "remote", "get-url", "origin", check=False).returncode == 0:
