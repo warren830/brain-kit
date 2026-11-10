@@ -784,14 +784,15 @@ def oracle_answer(task, park):
                 break
     if hit is None:
         return None
+    # what the bridge takes (bridge/decisions.py check_answer): approve / reject (any letter case) for a Lean request
+    # or a question without options, else one of the options (the letter upper-cased)
     choice = answers[hit]
-    if lr:
-        allowed = {"approve", "reject"}
-    else:
-        allowed = {str(o.get("id")) for o in (park.get("options") or []) if isinstance(o, dict)}
+    choice = choice.lower() if choice.lower() in ("approve", "reject") else choice.upper()
+    options = {o.get("id") for o in ((park or {}).get("options") or []) if isinstance(o, dict)}
+    allowed = {"approve", "reject"} if lr or not options else options
     if choice not in allowed:
         raise BrainError("task %s: oracle answer %r (for %r) is not one of %s" % (
-            task.get("id"), choice, hit, ", ".join(sorted(allowed)) or "no options"))
+            task.get("id"), answers[hit], hit, ", ".join(sorted(str(x) for x in allowed))))
     return {"choice": choice, "matched": hit, "task": task.get("id"), "eval_oracle": True}
 
 

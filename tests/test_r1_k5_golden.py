@@ -7,6 +7,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from brainkit import entries as E, golden as G  # noqa: E402
+from brainkit.bridge import decisions  # noqa: E402
+from brainkit.common import BrainError  # noqa: E402
 from tests.helpers import git_repo, sh, tmpdir  # noqa: E402
 from tests.test_golden import ClassScope, ceiling_at_the_temp_root, restore_ceiling  # noqa: E402
 
@@ -100,6 +102,37 @@ class R96AblationDropsRestatingEntries(unittest.TestCase):
         self.assertEqual(self.full["scrubbed"], [])
         self.assertEqual(self.read(self.noimp_dir, "brain/TECH.md"), self.read(self.full_dir, "brain/TECH.md"))
         self.assertEqual(self.read(self.noimp_dir, "brain/PRODUCT.md"), self.read(self.full_dir, "brain/PRODUCT.md"))
+
+
+class R98OracleAcceptsWhatTheBridgeAccepts(unittest.TestCase):
+    """A question without options and without lean_request (acceptance, a yes/no clarify) is answered approve /
+    reject at the bridge (check_answer); the oracle refused approve for it."""
+
+    def test_no_options_no_lean_request(self):
+        task = {"id": "G-1", "oracle_answers": {"acceptance": "approve", "clarify": "reject"}}
+        for park, want in (({"schema": 1, "kind": "acceptance", "ask": "product", "status": "waiting",
+                             "question": "验收：退款接口做完了，可以发布吗？", "options": []}, "approve"),
+                           ({"schema": 1, "kind": "clarify", "ask": "product", "status": "waiting",
+                             "question": "退款期限按自然日算可以吗？"}, "reject")):
+            with self.subTest(park["kind"]):
+                self.assertFalse(decisions.validate_park(park))          # the bridge takes this question
+                a = G.oracle_answer(task, park)
+                self.assertEqual((a["choice"], a["matched"], a["eval_oracle"]), (want, park["kind"], True))
+
+    def test_the_bridge_rules_otherwise_too(self):
+        opts = [{"id": "A", "text": "x"}, {"id": "B", "text": "y"}]
+        o = G.oracle_answer
+        self.assertEqual(o({"id": "G-1", "oracle_answers": {"clarify": "b"}},
+                           {"kind": "clarify", "question": "?", "options": opts})["choice"], "B")
+        self.assertEqual(o({"id": "G-1", "oracle_answers": {"RELEASE": "Approve"}},
+                           {"kind": "acceptance", "lean_request": "RELEASE 1a2b3c4d", "options": []})["choice"],
+                         "approve")
+        with self.assertRaises(BrainError):                                # options given: a letter, not approve
+            o({"id": "G-1", "oracle_answers": {"clarify": "approve"}}, {"kind": "clarify", "question": "?",
+                                                                         "options": opts})
+        with self.assertRaises(BrainError):
+            o({"id": "G-1", "oracle_answers": {"acceptance": "C"}}, {"kind": "acceptance", "question": "?",
+                                                                      "options": []})
 
 
 if __name__ == "__main__":
