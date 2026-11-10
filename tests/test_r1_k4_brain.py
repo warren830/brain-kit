@@ -194,6 +194,13 @@ class BrainRound1(unittest.TestCase):
         self.assertTrue(b.files["TECH.md"].render().endswith("rule one\n\n<!-- id:%s type:pitfall side:builder "
                                                              "rel:new src:D-2 -->\nrule two\n" % eid))
 
+    def test_r1_85_sql_and_shell_parameters_are_not_amounts(self):
+        for text in ("PostgreSQL 的预编译语句用 $1、$2 占位，不要拼字符串。", 'shell 脚本里 "$1" 要加引号。',
+                     "```sql\nSELECT * FROM refund WHERE id = $1 AND shop = $2;\n```", "awk '{print $3}' 取第三列。"):
+            self.assertEqual(added(text)[0], [], text)
+        for text in ("单笔上限 $5,000", "超过 $100 要审批", "US$5 手续费", "$1.50 一件", "$2M 的合同", "1,000,000 HKD"):
+            self.assertTrue(any("amount" in x for x in added(text)[0]), text)
+
 
 if __name__ == "__main__":
     unittest.main()

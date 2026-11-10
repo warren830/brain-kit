@@ -33,6 +33,7 @@ RELAX_RE = re.compile(
     r"coverage|覆盖率|加密|encrypt|TLS|HTTPS|权限|permission)")
 TERM_RE = re.compile(r"^\s*(?:[-*]\s*)?\*\*([^*]{1,40})\*\*")
 EMAIL_CHAR_RE = re.compile(r"[A-Za-z0-9._%+-]")
+PARAM_RE = re.compile(r"^\$[0-9]{1,2}$")          # $1, $2 in SQL, shell, awk: a parameter, not dollars
 
 
 def _scan(text) -> list:
@@ -65,6 +66,8 @@ def content_problems(text, offset=0) -> tuple:
             errs.append("looks like a secret (%s)" % h.kind)
         elif h.cat == "pii":
             errs.append("personal data (%s)" % h.kind)
+        elif h.cat == "business" and h.kind == "amount" and PARAM_RE.match(h.value):
+            continue
         elif h.cat == "business" and h.kind in ("amount", "contract"):
             errs.append("%s %r: write the rule, not the number" % ("amount" if h.kind == "amount" else
                                                                     "contract number", h.value))
