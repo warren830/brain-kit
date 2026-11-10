@@ -426,6 +426,15 @@ class R1_48NamesAndPasswordsSpread(Base):
         self.assertNotIn("Alice Wang", text)
         self.assertIn("[人名-", text)
 
+    def test_an_at_mention_spreads_as_the_name(self):
+        self.file("a.md", "# a\n\n评审请 @李娜 确认；@王芳 也看一下。\n")
+        self.file("b.md", "# b\n\n与会：李娜、王芳\n")
+        text = self.segments(self.build())
+        self.assertNotIn("李娜", text)
+        self.assertNotIn("王芳", text)
+        self.assertIn("评审请 [人名-1] 确认", text)
+        self.assertIn("与会：[人名-1]、[人名-2]", text)    # the same person keeps the same placeholder
+
     def test_password_spreads_but_a_plain_short_word_does_not(self):
         pw = "Hunter" + str(2000 + 24) + "!"
         self.file("a.md", "# a\n\npassword: %s\n\npassword: admin\n" % pw)

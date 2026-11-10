@@ -517,6 +517,8 @@ def propagate(text, hits, values) -> list:
         if kind not in PROPAGATE_KINDS and not kind.startswith("gitleaks:"):
             continue
         for v in vals:
+            if kind == "person":
+                v = v.lstrip("@")                    # an @mention spreads as the name (@李娜 -> 李娜 elsewhere)
             if not _spreads(kind, v):
                 continue
             start = text.find(v)
@@ -588,7 +590,7 @@ class Masker:
         self.count = {}
 
     def placeholder(self, kind, value):
-        key = (kind, value)
+        key = (kind, value.lstrip("@") if kind == "person" else value)     # @李娜 and 李娜 are one person
         if key not in self.seen:
             label = "密钥" if kind.startswith("gitleaks:") else self.LABEL.get(kind, kind)
             self.count[label] = self.count.get(label, 0) + 1
