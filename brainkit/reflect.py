@@ -240,9 +240,14 @@ def plan(brain, proposals, key, pending=None, used_extra=()) -> tuple:
     pending = pending or {}
     main = brain.main()
     texts = {e.text(): eid for eid, (f, e) in main.items()}
+    seen = {}
     for p in proposals:
         where = p.label()
         f = p.fields
+        if p.hash in seen:
+            notes.append("%s: same proposal as %s, skipped" % (where, seen[p.hash].label()))
+            continue
+        seen[p.hash] = p
         if p.hash in props:
             notes.append("%s: already in the Brain as %s, skipped" % (where, props[p.hash]))
             continue
