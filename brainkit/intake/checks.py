@@ -308,9 +308,9 @@ def _kv_secrets(text) -> list:
 
 # ---------- business-sensitive ----------
 
-# An amount carries a currency (a code, a sign or a name, before or after the number) or 元 / 萬 (README, gate 3):
-# HKD 50,000, EUR 300, 300 EUR, €300, 港幣 50,000, 人民币 5,000, 100萬港元, 5千元, 3,000 元, 500萬. A number with
-# 萬 / 亿 alone is an amount unless a word follows that says what is counted (500萬用户, 1亿 次请求).
+# An amount carries a currency (a code, a sign or a name, before or after the number) or 元 (README, gate 3):
+# HKD 50,000, EUR 300, 300 EUR, €300, 港幣 50,000, 人民币 5,000, 人民币 300 万, 100萬港元, 5 万元, 3,000 元. A number
+# with 万 / 亿 alone is a count (峰值 QPS 10万, 日活 100万), the user's decision of 2026-11-10.
 CUR_CODE = r"(?:HKD|USD|CNY|RMB|CNH|EUR|GBP|SGD|JPY|AUD)"
 CUR_NAME = r"(?:港元|港幣|港币|美元|美金|人民幣|人民币|歐元|欧元|英鎊|英镑|日元)"
 CUR = r"(?:%s|HK\$|US\$|S\$|¥|￥|\$|€|£|%s)" % (CUR_CODE, CUR_NAME)     # before the number (元 alone only after it)
@@ -319,13 +319,10 @@ CJK_SCALE = r"(?:[百千]?[億亿萬万]|[百千])"
 SCALE = r"(?:%s|k|K|m|M|bn|million|billion)" % CJK_SCALE                    # only after a currency: 3M alone is a tenor
 _NUM = r"[0-9][0-9,]*(?:\.[0-9]+)?"
 _SP = r"[ \t\u00a0]?"
-_COUNTED = r"(?![ \t\u00a0]*(?!左右|以上|以内|以內|以下|起|封顶|封頂|上下)\w)"   # 500萬，/ 500萬左右, not 500萬用户
 AMOUNT_RE = re.compile(r"(?<![A-Za-z0-9])(?:{cur}{sp}{num}(?:{sp}{scale})?(?:{sp}{word})?"
                        r"|{num}{sp}(?:{cjk}{sp})?{word}"
-                       r"|{num}{sp}(?:{scale}{sp})?{code}"
-                       r"|{num}{sp}[百千]?[億亿萬万]{counted})(?![A-Za-z0-9])".format(
-                           cur=CUR, sp=_SP, num=_NUM, scale=SCALE, word=MONEY_WORD, cjk=CJK_SCALE, code=CUR_CODE,
-                           counted=_COUNTED))
+                       r"|{num}{sp}(?:{scale}{sp})?{code})(?![A-Za-z0-9])".format(
+                           cur=CUR, sp=_SP, num=_NUM, scale=SCALE, word=MONEY_WORD, cjk=CJK_SCALE, code=CUR_CODE))
 # A company name ends with its suffix. The suffixes are also the head of common words (银行卡, 银行账户, 证券账户, 证券代码,
 # 资产管理计划): followed by one of these characters it is such a word, not a name. A Latin name stays on one line
 # (a heading "Payment Methods" over "Bank cards ..." is no company).

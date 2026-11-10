@@ -1,4 +1,4 @@
-"""Review round 2 on document intake: regressions from round 1's fixes (R2-01, R2-11, R2-12).
+"""Review round 2 on document intake: regressions from round 1's fixes (R2-01, R2-11, R2-12, R2-08).
 
 Password-shaped values are built at runtime, so the source holds none (the commit hook scans for them).
 """
@@ -107,6 +107,25 @@ class R2_12PasswordRuleIsNoPassword(Base):
         self.assertIn("用户名长度 8-16 个字符", text)
         self.assertIn("密码：8-16位", text)
 
+
+class R2_08WanAloneIsACount(Base):
+    """The user's decision (2026-11-10): 万 / 亿 with neither a currency nor 元 is a count (峰值 QPS 10万, 日活 100万),
+    not an amount; 5 万元 and 人民币 300 万 stay amounts."""
+
+    def amounts(self, text):
+        return [h.value for h in checks.scan(text) if h.kind == "amount"]
+
+    def test_counts_and_amounts(self):
+        for text in ("峰值 QPS 10万", "日活 100万，峰值 QPS 5万。", "数据量：2亿", "存量订单 800萬。", "预算 500万左右"):
+            self.assertEqual(self.amounts(text), [], text)
+        for text, value in (("退款超过 5 万元时人工审核", "5 万元"), ("授信额度人民币 300 万", "人民币 300 万"),
+                            ("100萬港元", "100萬港元"), ("HKD 5千万", "HKD 5千万")):
+            self.assertEqual(self.amounts(text), [value], text)
+
+    def test_prd_without_money_passes_gate_3(self):
+        self.file("性能需求.md", "# 性能需求\n\n- 大促峰值 QPS 10万，日活 100万。\n- 大促时峰值 15万 QPS\n")
+        rep = self.build(business=None)
+        self.assertIn("峰值 QPS 10万，日活 100万", self.segments(rep))
 
 
 if __name__ == "__main__":
