@@ -241,7 +241,7 @@ def _labelled_names(text) -> list:
 # ---------- secrets ----------
 
 # the armour line of a private key in any of its text forms: PEM (RSA, EC, PKCS#8, ENCRYPTED), OpenSSH, SSH2
-# and PGP ("-----BEGIN PGP PRIVATE KEY BLOCK-----"); the same shape as gitleaks' private-key rule
+# and PGP (its armour line ends in "PRIVATE KEY BLOCK"); the same shape as gitleaks' private-key rule
 PRIVATE_KEY_RE = re.compile(r"(?i)-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----")
 CLOUD_KEY_RE = re.compile(r"(?<![A-Z0-9])(AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])")
 KV_SECRET_RE = re.compile(r"(?i)((?:passw(?:or)?d|pwd|secret|token|api[_-]?key|access[_-]?key|client[_-]?secret"
