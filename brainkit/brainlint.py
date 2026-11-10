@@ -242,6 +242,16 @@ def _free_text(b, base, errors, warnings):
                             % (name, len(prose), prose[0][:60]))
 
 
+def _only_grows(where, be, he, errors):
+    """Sources and proposal hashes only grow, repeats never go down: in the file and on the way into the archive."""
+    if he.repeats < be.repeats:
+        errors.append("%s: repeats went down (%d -> %d)" % (where, be.repeats, he.repeats))
+    lost = [s for s in be.src if s not in he.src] + \
+        [h for h in E.split_src(be.attrs.get("prop")) if h not in E.split_src(he.attrs.get("prop"))]
+    if lost:
+        errors.append("%s: sources or proposal hashes removed (%s); they only grow" % (where, ", ".join(lost)))
+
+
 def _diff(b, base, errors, warnings, purge_approvers):
     bm, ba, bp = base.main(), base.archived(), base.purged()
     hm, ha, hp = b.main(), b.archived(), b.purged()
@@ -274,21 +284,21 @@ def _diff(b, base, errors, warnings, purge_approvers):
                 else:
                     errors.append("%s: text edited in place; only same, adds-to (old text first), replaces, "
                                   "withdraws are allowed" % where)
-            if he.repeats < be.repeats:
-                errors.append("%s: repeats went down (%d -> %d)" % (where, be.repeats, he.repeats))
-            lost = [s for s in be.src if s not in he.src] + \
-                [h for h in E.split_src(be.attrs.get("prop")) if h not in E.split_src(he.attrs.get("prop"))]
-            if lost:
-                errors.append("%s: sources or proposal hashes removed (%s); they only grow" % (where, ", ".join(lost)))
+            _only_grows(where, be, he, errors)
         elif eid in ha:
             af, ae = ha[eid]
+            where = "%s (%s)" % (eid, af.name)
             if af.key != bf.key:
                 errors.append("%s: archived into %s, but it was in %s" % (eid, af.name, bf.name))
+            if ae.type != be.type or ae.attrs.get("side") != be.attrs.get("side"):
+                errors.append("%s: type or side changed on the way into the archive; archive the entry as it was"
+                              % where)
             old, new = be.text(), ae.text()
             if new != old and not new.startswith(old + "\n"):
                 errors.append("%s: archived with different text; archive the entry as it was" % eid)
             elif new != old:
-                _new_text("%s (%s)" % (eid, af.name), new, errors, warnings, [], offset=len(old))
+                _new_text(where, new, errors, warnings, [], offset=len(old))
+            _only_grows(where, be, ae, errors)
             if ae.attrs.get("status") == "replaced" and ae.attrs.get("by") not in hm and ae.attrs.get("by") not in ha:
                 errors.append("%s: archived as replaced by %s, which does not exist" % (eid, ae.attrs.get("by")))
         elif eid in hp:

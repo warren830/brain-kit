@@ -141,6 +141,28 @@ class BrainRound1(unittest.TestCase):
                 self.assertTrue(checks.APPROVAL_LINE_RE.match(line), "Lean takes %r" % line)
         self.assertGreater(seen, 1000)
 
+    def test_r1_76_moving_into_the_archive_keeps_sources_props_repeats_and_type(self):
+        base = brain_of(TECH="# TECH\n\n<!-- id:T-OMS-1-1 type:pitfall side:builder rel:new repeats:2 src:D-1,D-2 "
+                             "prop:9f3c2a1b -->\nrule one\n")
+        good = "type:pitfall side:builder rel:new repeats:2 src:D-1,D-2,D-3 prop:9f3c2a1b"
+
+        def archived(hdr):
+            return brain_of(TECH="# TECH\n", **{"TECH-archive": "# TECH archive\n\n<!-- id:T-OMS-1-1 %s "
+                                                "status:withdrawn archived:2026-11-10 -->\nrule one\n\n> 撤回：过时了\n"
+                                                % hdr})
+        self.assertEqual(errors(archived(good), base), "")
+        for hdr, want in ((good.replace("D-1,D-2,D-3", "D-1"), "sources or proposal hashes removed"),
+                          (good.replace(" prop:9f3c2a1b", ""), "sources or proposal hashes removed"),
+                          (good.replace("repeats:2", "repeats:1"), "repeats went down"),
+                          (good.replace("type:pitfall", "type:guideline"), "type or side changed"),
+                          (good.replace("side:builder", "side:product"), "type or side changed")):
+            self.assertIn(want, errors(archived(hdr), base), hdr)
+        for edit in (lambda b: b.withdraw("T-OMS-1-1", "过时了", "D-3"),
+                     lambda b: b.replace("T-OMS-1-1", "rule two", "OMS-2", "D-3")):
+            b = base.copy()
+            edit(b)
+            self.assertEqual(errors(b, base), "")                           # what the tool writes passes
+
 
 if __name__ == "__main__":
     unittest.main()
