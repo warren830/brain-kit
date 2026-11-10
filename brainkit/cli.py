@@ -992,11 +992,13 @@ def handoff_risk_warnings(repo, cfg, rec) -> list:
     return out
 
 
-def handoff_description(repo, cfg, key):
+def handoff_description(repo, cfg, key, what="hand-over"):
     """Write runs/<KEY>/MR.md from the records (mrdesc.build / render) and, when it changed, amend it into the
     hand-over commit just made: the MR head stays the one hand-over commit the bridge takes (one parent, it changes
-    run.json). Returns the description, or None after a warning when it could not be written (the hand-over goes
-    on without it; the working tree is left clean)."""
+    run.json). Made after that commit, so the description is of what the MR holds (nothing left uncommitted).
+    Returns the description, or None after a warning when it could not be written (the hand-over goes on without
+    it; the working tree is left clean). `what`: the commit's name in the messages (a split child's is not a
+    hand-over)."""
     from .commands.trace_cmd import default_vouchers
     md = mrdesc.md_path(cfg, key)
     try:
@@ -1012,10 +1014,10 @@ def handoff_description(repo, cfg, key):
             git(repo, "checkout", "-q", "HEAD", "--", md, check=False)
         elif os.path.lexists(os.path.join(repo, md)):
             os.remove(os.path.join(repo, md))
-        print("WARN: %s not written (%s): the hand-over goes on without the MR description."
-              % (md, str(e).replace(repo, ".")))
+        print("WARN: %s not written (%s): the %s goes on without the MR description."
+              % (md, str(e).replace(repo, "."), what))
         return None
-    print("Wrote %s from the records into the hand-over commit (`brain mr-desc` regenerates it)." % md)
+    print("Wrote %s from the records into the %s commit (`brain mr-desc` regenerates it)." % (md, what))
     return text
 
 
@@ -1122,8 +1124,8 @@ def cmd_handoff(a):
 def _child_mr(repo, cfg, a, br, b, rec, me):
     """`brain handoff` on a split child (phase 1): its work goes to the parent's owner, not to the team runner. The
     note is checked (its own `### Next (team <unit>)`), run.json records the request to merge ("mr": the child
-    counts as merged once this commit is on the parent's branch), MR.md is written, both are committed, the branch is
-    pushed and the MR into the parent's run branch is opened or updated with that description. No hand-over record
+    counts as merged once this commit is on the parent's branch) and is committed, MR.md is written from the records
+    and amended into that one commit (handoff_description, as for any run), the branch is pushed and the MR into the parent's run branch is opened or updated with that description. No hand-over record
     and no label: the bridge takes hand-overs into the default branch only (handing children to the runner is
     phase 2)."""
     target = rec["target_branch"]
@@ -1146,18 +1148,10 @@ def _child_mr(repo, cfg, a, br, b, rec, me):
         warnings = ["risk paths not checked (%s)" % e]
     for w in warnings:
         print("WARN: " + w)
-    desc = None
-    try:
-        from .commands.trace_cmd import default_vouchers
-        desc = mrdesc.render(mrdesc.build(repo, cfg, rec["key"], vouchers_dir=default_vouchers(repo),
-                                          allowed_signers=os.environ.get("BRAIN_ALLOWED_SIGNERS") or None))
-        mrdesc.write(repo, cfg, rec["key"], desc)
-        git(repo, "add", "--", md)
-    except Exception as e:  # noqa: BLE001  the description helps the reviewer; it does not hold up the MR
-        git(repo, "reset", "-q", "--", md, check=False)
-        print("WARN: %s not written (%s)." % (md, str(e).replace(repo, ".")))
     git(repo, "commit", "-q", "-m", "%s: ready to merge into %s (unit %s of %s)" % (rec["key"], target,
                                                                                    rec.get("unit"), rec["parent"]))
+    # after the commit, as for any run: a description made before it would count run.json as not committed
+    desc = handoff_description(repo, cfg, rec["key"], what="ready-to-merge")
     who = "%s's owner" % rec["parent"]
     if a.no_push or not _has_origin(repo):
         print("Ready for %s: push %s and open its MR into %s (not pushed). A child is merged by its parent's owner; "
