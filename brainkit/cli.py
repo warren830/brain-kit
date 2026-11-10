@@ -734,6 +734,10 @@ def cmd_claim(a):
                 raise BrainError("%s is claimed by %s" % (a.target, doc.get("owner") or "someone"))
             print("%s is already yours." % a.target)
             return 0
+        if not a.key:   # `brain claim KEY` takes a requirement someone filed; one nobody filed is most likely a typo
+            raise BrainError("%s is not filed: nobody registered it (`brain intent list` shows what is). To claim a "
+                             "new requirement under this very key: `brain claim --key %s --title <title>`"
+                             % (a.target, a.target))
     key = _claim(repo, cfg, me, key, a.title)
     print("Claimed %s for %s." % (key, me))
     return 0

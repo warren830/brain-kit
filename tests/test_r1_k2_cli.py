@@ -471,5 +471,17 @@ class R1_29_HookIgnoresIgnoredLeftovers(Project):
         self.assertNotIn(".DS_Store", r.stdout + r.stderr)
 
 
+class R1_41_ClaimOfAKeyNobodyFiled(Project):
+    def test_r1_41_claim_key_of_a_requirement_nobody_filed_is_refused(self):
+        rc, out = brain(self.repo, "claim", "PAY-7")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("PAY-7 is not filed", out)
+        self.assertIn("brain claim --key PAY-7 --title <title>", out)
+        self.assertEqual((self.claim_refs(), claims.read(self.repo, "PAY-7")), ([], None))
+        rc, out = brain(self.repo, "claim", "--key", "PAY-7", "--title", "退款表加索引")    # a new one: by --key
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(claims.read(self.repo, "PAY-7")["title"], "退款表加索引")
+
+
 if __name__ == "__main__":
     unittest.main()
