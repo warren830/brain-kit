@@ -215,9 +215,10 @@ Who 的写法是运行机提示词（`remote/prompts/brain-run.md` 第 5 节）�
   - 像真密钥的（其他的值，以及私钥、云访问密钥、令牌）：整个拒绝，快照不留，报错里只写路径和规则名。考题的 base_sha 是定死的，换不了 commit 时，确认这些是测试用的假值、或者本来就要轮换，可以加 `--mask-secrets`：密钥和密码都打码（同上），带私钥的文件整个去掉（列在 `removed`），清单写 `"override": "mask-secrets"`，命令在 stderr 打一行 WARN。这是要人明确选的，不会自动发生；
 - 消融变体：`full`、`no-PRODUCT`、`no-TECH`、`no-IMPROVEMENT`，从快照里删掉对应的 Brain 文件和它的 archive。PROJECT 没有消融变体；
 - 消融时，这块知识在别处的副本也删（清单的 `scrubbed` 里列出），只删去掉的那个文件（和它的 archive）里的条目号，按整个号比（`T-PAY-1-2` 不会碰到 `T-PAY-1-20`，也不会碰到别的文件或示例里的 `T-PAY-88-1`）：
+  - Brain 里留下的文件（`IMPROVEMENT.md`、`PRODUCT.md` 等和它们的 archive）：引用了它条目号的条目整条删（条目头的 `src`、`rel` 里写着它也算），条目外引用了它完整条目号的行也删；
   - run 的文档里（`aidlc-docs/**`、`runs/**`，即 `decisions.md`、`reflect-proposals.md` 等）：`file:` 是这个文件（或 `rel` 指向它的条目）的 `brain-proposal` 块、引用了它条目号的块，以及其他引用它条目号的行（决策表里的行）；
   - 别的 Markdown 文件里：只删引用了它完整条目号（`T-PAY-1-2`）的行，不删块；
-  - 老式的短号（`T-1`）也常是普通的词（"每天 T-1 日的交易"），只在 run 的文档里、写成引用的样子时才算：`` `T-1` ``、`(T-1)`、`[T-1]`、`（T-1，T-2）`、`per T-1`；
+  - 老式的短号（`T-1`）也常是普通的词（"每天 T-1 日的交易"），只在 run 的文档和 Brain 的条目里、写成引用的样子时才算：`` `T-1` ``、`(T-1)`、`[T-1]`、`（T-1，T-2）`、`per T-1`；
   - 指令文件一个字都不改，每个变体的 agent 拿到的说明都一样：`.kiro/**`（`brain install` 装的 steering、skill，Lean）、`.claude/**`、`.cursor/**`、`.github/**`、`AGENTS.md`、`CLAUDE.md`、`GEMINI.md`。
   - **还会漏的**：代码和测试本身（注释、常量就是这条规则的实现）、需求文档和 `runs/<KEY>/intent.md`、`requirements.md` 里原样写着这条规则但没带条目号的文字、Lean 审计记录（`aidlc-docs/audit/*.jsonl`）、`AGENTS.md` 和指令文件里的抄写和引用、别的文档里写成短号的引用、模型本来就知道的常识。所以"没掉分"只说明这些都不在时 agent 也能做对，不一定说明这条知识没用；
 - 快照的清单只返回给调用方，不写进快照，AI 看不到自己考的是哪个变体。
