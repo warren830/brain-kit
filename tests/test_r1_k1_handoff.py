@@ -22,7 +22,8 @@ class _Flow(unittest.TestCase):
         rec = load_json(os.path.join(self.repo, "runs", "PAY-1", "run.json"))
         st = lean.state_path(self.repo, rec["intent"])
         with open(st, encoding="utf-8") as f:
-            text = f.read().replace(lean.TEMPLATE_STATUS, "Status: Inception: requirements drafted")
+            text = f.read().replace(lean.TEMPLATE_STATUS, "Status: Inception: requirements drafted").replace(
+                lean.TEMPLATE_NEXT[0], "Ask for the REQUIREMENTS approval")
         with open(st, "w", encoding="utf-8") as f:
             f.write(text)
         sh("git", "-C", self.repo, "commit", "-q", "-am", "work")
