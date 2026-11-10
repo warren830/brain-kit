@@ -177,7 +177,7 @@ class PublishPullsFirst(unittest.TestCase):
         pdir = os.path.join(store, "packages", name)
         os.makedirs(pdir)
         with open(os.path.join(pdir, "manifest.json"), "w", encoding="utf-8") as f:
-            json.dump({"package": name, "segments": []}, f)
+            json.dump({"package": name, "segments": [], "files": {}}, f)
         return {"key": "OMS-%s" % name[-1], "materials": [{"package": name,
                                                            "manifest_sha256": intake.manifest_digest(pdir)}]}
 

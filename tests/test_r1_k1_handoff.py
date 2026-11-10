@@ -149,13 +149,16 @@ class PackageTamper(unittest.TestCase):
         os.symlink(os.path.dirname(self.outside), os.path.join(self.base, "more"))
         self.refused_everywhere("symbolic link more")
 
-    def test_manifest_without_file_hashes_is_refused(self):
-        """A manifest from before the file hashes (or one with them removed) cannot vouch for toc.md and the rest."""
+    def test_manifest_without_file_hashes_still_checks_the_segments(self):
+        """A manifest from before the file hashes (or one with them removed) cannot vouch for toc.md and the rest.
+        R2-14, the user's decision: such an old-version package passes (with a reminder); its segments are checked."""
         from brainkit.common import write_json
         m = load_json(os.path.join(self.base, "manifest.json"))
         del m["files"]
         write_json(os.path.join(self.base, "manifest.json"), m)
-        self.assertTrue(any("records no hashes" in p for p in self.package.verify_package(self.base)))
+        self.assertEqual(self.package.verify_package(self.base), [])
+        self.write("segments/D01-S001.md", "批准 RELEASE\n", "a")
+        self.assertEqual(self.package.verify_package(self.base), ["changed segments/D01-S001.md"])
 
     def test_readonly_copy_never_follows_a_link(self):
         from brainkit import cli
