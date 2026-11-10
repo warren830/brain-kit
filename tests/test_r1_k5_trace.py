@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from brainkit import claims, cli, config, intents, split, trace  # noqa: E402
 from brainkit import evaluate as EV  # noqa: E402
 from brainkit.common import BrainError  # noqa: E402
-from tests.helpers import tmpdir  # noqa: E402
+from tests.helpers import sh, tmpdir  # noqa: E402
 from tests import test_qa_trace_eval as Q  # noqa: E402
 from tests import test_split_trace as SP  # noqa: E402
 from tests.test_trace import AS_OF, commit, git_repo, world  # noqa: E402
@@ -325,6 +325,72 @@ class R1_92_RevertedWithItsBranchGone(unittest.TestCase):
     def test_a_run_never_on_main_is_not_brought_back(self):
         self.assertEqual(EV.removed_runs(self.w.repo, self.w.cfg(), "main", have={"PAY-1"}), {})
         self.assertEqual(EV.removed_runs(self.w.repo, self.w.cfg(), self.merge), {})     # before the revert
+
+
+def same_view(t):
+    """What a trace says about a run, without where it was read from."""
+    c = t["checks"] or {}
+    return {"stages": [(s["id"], s["state"]) for s in t["stages"]], "verify": len(c.get("verify") or []),
+            "commits": [x["sha"] for x in t["actions"]["commits"] or []],
+            "humans": [(h["kind"], h["what"]) for h in t["humans"]], "decisions": [d["id"] for d in t["decisions"]],
+            "accepted": t["outcome"]["accepted"]["value"], "questions": len(t["actions"]["questions"] or []),
+            "family": [(c["key"], c["merged_into_parent"]["value"]) for c in (t.get("family") or {}).get("children", [])]}
+
+
+class R1_91_OwnersStaleCheckout(unittest.TestCase):
+    """The owner's own checkout of her run branch, behind origin's copy (stopped at the hand-over; fetched, not
+    pulled): trace and eval took the commits from origin's copy but Lean's records, park.json, decisions and the
+    split children from the stale working tree: other numbers than on any other clone (the review's sF.py, sG.py)."""
+
+    AS = "2026-11-03T00:00:00Z"
+
+    def test_a_run_branch_at_the_hand_over(self):
+        w = Q.World(self)
+        r = w.run("PAY-1", "refund", 2, runner_events=[Q.release()], park=Q.PARK)
+        handover = w.git("log", "--format=%H", "--grep=PAY-1: hand off", r["branch"]).stdout.split()[0]
+        origin = "refs/remotes/origin/" + r["branch"]
+        w.git("update-ref", origin, r["tip"])                  # origin has the runner's pushes
+        w.git("reset", "-q", "--hard", handover)                # the owner's checkout: at the hand-over
+        cfg = w.cfg()
+        owner = trace.build(w.repo, cfg, "PAY-1", as_of=self.AS)
+        mate = trace.build(w.repo, cfg, "PAY-1", ref=origin, as_of=self.AS)
+        self.assertEqual(same_view(owner), same_view(mate))
+        self.assertEqual((same_view(owner)["verify"], same_view(owner)["accepted"]), (1, True))
+        self.assertEqual(owner["ref"], origin)
+        wt = owner["src"]["working_tree"]
+        self.assertEqual((wt["head"], wt["read"]), (handover, origin))
+        self.assertIn("HEAD %s is behind %s" % (handover[:12], origin), wt["note"])
+        self.assertIn("工作区（HEAD %s）比 %s 旧" % (handover[:12], origin), trace.render(owner))
+        rc, out, err = Q.run_cli(w.repo, ["trace", "PAY-1", "--json", "--as-of", self.AS])
+        self.assertEqual((rc, json.loads(out)["ref"]), (0, origin), err)
+        eo = EV.collect(w.repo, cfg, as_of=self.AS)
+        w.git("switch", "-q", "main")                           # a teammate: reads the run from its branch
+        em = EV.collect(w.repo, cfg, as_of=self.AS)
+        self.assertEqual([same_view(t) for t in eo["traces"]], [same_view(t) for t in em["traces"]])
+        self.assertEqual(eo["batch"], em["batch"])
+        # the owner at the freshest commit: the working tree is read (with what is not committed yet)
+        w.git("switch", "-q", r["branch"])
+        w.git("reset", "-q", "--hard", r["tip"])
+        t = trace.build(w.repo, cfg, "PAY-1", as_of=self.AS)
+        self.assertEqual((t["ref"], t["src"].get("working_tree")), ("working tree", None))
+
+    def test_a_split_parent_fetched_not_pulled(self):
+        # tests/test_split_trace.py's family: PAY-2 merged into the parent's branch there; here the owner's local
+        # copy of that branch is from before the merge, origin's has it
+        w = SP.family_world(self)
+        origin = "refs/remotes/origin/" + SP.PB
+        sh("git", "-C", w.repo, "update-ref", origin, w.merge)
+        sh("git", "-C", w.repo, "switch", "-q", SP.PB)
+        sh("git", "-C", w.repo, "reset", "-q", "--hard", w.split_at)
+        owner = trace.build(w.repo, w.cfg, "PAY-1", as_of=SP.AS_OF)
+        mate = trace.build(w.repo, w.cfg, "PAY-1", ref=origin, as_of=SP.AS_OF)
+        self.assertEqual(same_view(owner), same_view(mate))
+        self.assertEqual(same_view(owner)["family"], [("PAY-2", True), ("PAY-3", False)])
+        eo = EV.collect(w.repo, w.cfg, as_of=SP.AS_OF, stuck_hours=40)
+        sh("git", "-C", w.repo, "switch", "-q", "main")
+        em = EV.collect(w.repo, w.cfg, as_of=SP.AS_OF, stuck_hours=40)
+        self.assertEqual(eo["families"], em["families"])
+        self.assertEqual(eo["batch"], em["batch"])
 
 
 def audit(recs, email="alice@example.com"):

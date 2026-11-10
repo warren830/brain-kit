@@ -818,6 +818,28 @@ def _ancestry(log, sha) -> set:
     return seen
 
 
+def fresher_than_worktree(repo, rp, hist):
+    """{"head", "read", "note"} when the working tree is behind what the run's history is read at (hist["tip"]: the
+    freshest copy of its branch, or the copy that merged): HEAD is an ancestor of that commit and not the commit
+    itself (the owner's checkout stopped at the hand-over; fetched, not pulled). The run is then read where a clone
+    without that checkout reads it: the default branch once it merged there (when its run.json is there), else that
+    commit (by the ref that names it). None: the working tree is read."""
+    tip, head = hist.get("tip"), _commit(repo, "HEAD")
+    if not tip or not head or head == tip or not _ancestor(repo, head, tip):
+        return None
+    src = hist.get("tip_src")
+    cands = [(hist["default_ref"], "the default branch: the run merged")] if hist.get("merge") and \
+        hist.get("default_ref") else []
+    cands.append((src if isinstance(src, str) and src.startswith("refs/") and _commit(repo, src) == tip else tip,
+                  src or "the run's last commit"))
+    for r, why in cands:
+        if r and _show(repo, r, rp) is not None:
+            label = r if r != tip else tip[:12]
+            return {"head": head, "read": r, "note": "HEAD %s is behind %s (%s): the run is read there, not from the "
+                    "working tree (its uncommitted changes are not read)" % (head[:12], label, why)}
+    return None
+
+
 def git_history(repo, cfg, rec, ref, key, refs=None, target=None):
     """Commits of the run branch, the hand-over commit, the merge, park.json history. `target` (a split child):
     (the parent's run branch name, the ref or commit it is read at, or None): the run's own commits are judged against
@@ -1887,6 +1909,12 @@ def _build(repo, cfg, key, ref, ledger_path, vouchers_dir, credits, as_of, allow
     hist = git_history(repo, cfg, rec, ref, key, refs, target=target[:2] if target else None) if branch else {
         "tip": None, "tip_src": None, "tip_note": None, "default_ref": default_ref(repo, cfg, ref, refs), "merge": None,
         "commits": None, "range": None, "handover_commit": None, "park": None, "requests": [], "_log": [], "_rp": rp}
+    stale = fresher_than_worktree(repo, rp, hist) if ref is None else None
+    if stale:      # the owner's old checkout of the run branch: read what any other clone reads (docs/eval.md §2)
+        t = _build(repo, cfg, key, stale["read"], ledger_path, vouchers_dir, credits, as_of, allowed_signers, None,
+                   _cache)
+        t["src"]["working_tree"] = stale
+        return t
     if hist["tip"] is None:
         missing.append("run branch %s (not found locally, on origin, or as a merge on the default branch)"
                        % branch)
@@ -2306,6 +2334,10 @@ def render(t) -> str:
         out.append("Lean 日志：" + "；".join("%s %d 条 %s" % (os.path.basename(p), c["records"],
                                                            "链完好" if c["chain"] == "ok" else c["chain"])
                                          for p, c in sorted(chains.items())))
+    wt = t["src"].get("working_tree")
+    if wt:
+        out.append("工作区（HEAD %s）比 %s 旧：读的是那里，工作区里没提交的改动不算" % (
+            wt["head"][:12], wt["read"] if wt["read"].startswith("refs/") else wt["read"][:12]))
     g = t["src"]["git"]
     if g.get("tip_note"):
         out.append("分支：用的是 %s；%s" % (g["tip_src"], g["tip_note"]))

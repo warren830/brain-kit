@@ -59,7 +59,7 @@ brain golden summarize results.json --tasks tasks
 
 下面是 trace 读 git 的全部规则。每条都有测试（`tests/test_qa_r2_trace.py`、`tests/test_qa_r3_trace.py`、`tests/test_qa_r4_trace.py`，测试类名、测试名或说明里带规则号）。说法里：main = 默认分支（有 `origin/main` 用它，没有用本地的）；分支 = run.json 里的 `branch`；KEY = 需求号；运行机 = kit.json 的 `bot_emails`；**S** = main 的第一父链上第一个带进 `runs/<KEY>/run.json` 的提交。
 
-**读哪一份分支**：分支可能有几份：本地的 `refs/heads/<分支>`、origin 的 `refs/remotes/origin/<分支>`，或者 `--ref <分支>` 给的。没合并时取新的那份（包含另一份的那份）；两份分叉了，用 origin 的。合并了以后读"合并进去的那份"（下面的 M1–M6）。用不上的那几份写进 `src.git.tip_note`：旧了、合并后又有提交、分叉了。所以负责人自己机器上那份停在交接时的旧分支，不会把交接后的事丢掉，结果和没有这个分支的机器一样。
+**读哪一份分支**：分支可能有几份：本地的 `refs/heads/<分支>`、origin 的 `refs/remotes/origin/<分支>`，或者 `--ref <分支>` 给的。没合并时取新的那份（包含另一份的那份）；两份分叉了，用 origin 的。合并了以后读"合并进去的那份"（下面的 M1–M6）。用不上的那几份写进 `src.git.tip_note`：旧了、合并后又有提交、分叉了。所以负责人自己机器上那份停在交接时的旧分支，不会把交接后的事丢掉，结果和没有这个分支的机器一样。不给 `--ref` 时读工作区；工作区的 HEAD 比这个 run 要读的那份旧时（HEAD 是那份的祖先：负责人停在交接时的旧分支上，或者 fetch 了没 pull），run.json、Lean 记录、park.json、决策和小需求也都改从那份读（合并了的、main 上有它的 run.json 时从 main 读），和别的机器一样；`src.working_tree` 写明（`head`、`read`、`note`），工作区里没提交的改动这时不算。
 
 **怎么认合并**（不问 GitLab）。按顺序看，第一条对上的就是：
 
