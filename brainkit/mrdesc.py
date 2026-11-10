@@ -731,23 +731,63 @@ def _default_ref(repo, cfg):
     return None
 
 
-def _changes(repo, cfg, key, tree, base, label=None):
-    """(changes, why not): the diff from the merge base with the default branch to the tip, by top-level folder."""
+MERGE_HOW = (("squash", "压缩合并"), ("rebase", "变基合并"), ("fast-forward", "快进合并"), ("merge commit", "合并提交"))
+
+
+def _landed(repo, cfg, rec, key, ref, into):
+    """The run as it merged into `into` (a ref; cfg["default_branch"] is its branch name): {"base", "tip", "commit",
+    "how"} of the diff that merge brought in, found as brain trace finds a merge (trace.landing: a merge commit,
+    fast-forward, rebase or squash), or None when it is not found there."""
+    branch = rec.get("branch") if plain(rec.get("branch")) else None
+    intent = rec.get("intent") if isinstance(rec.get("intent"), str) else None
+    try:
+        refs = T._refs(repo)
+        land = T.landing(repo, cfg, into, key, intent, branch, T.copies_of(repo, branch, ref, refs), refs)
+    except (BrainError, OSError, ValueError, KeyError, TypeError, IndexError):
+        return None
+    m = (land or {}).get("merge")
+    if not m or not m.get("commit"):
+        return None
+    own = m.get("own") if isinstance(m.get("own"), list) and m["own"] else None
+    if own:                                        # its commits on the line (fast-forward, rebase, squash)
+        b, t = (T._parents(repo, own[0]) or [None])[0], own[-1]
+    elif len(T._parents(repo, m["commit"])) >= 2:  # a merge commit: what it brought onto its first parent
+        b, t = T._parents(repo, m["commit"])[0], m["commit"]
+    else:
+        b, t = (land.get("exclude") or [None])[0], land.get("tip") or m["commit"]
+    if not b or not t:
+        return None
+    how = next((zh for en, zh in MERGE_HOW if en in str(m.get("how"))), "合并")
+    return {"base": b, "tip": t, "commit": m["commit"], "how": how, "into": into}
+
+
+def _changes(repo, cfg, key, tree, base, label=None, rec=None, into=None):
+    """(changes, why not): the diff from the merge base with the default branch (`into`: (its cfg, the ref), a split
+    child's parent's branch) to the tip, by top-level folder. A tip already on that branch is a run that merged: the
+    diff that merge brought in."""
     tip = tree.commit or _commit(repo, "HEAD")
     dref = _default_ref(repo, cfg)
+    merged = None
     if base:
         b = _commit(repo, base)
         if not b:
             raise BrainError("--base %s is not a commit here" % base)
         label = label or "%s（%s）" % (_one(base, 60), b[:12])
     else:
-        if not dref:
+        icfg, iref = into or (cfg, dref)
+        if not iref:
             return None, "找不到 %s（也没有 origin/%s），没法算改了什么" % (cfg["default_branch"], cfg["default_branch"])
-        p = git(repo, "merge-base", tip, dref, check=False)
+        p = git(repo, "merge-base", tip, iref, check=False)
         b = p.stdout.strip()
         if p.returncode != 0 or not b:
-            return None, "和 %s 没有共同的提交，没法算改了什么" % dref
-        label = "%s 的分叉点 %s" % (dref, b[:12])
+            return None, "和 %s 没有共同的提交，没法算改了什么" % iref
+        label = "%s 的分叉点 %s" % (iref, b[:12])
+        if b == tip:            # the records are read from where the run merged (`--ref origin/main`)
+            merged = _landed(repo, icfg, rec or {}, key, tree.ref, iref)
+            if not merged:
+                return None, "%s 已经在 %s 上，找不到它是怎么合进去的，没法算改了什么" % (tree.label, iref)
+            b, tip = merged["base"], merged["tip"]
+            label = "合进 %s 之前的 %s（%s %s）" % (iref, b[:12], merged["how"], merged["commit"][:12])
     mr = "%s/%s/%s" % (cfg["runs_dir"], key, MR_FILE)
     p = subprocess.run(["git", "-C", repo, "diff", "--no-renames", "--no-ext-diff", "-z", "--numstat", b, tip, "--",
                         ".", ":(exclude)" + mr], capture_output=True)
@@ -790,7 +830,8 @@ def _changes(repo, cfg, key, tree, base, label=None):
     risk = _risk(repo, cfg, tree, dref, [f for f, _, _ in files])
     code = [{"path": _one(f, 120), "added": a, "deleted": x} for f, a, x in sorted(files)
             if kinds.get(f.split("/", 1)[0] if "/" in f else "") is None]
-    return {"base": b, "base_label": label, "tip": tip, "files": len(files), "code_files": len(code),
+    return {"base": b, "base_label": label, "tip": tip, "merged": {k: merged[k] for k in ("commit", "how", "into")}
+            if merged else None, "files": len(files), "code_files": len(code),
             "code": code[:50],
             "added": sum(a for _, a, _ in files if a), "deleted": sum(d for _, _, d in files if d),
             "groups": order, "uncommitted": uncommitted, "risk": risk, "brain_touched": cfg["brain_dir"] in groups,
@@ -919,14 +960,14 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
                   "target_branch": _one(rec.get("target_branch"), 100) if plain(rec.get("target_branch")) else None}
     clone = rec.get("lean_clone") if family and re.match(r"^[0-9a-f]{6}$", str(rec.get("lean_clone") or "")) else None
     own = _events(tree, intent, clone) if intent and clone else events     # the child's own clone: verify, stage
-    base_label = None
+    into, fork = None, None      # a child: diffed against its parent's branch (its MR's target), from the fork
     if family and base is None and family["target_branch"]:
         tip = tree.commit or _commit(repo, "HEAD")
         for r in ("origin/" + family["target_branch"], family["target_branch"]):
             tref = _commit(repo, r)
             mb = git(repo, "merge-base", tip, tref, check=False).stdout.strip() if tref and tip else ""
             if mb:
-                base, base_label = mb, "%s 的分叉点 %s" % (r, mb[:12])
+                into, fork = (dict(cfg, default_branch=family["target_branch"]), r), mb
                 break
 
     req = _requirements(tree.read("%s/%s" % (docs, REQ_DOC))) if docs else None
@@ -978,7 +1019,7 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
                                                  else ac["given"] or ac["then"], 60),
                     "tests": shown, "result": result})
 
-    ch, why_no_changes = _changes(repo, cfg, key, tree, base, base_label)
+    ch, why_no_changes = _changes(repo, cfg, key, tree, base, rec=rec, into=into)
     if why_no_changes:
         missing.append(why_no_changes)
     elif not ch["files"]:
@@ -1012,7 +1053,7 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
     # keeps the lines its own commits wrote (git blame), as brain trace does
     lines = {}
     if family and docs:
-        mine = _own_commits(repo, tr, base, tree)
+        mine = _own_commits(repo, tr, base or fork, tree)
         for path in (dec_path, req_path):
             if tree.raw(path) is not None:
                 lines[path] = T.owned_lines(repo, tree, path, mine, set(), branch, set())
@@ -1043,7 +1084,7 @@ def build(repo, cfg, key, base=None, ref=None, credits=None, vouchers_dir=None, 
         "title": _one((req or {}).get("title") or next((_d(e).get("title") for e in events
                                                          if e.get("event") == "INTENT_CREATED"), None) or intent,
                       80) or None,
-        "where": {"stage": stage, "handed_over": bool(handoff),
+        "where": {"stage": stage, "handed_over": bool(handoff), "merged": (ch or {}).get("merged"),
                   "handoff_at": handoff.get("requested_at") if handoff and plain(handoff.get("requested_at")) else None,
                   "waiting": waiting, "released": approvals["released"]},
         "size": (req or {}).get("size"),
@@ -1141,8 +1182,14 @@ def render(d) -> str:
     w = d["where"]
     st = w["stage"]
     now = ["Lean 在%s%s%s" % ("「%s」" % st["name"], "（%s）" % st["unit"] if st["unit"] else "", st["state"])
-           if st else "Lean 还没开始阶段",
-           "已交给团队运行机" if w["handed_over"] else "在本地开发（还没交接）"]
+           if st else "Lean 还没开始阶段"]
+    if w["handed_over"]:
+        now.append("已交给团队运行机")
+    if w.get("merged"):
+        now.append("已合进 `%s`（%s %s）" % (_one(w["merged"]["into"], 100), w["merged"]["how"],
+                                         w["merged"]["commit"][:12]))
+    elif not w["handed_over"]:
+        now.append("在本地开发（还没交接）")
     if w["released"]:
         now.append("RELEASE 已批")
     elif w["waiting"]:

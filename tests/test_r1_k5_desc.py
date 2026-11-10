@@ -322,5 +322,60 @@ class ChildKeepsItsOwnRecords(unittest.TestCase):
         self.assertEqual(len(d["brain"]["gaps"]), 1)
 
 
+
+class ReadAfterTheMerge(unittest.TestCase):
+    """R1-90: after the merge, `brain mr-desc KEY --ref origin/main` (docs/mr-desc.md) dropped 「改了什么」 and said
+    「还没有提交的改动」: the diff was from main's merge base with itself."""
+
+    def setUp(self):
+        isolated(self)
+        self.repo, self.cfg = run_world(self, {"src/pay/refund.py": "def refund():\n    return 1\n",
+                                               "tests/test_refund.py": "def test_refund():\n    pass\n"})
+        self.at = {"GIT_AUTHOR_DATE": "2026-11-05T00:00:00Z", "GIT_COMMITTER_DATE": "2026-11-05T00:00:00Z"}
+
+    def finish(self):
+        sh("git", "-C", self.repo, "branch", "-q", "-D", BR)          # GitLab deletes the source branch
+        sh("git", "-C", self.repo, "update-ref", "refs/remotes/origin/main", "main")
+        return sh("git", "-C", self.repo, "rev-parse", "main").stdout.strip()
+
+    def check(self, d, how, commit_):
+        text = mrdesc.render(d)
+        ch = d["changes"]
+        self.assertNotIn("还没有提交的改动", text)
+        self.assertEqual([c["path"] for c in ch["code"]], ["src/pay/refund.py", "tests/test_refund.py"])
+        self.assertEqual(ch["files"], 4)                       # with run.json and the Lean audit
+        self.assertEqual(ch["merged"], {"commit": commit_, "how": how, "into": "origin/main"})
+        self.assertIn("### 改了什么\n和 合进 origin/main 之前的 %s（%s %s） 比：4 个文件，" % (
+            ch["base"][:12], how, commit_[:12]), text)
+        self.assertIn("现在：Lean 在「需求分析」进行中，已合进 `origin/main`（%s %s）。" % (how, commit_[:12]), text)
+        self.assertNotIn("在本地开发", text)
+
+    def test_a_merge_commit(self):
+        sh("git", "-C", self.repo, "switch", "-q", "main")
+        sh("git", "-C", self.repo, "merge", "-q", "--no-ff", BR, "-m", "Merge branch '%s' into 'main'" % BR,
+           env=self.at)
+        m = self.finish()
+        d = mrdesc.build(self.repo, self.cfg, "PAY-1", ref="origin/main")
+        self.check(d, "合并提交", m)
+        self.assertEqual(d["changes"]["base"], sh("git", "-C", self.repo, "rev-parse", "main^1").stdout.strip())
+
+    def test_a_squash_merge(self):
+        sh("git", "-C", self.repo, "switch", "-q", "main")
+        sh("git", "-C", self.repo, "merge", "-q", "--squash", BR)
+        sh("git", "-C", self.repo, "commit", "-q", "-m", "PAY-1: refund", env=self.at)
+        m = self.finish()
+        self.check(mrdesc.build(self.repo, self.cfg, "PAY-1", ref="origin/main"), "压缩合并", m)
+
+    def test_a_child_merged_into_its_parent(self):
+        w = ST.family_world(self)
+        d = mrdesc.build(w.repo, w.cfg, "PAY-2", ref=ST.PB)
+        ch, text = d["changes"], mrdesc.render(d)
+        self.assertNotIn("还没有提交的改动", text)
+        self.assertEqual([c["path"] for c in ch["code"]], ["services/api/a.py"])
+        self.assertEqual(ch["merged"], {"commit": w.merge, "how": "合并提交", "into": ST.PB})
+        self.assertEqual(ch["base"], w.split_at)
+        self.assertIn("已合进 `%s`（合并提交 %s）" % (ST.PB, w.merge[:12]), text)
+
+
 if __name__ == "__main__":
     unittest.main()
