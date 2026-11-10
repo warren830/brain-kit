@@ -748,17 +748,21 @@ def _release(repo, cfg, me, key):
     from . import intents
     branches = [n for n in intents.run_keys(repo, cfg)[0] if n == key]
     if branches:
-        mine = [l for l in git_out(repo, "for-each-ref", "--format=%(refname:short)",
+        here = [l for l in git_out(repo, "for-each-ref", "--format=%(refname:short)",
                                    "refs/heads/%s/%s/" % (cfg["branch_prefix"], me)).split() if
                 (parse_branch(l, cfg["branch_prefix"]) or {}).get("key") == key]
+        there = []
         if git(repo, "remote", "get-url", "origin", check=False).returncode == 0:
             p = git(repo, "ls-remote", "origin", "refs/heads/%s/%s/*" % (cfg["branch_prefix"], me), check=False)
-            mine += [l.split("\t", 1)[1][len("refs/heads/"):] for l in p.stdout.splitlines() if "\t" in l and
+            there = [l.split("\t", 1)[1][len("refs/heads/"):] for l in p.stdout.splitlines() if "\t" in l and
                      (parse_branch(l.split("\t", 1)[1][len("refs/heads/"):], cfg["branch_prefix"]) or {}).get("key")
                      == key]
-        if mine:
-            raise BrainError("%s has your run branch %s: hand the run over or delete the branch first (here and on "
-                             "origin), then release it" % (key, ", ".join(sorted(set(mine)))))
+        if here or there:
+            # a hand-over keeps the branch (the run goes on): only deleting it, here and on origin, lets the key go
+            raise BrainError("%s has your run branch %s: delete it first (%s), then release it. Handing the run over "
+                             "keeps the branch" % (key, ", ".join(sorted(set(here + there))), "; ".join(
+                                 ["git branch -D %s" % n for n in sorted(set(here))] +
+                                 ["git push origin --delete %s" % n for n in sorted(set(there))])))
     claims.release(repo, key, me)
     print("Released %s: it is 待认领 again (`brain claim %s` takes it)." % (key, key))
     return 0

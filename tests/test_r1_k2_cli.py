@@ -483,5 +483,34 @@ class R1_41_ClaimOfAKeyNobodyFiled(Project):
         self.assertEqual(claims.read(self.repo, "PAY-7")["title"], "退款表加索引")
 
 
+class R1_44_ReleaseSaysDeleteTheBranch(Project):
+    def setUp(self):
+        super().setUp()
+        self.add_origin()
+
+    def release(self):
+        return brain(self.repo, "claim", "--release", "PAY-1")
+
+    def test_r1_44_release_refused_names_the_deletes_a_hand_over_does_not_help(self):
+        self.assertEqual(brain(self.repo, "start", "refund", "--key", "PAY-1")[0], 0)
+        edit_status(self.repo, load_json(os.path.join(self.repo, "runs", "PAY-1", "run.json"))["intent"])
+        rc, out = brain(self.repo, "handoff")                     # pushed (not labelled: no GitLab here)
+        self.assertEqual(rc, 1, out)
+        rc, out = self.release()                                  # handed over: the branch is still there
+        self.assertEqual(rc, 2, out)
+        self.assertIn("delete it first (git branch -D ai/alice/PAY-1-refund; git push origin --delete "
+                      "ai/alice/PAY-1-refund), then release it. Handing the run over keeps the branch", out)
+        self.assertNotIn("hand the run over", out)
+        sh("git", "-C", self.repo, "checkout", "-q", "main")
+        sh("git", "-C", self.repo, "branch", "-q", "-D", "ai/alice/PAY-1-refund")
+        rc, out = self.release()                                  # only origin's is left: only its delete is named
+        self.assertEqual(rc, 2, out)
+        self.assertIn("delete it first (git push origin --delete ai/alice/PAY-1-refund)", out)
+        sh("git", "-C", self.repo, "push", "-q", "origin", "--delete", "ai/alice/PAY-1-refund")
+        rc, out = self.release()
+        self.assertEqual(rc, 0, out)
+        self.assertIsNone(claims.read(self.repo, "PAY-1")["owner"])
+
+
 if __name__ == "__main__":
     unittest.main()
