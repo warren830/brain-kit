@@ -544,7 +544,9 @@ PROPAGATE_KINDS = {"hkid", "cnid", "phone", "email", "card", "private_key", "clo
                    "amount", "company", "contract", "person", "kv_secret"}
 WORD_PASSWORDS = set("admin administrator root test demo guest user default monkey".split())
 WORD_NAMES = set("高峰".split())         # a name that is also a word (高峰期): masked where found, not spread
-SECRET_FIELD_WORDS = set("password passwd pwd secret token key api apikey".split())
+FIELD_WORDS = set("password passwd pwd secret token key api apikey access refresh client auth session id app bearer"
+                  .split())
+FIELD_NAME_RE = re.compile(r"[A-Za-z]+(?:[-_.][A-Za-z]+)*")
 _WORD_CHAR = re.compile(r"[A-Za-z0-9_]")
 
 
@@ -554,8 +556,15 @@ def _spreads(kind, v) -> bool:
     if kind == "person":
         return v not in WORD_NAMES
     if kind == "kv_secret":
-        return v.lower() not in WORD_PASSWORDS and not set(re.split(r"[^a-z0-9]+", v.lower())) & SECRET_FIELD_WORDS
+        return v.lower() not in WORD_PASSWORDS and not _field_name(v)
     return True
+
+
+def _field_name(v) -> bool:
+    """The value is itself a field name (refresh_token, X-Api-Key): letters only, each part a field word or a letter.
+    Prod_Secret_2026 or live-api-key-7f3k is a password that only holds such a word."""
+    return bool(FIELD_NAME_RE.fullmatch(v)) and all(len(w) == 1 or w.lower() in FIELD_WORDS
+                                                    for w in re.split(r"[-_.]", v))
 
 
 def _whole_word(text, start, end) -> bool:
