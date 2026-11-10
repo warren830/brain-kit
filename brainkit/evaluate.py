@@ -314,8 +314,8 @@ def _closed(doc):
 def run_state(t, as_of=None, stuck_hours=STUCK_HOURS, claim=None) -> dict:
     """Where a run is: {"value", "bridge" (the ledger state of its last run), "last_activity", "idle_hours",
     "stuck", "waiting_on", "answered"}. value: merged | merged_not_here (the ledger says merged; git here has no
-    merge) | closed (MR closed, not merged; a split child also when its claim was closed, `brain intent close`:
-    "closed_by": "claim") | failed (the runner could not start it) | unknown (a *_unknown ledger state: the bridge
+    merge) | closed (MR closed, not merged; or its claim was closed, `brain intent close`, a split child or not:
+    "closed_by": "claim", and "leftover" when its run branch is still here, see leftover) | failed (the runner could not start it) | unknown (a *_unknown ledger state: the bridge
     cannot tell whether it was sent) | answered (parked on a question the bridge already has the answer to:
     delivered, or on its way; the run did not go on) | waiting (parked on a question nobody answered yet, or a bridge
     question is open) | accepted (accepted, not merged yet) | open. Stuck: not merged, closed or failed, and nothing
@@ -336,7 +336,7 @@ def run_state(t, as_of=None, stuck_hours=STUCK_HOURS, claim=None) -> dict:
         v = "merged_into_parent"
     elif last in ("merged", "closed", "failed"):
         v = {"merged": "merged_not_here"}.get(last, last)
-    elif fam.get("role") == "child" and _closed(claim):     # as `brain intent list`: closed, not in progress
+    elif _closed(claim):                                    # as `brain intent list`: closed, not in progress
         v = "closed"
     elif last and last.endswith("_unknown"):
         v = "unknown"
@@ -356,6 +356,25 @@ def run_state(t, as_of=None, stuck_hours=STUCK_HOURS, claim=None) -> dict:
     if fam.get("role") == "parent":
         st["family_activity"] = fam["rollup"]["last_activity"]
     return st
+
+
+def leftover(t, refs):
+    """A closed requirement's run branch that is still here, {"branch", "where": ["local", "origin"]}, or None: what
+    its owner may delete (and the MR of it, if one is open, may be closed; eval does not ask GitLab)."""
+    b = t.get("branch")
+    if not isinstance(b, str) or not b:
+        return None
+    where = [w for w, r in (("local", "refs/heads/" + b), ("origin", "refs/remotes/origin/" + b)) if r in refs]
+    return {"branch": b, "where": where} if where else None
+
+
+def _leftover_text(lo) -> str:
+    if not lo:
+        return ""
+    return "；分支 %s 还在（%s）：用不着就删掉%s，它的 MR 如果还开着，也关掉" % (
+        lo["branch"], " 和 ".join({"local": "本地", "origin": "origin"}[w] for w in lo["where"]),
+        "（%s）" % "、".join(("`git branch -D %s`" if w == "local" else "`git push origin --delete %s`") % lo["branch"]
+                           for w in lo["where"]))
 
 
 def _stuck_on(st) -> str:
@@ -382,8 +401,8 @@ def open_reasons(t, st, stuck_hours=STUCK_HOURS) -> list:
             st["idle_hours"], st["last_activity"], stuck_hours, _stuck_on(st)),
             "evidence": [(st.get("family_activity") or t["outcome"].get("last_activity") or {}).get("src")]})
     if v == "closed" and st.get("closed_by") == "claim":
-        out.append({"rule": "closed_unmerged", "text": "需求关了（brain intent close），没有合并",
-                    "evidence": "claim/%s" % t["key"]})
+        out.append({"rule": "closed_unmerged", "text": "需求关了（brain intent close），没有合并" +
+                    _leftover_text(st.get("leftover")), "evidence": "claim/%s" % t["key"]})
     elif v == "closed":
         out.append({"rule": "closed_unmerged", "text": "MR 关了，没有合并", "evidence": "bridge ledger runs"})
     if v == "failed":
@@ -451,6 +470,8 @@ def batch(traces, skipped, states) -> list:
             rows[-1]["parent"] = t["family"]["parent"]
         if st.get("closed_by"):
             rows[-1]["closed_by"] = st["closed_by"]
+        if st.get("leftover"):
+            rows[-1]["leftover"] = st["leftover"]
     for s in skipped:
         if s.get("state") == "not_readable":
             last = (s.get("bridge_runs") or [{}])[-1]
@@ -516,6 +537,11 @@ def collect(repo, cfg, ref=None, since=None, traces=None, ledger_path=None, vouc
     now = T._dt(traces[0]["as_of"]) if traces else (T._dt(as_of) if as_of else utcnow())
     claims = claims_here(repo)
     states = {t["key"]: run_state(t, now, stuck_hours, claims.get(t["key"])) for t in traces}
+    refs = T._refs(repo)
+    for t in traces:                       # closed by its claim: the run branch it left behind, for its owner
+        st = states[t["key"]]
+        if st.get("closed_by") == "claim" and leftover(t, refs):
+            st["leftover"] = leftover(t, refs)
     completed = [t for t in traces if done_at(t) and _in(done_at(t), since)]
     # in the period: something happened in it, or the run is still open (stuck or not, it is part of the batch)
     active = [t for t in traces if since is None or (last_at(t) and last_at(t) >= since) or

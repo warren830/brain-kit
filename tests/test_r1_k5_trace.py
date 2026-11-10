@@ -266,8 +266,10 @@ class R1_89_FamilyLikeIntentList(unittest.TestCase):
         self.assertEqual((row["state"], row["closed_by"], row["delivery"]), ("closed", "claim", "closed"))
         reasons = {r["rule"]: r for r in next(q["reasons"] for q in d["review_queue"] if q["key"] == "PAY-3")}
         self.assertNotIn("stuck", reasons)
-        self.assertEqual((reasons["closed_unmerged"]["text"], reasons["closed_unmerged"]["evidence"]),
-                         ("需求关了（brain intent close），没有合并", "claim/PAY-3"))
+        self.assertEqual(reasons["closed_unmerged"]["evidence"], "claim/PAY-3")
+        self.assertTrue(reasons["closed_unmerged"]["text"].startswith("需求关了（brain intent close），没有合并"))
+        if st.get("leftover"):                                  # its run branch is still here: its owner is told
+            self.assertIn("分支 %s 还在" % st["leftover"]["branch"], reasons["closed_unmerged"]["text"])
         text = EV.report(d)
         self.assertIn("| PAY-3 | 需求关了，没合并（PAY-1 的小需求） |", text)
         self.assertIn("  PAY-1：小需求都合并了，等大需求评审和发布；已合并 1/1（有 run 的 PAY-2；已关闭的 PAY-3、PAY-4）；",
