@@ -208,9 +208,9 @@ class LocalRepoNeedsNoGitLabName(unittest.TestCase):
     def test_login_name_without_gitlab_and_the_gitlab_username_with_it(self):
         repo = git_repo(os.path.join(tmpdir(self), "r"))
         env = {k: v for k, v in os.environ.items() if k not in ("BRAIN_USER", "GITLAB_TOKEN", "BRAIN_GITLAB_TOKEN_FILE")}
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch("getpass.getuser", return_value="Yingchu"), \
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("getpass.getuser", return_value="Bob"), \
                 mock.patch.object(cli, "read_token", return_value=None):
-            self.assertEqual(cli._me(repo, self.cfg("")), "yingchu")
+            self.assertEqual(cli._me(repo, self.cfg("")), "bob")
             with self.assertRaises(BrainError) as e:
                 cli._me(repo, self.cfg("https://gitlab.example"))
             self.assertIn("GitLab username", str(e.exception))

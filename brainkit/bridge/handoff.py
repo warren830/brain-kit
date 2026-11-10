@@ -1090,7 +1090,7 @@ def _main(a):
                 except Exception as e:  # noqa: BLE001
                     if a.cmd != "loop":
                         raise
-                    # one bad round (network, GitLab, Midway, one run's odd data) must not stop the bridge: log, go
+                    # one bad round (network, GitLab, SSO, one run's odd data) must not stop the bridge: log, go
                     # on, retry next round. A stop (SIGTERM, Ctrl-C) is not an Exception and ends the loop.
                     print("brain-bridge: %s failed this round: %s%s" % (
                         step, "" if isinstance(e, BrainError) else type(e).__name__ + ": ", e), file=sys.stderr)
