@@ -178,6 +178,22 @@ class BrainRound1(unittest.TestCase):
             with self.assertRaises(BrainError):
                 brain_of(TECH=TECH).new("TECH", "pitfall", bad, "OMS-2", "D-2")
 
+    def test_r1_82_an_entry_without_a_section_does_not_join_the_last_one(self):
+        product = ("# PRODUCT\n\n> help\n\n<!-- id:P-OMS-1-1 type:decision side:product rel:new src:D-1 -->\n退款先审批。\n\n"
+                   "## 术语\n\n<!-- id:P-OMS-1-2 type:model side:product rel:new src:D-1 -->\n**退款单**：x\n\n"
+                   "## 非目标\n\n<!-- id:P-OMS-1-3 type:decision side:product rel:new src:D-1 -->\n不做跨境退款。\n")
+        b = E.Brain({"PRODUCT.md": product})
+        eid = b.new("PRODUCT", "decision", "部分退款按比例退运费。", "OMS-2", "D-2")
+        text = b.files["PRODUCT.md"].render()
+        self.assertIn("退款先审批。\n\n<!-- id:%s " % eid, text)
+        self.assertIn("部分退款按比例退运费。\n\n## 术语", text)
+        b.new("PRODUCT", "model", "**运费**：y", "OMS-2", "D-2", section="术语")
+        self.assertIn("**运费**：y\n\n## 非目标", b.files["PRODUCT.md"].render())
+        b = brain_of(TECH=TECH)
+        eid = b.new("TECH", "pitfall", "rule two", "OMS-2", "D-2")
+        self.assertTrue(b.files["TECH.md"].render().endswith("rule one\n\n<!-- id:%s type:pitfall side:builder "
+                                                             "rel:new src:D-2 -->\nrule two\n" % eid))
+
 
 if __name__ == "__main__":
     unittest.main()

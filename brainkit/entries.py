@@ -260,14 +260,16 @@ class BrainFile:
         if at is not None:
             self.blocks[at:at] = [e]
             return
-        pos = len(self.blocks)
         if section:
             pos = self._section_end(section)
+        else:                                # no section: after the entries without one, before the first section
+            pos = next((i for i, b in enumerate(self.blocks) if isinstance(b, str) and re.match(r"^#{2,6}\s", b)),
+                       len(self.blocks))
         while pos > 0 and isinstance(self.blocks[pos - 1], str) and not self.blocks[pos - 1].strip():
             pos -= 1
         new = ["", e]
-        if pos < len(self.blocks):
-            new.append("")
+        if pos < len(self.blocks) and not (isinstance(self.blocks[pos], str) and not self.blocks[pos].strip()):
+            new.append("")                   # one blank line before what follows, not two
         self.blocks[pos:pos] = new
 
     def _section_end(self, section):
