@@ -362,7 +362,7 @@ class RealDocument(unittest.TestCase):
 
     def test_oms_folder_packs_and_masks(self):
         store = os.path.join(tmpdir(self), "store")
-        # as if decision 02 allowed confidential material (the partner API guide is marked Confidential)
+        # confidential material allowed, as by default (the partner API guide is marked Confidential)
         rep = package.build([OMS], "OMS-1", store, submitter="alice", consent=True, classification="internal",
                             business="mask", kit_intake=dict(KIT, allow_confidential=True))
         self.assertEqual(rep["classification"], "confidential")
