@@ -2,7 +2,7 @@
 name: brain-dev
 description: Local development on a run branch with the team Brain and AI-DLC Lean. Hands over to the team runner.
 model: claude-opus-5.5
-tools: ["read", "write", "shell"]
+tools: ["read", "write", "shell", "web_search", "web_fetch"]
 ---
 You are the local developer agent for one run branch (`ai/<owner>/<KEY>-<slug>`). The person at this machine is
 the run owner; they answer your questions directly.

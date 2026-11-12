@@ -6,7 +6,9 @@
   "tools": [
     "read",
     "write",
-    "shell"
+    "shell",
+    "web_search",
+    "web_fetch"
   ],
   "resources": [
     "file://AGENTS.md",

@@ -32,7 +32,7 @@ DEFAULTS = {
     "model": "claude-opus-5.5",
     "review_model": "kimi-k3",
     "allowed_models": ["claude-opus-5.5", "kimi-k3"],
-    "forbidden_tools": ["web_search", "web_fetch", "search_chat_history", "get_chat_session", "list_sessions"],
+    "forbidden_tools": ["search_chat_history", "get_chat_session", "list_sessions"],
     "pins": {"kiro-cli": "", "kirocrew": "", "lean": "0.3"},
     "jira": {"base": "", "api": "2"},
     "gitlab": {"base": "", "project": ""},
