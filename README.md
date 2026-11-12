@@ -165,7 +165,7 @@ brain-kit/bin/brain install <项目目录> --lean <AI-DLC Lean 的 checkout 目�
 
 ## 测过什么
 
-本机 994 个测试，在 python3.9（pytest）和 python3.12（`python3.12 -W error -m unittest discover -s tests -t .`）上都加 `-W error` 跑：除了 2 个跳过的（真实需求文档的测试，要 `BRAIN_TEST_REAL_DOCS` 指向一个文件夹），都要通过。加了或删了测试，就改这个数（`tests/test_r1_k2_cli.py` 的 R1-34 核对它）。做过三轮独立的对抗评审：流程部分找出 15 个问题，Brain 部分（条目工具、lint、reflect、usage）又找出 15 个，大需求拆分找出 16 个，都已修掉，每个问题都补了回归测试。
+本机 996 个测试，在 python3.9（pytest）和 python3.12（`python3.12 -W error -m unittest discover -s tests -t .`）上都加 `-W error` 跑：除了 2 个跳过的（真实需求文档的测试，要 `BRAIN_TEST_REAL_DOCS` 指向一个文件夹），都要通过。加了或删了测试，就改这个数（`tests/test_r1_k2_cli.py` 的 R1-34 核对它）。做过三轮独立的对抗评审：流程部分找出 15 个问题，Brain 部分（条目工具、lint、reflect、usage）又找出 15 个，大需求拆分找出 16 个，都已修掉，每个问题都补了回归测试。
 
 - **认领**：本地和远端都测了；两个 clone 抢同一个号，git 本身就会拒掉后到的那个；钩子按 claim.json 认人。
 - **大需求拆成小需求**（`tests/test_split.py`、`tests/test_split_trace.py`）：用真的 Lean、一个 bare origin 和两个 clone 端到端跑（两人只靠登录名区分，没有 GitLab）：拆、认领、被拒的认领、被拒的开工、合并后开工、`brain sync` 解决 Lean 进度页的冲突、进度 n/m、大需求发布和关闭、重拆、`--on`、多团队模式下两个小需求之间走 Lean 的 CR；服务器钩子的每条认领规则；两个人抢同一个待认领；trace、eval、usage 的汇总。
