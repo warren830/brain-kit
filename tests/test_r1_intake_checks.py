@@ -554,6 +554,12 @@ class R1_67DryRun(CliBase):
         self.assertFalse(os.path.exists(env_store))
 
     def test_without_consent_every_gate_is_listed(self):
+        kit = os.path.join(self.repo, ".brain", "kit.json")
+        with open(kit, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["intake"]["allow_confidential"] = False         # so that gate 2 has a problem to list too
+        with open(kit, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
         rc, out = self.brain("intake", self.src, "--key", "REQ-1", "--classification", "internal", "--dry-run",
                              "--store", self.store)
         self.assertEqual(rc, 1, out)

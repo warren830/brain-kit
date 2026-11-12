@@ -36,9 +36,9 @@
     "base": "",
     "project": ""
   },
-  "_help": "People edit this file; the bot may not (pre-receive). tracker: none (keys <req_prefix>-<n>, claimed as git branches claim/<KEY>) or jira (keys are Jira issues; set jira.base). gitlab.base / gitlab.project (group/repo): for MR labels. bot_users / bot_emails: the team runner's GitLab account. pins: exact versions every machine must run. intake.allow_confidential: decision 02 (may confidential material reach the model).",
+  "_help": "People edit this file; the bot may not (pre-receive). tracker: none (keys <req_prefix>-<n>, claimed as git branches claim/<KEY>) or jira (keys are Jira issues; set jira.base). gitlab.base / gitlab.project (group/repo): for MR labels. bot_users / bot_emails: the team runner's GitLab account. pins: exact versions every machine must run. intake.allow_confidential: set false to refuse confidential material (gate 2).",
   "intake": {
-    "allow_confidential": false,
+    "allow_confidential": true,
     "bulk_pii_limit": 30
   }
 }

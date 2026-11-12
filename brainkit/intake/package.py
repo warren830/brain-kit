@@ -2,7 +2,7 @@
 
   1. right to submit   the person confirms they are the author or have the author's consent
   2. classification    given by the person; a stronger marker found in the file wins; 'unsure' = confidential;
-                       confidential needs intake.allow_confidential (decision 02); secret is refused
+                       confidential is taken unless intake.allow_confidential is false; secret is refused
   3. business items    amounts, company names, contract numbers: listed; the person chooses keep or mask
   4. personal data     masked: a value found by its form (ID, phone, card, email) everywhere in the package, a name
                        found next to a label or in a name column where it was found; more than
@@ -320,7 +320,7 @@ def build(paths, key, store, *, submitter, consent, classification, business, ki
         block("门 2：材料按绝密处理（%s）：绝密材料不收，不写材料包。%s"
               % (marked or "你选的是 %s" % classification, "不想交这份，请用 --exclude 去掉。" if marked else ""))
     if effective == "confidential" and not kit_intake.get("allow_confidential"):
-        block("门 2：材料按机密处理（%s），而 intake.allow_confidential 是 false（决策 02 未放行）。"
+        block("门 2：材料按机密处理（%s），而 .brain/kit.json 的 intake.allow_confidential 是 false（不收机密）。"
                          "请产品写一份脱敏摘要再交，或用 --exclude 去掉这份。"
               % (", ".join("%s=%s" % d for d in detected if d[1] == "confidential") or "你选的是 %s" % classification))
     business_hits = sum(1 for hs in all_hits.values() for h in hs if h.cat == "business")

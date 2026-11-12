@@ -47,7 +47,7 @@ DEFAULTS = {
                        "plan": ["builder"],
                        "acceptance": ["product"], "action": ["security"], "other": ["owner"]},
     "intake": {
-        "allow_confidential": False,      # decision 02: may confidential material go to the model at all
+        "allow_confidential": True,       # false: gate 2 refuses material classified or marked confidential
         "bulk_pii_limit": 30,             # more personal-data hits than this in one file: refuse the file
         "segment_chars": 6000,
         "max_file_mb": 50,
