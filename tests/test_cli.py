@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import re
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -84,6 +85,20 @@ class LocalFlow(unittest.TestCase):
         self.assertIn("OK   KiroCrew engine: kas", out)
         self.assertNotIn("FAIL", out)
         self.assertEqual(rc, 0)
+
+    def test_doctor_lets_brain_dev_use_the_web_but_not_read_other_sessions(self):
+        p = os.path.join(self.repo, ".kiro", "agents", "brain-dev.md")
+        with open(p, encoding="utf-8") as f:
+            text = f.read()
+        tools = json.loads(re.search(r"(?m)^tools:(.*)$", text).group(1))
+        self.assertLessEqual({"web_search", "web_fetch"}, set(tools))
+        self.assertIn("OK   brain-dev forbidden tools: none", brain(self.repo, "doctor", "--offline")[1])
+        sessions = ["search_chat_history", "get_chat_session", "list_sessions"]
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(re.sub(r"(?m)^tools:.*$", "tools: " + json.dumps(tools + sessions), text))
+        rc, out = brain(self.repo, "doctor", "--offline")
+        self.assertEqual(rc, 1)
+        self.assertIn("FAIL brain-dev forbidden tools: " + ", ".join(sessions), out)
 
     def test_doctor_checks_the_crew_agent(self):
         """With KiroCrew there, doctor looks at brain-dev.json: Lean's PreToolUse guard must see every tool."""

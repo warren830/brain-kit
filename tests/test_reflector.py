@@ -217,7 +217,7 @@ class ReflectorSpec(unittest.TestCase):
             spec = json.load(f)
         self.assertEqual(spec["name"], "brain-reflector")
         self.assertEqual(spec["model"], "claude-opus-5.5")
-        self.assertEqual(spec["tools"], ["read", "write", "shell"])
+        self.assertEqual(spec["tools"], ["read", "write", "shell", "web_search", "web_fetch"])
         self.assertTrue(spec["prompt"].endswith("/remote/prompts/brain-reflector.md"))
         self.assertIn("~/.kiro/agents/brain-reflector.json", spec["_notes"])
         self.assertNotIn("hooks", spec)
